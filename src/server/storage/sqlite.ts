@@ -492,6 +492,67 @@ export class SqliteStorageAdapter implements StorageAdapter {
 
     this.backfillActivityMetrics();
     this.migrateRollup();
+    this.migrateDropRawEventFk();
+  }
+
+  // Legacy metric_points carried `raw_event_id` + a FOREIGN KEY to raw_events. migrateRollup() drops
+  // the raw_events table, which leaves that FK dangling — with foreign_keys=ON every insert then
+  // fails ("no such table: raw_events"). Rebuild metric_points without the column/FK. Gated on
+  // user_version < 3 so it also repairs databases already migrated to version 2.
+  private migrateDropRawEventFk() {
+    const { user_version: version } = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
+    if (version >= 3) return;
+
+    const columns = this.db.prepare("PRAGMA table_info(metric_points)").all() as Array<{ name: string }>;
+    const hasRawEventId = columns.some((c) => c.name === "raw_event_id");
+
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("BEGIN");
+    try {
+      if (hasRawEventId) {
+        this.db.exec(`
+          CREATE TABLE metric_points_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            signal TEXT NOT NULL,
+            session_row_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            user_id TEXT,
+            user_email TEXT,
+            user_account_id TEXT,
+            model TEXT,
+            metric_name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            token_type TEXT,
+            value REAL NOT NULL,
+            unit TEXT,
+            timestamp INTEGER NOT NULL,
+            attributes_json TEXT,
+            raw_batch_id INTEGER,
+            FOREIGN KEY (session_row_id) REFERENCES sessions(id),
+            FOREIGN KEY (raw_batch_id) REFERENCES raw_batches(id)
+          );
+          INSERT INTO metric_points_new
+            (id, source, signal, session_row_id, session_id, user_id, user_email, user_account_id,
+             model, metric_name, kind, token_type, value, unit, timestamp, attributes_json, raw_batch_id)
+          SELECT
+            id, source, signal, session_row_id, session_id, user_id, user_email, user_account_id,
+            model, metric_name, kind, token_type, value, unit, timestamp, attributes_json, raw_batch_id
+          FROM metric_points;
+          DROP TABLE metric_points;
+          ALTER TABLE metric_points_new RENAME TO metric_points;
+          CREATE INDEX IF NOT EXISTS idx_metric_points_timestamp ON metric_points(timestamp);
+          CREATE INDEX IF NOT EXISTS idx_metric_points_session ON metric_points(session_row_id);
+          CREATE INDEX IF NOT EXISTS idx_metric_points_model ON metric_points(model);
+        `);
+      }
+      this.db.exec("PRAGMA user_version = 3");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    this.db.exec("PRAGMA foreign_keys = ON");
   }
 
   // Build metric_rollup from existing metric_points once, and drop the now-unused raw_events audit

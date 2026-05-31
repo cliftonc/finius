@@ -221,7 +221,7 @@ describe("SQLite storage adapter", () => {
 
     const probe = new DatabaseSync(path);
     const { user_version } = probe.prepare("PRAGMA user_version").get() as { user_version: number };
-    expect(user_version).toBe(2);
+    expect(user_version).toBe(3);
     const tables = probe
       .prepare("SELECT name FROM sqlite_master WHERE type='table'")
       .all()
