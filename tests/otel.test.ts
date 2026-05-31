@@ -54,6 +54,32 @@ describe("OTLP parser", () => {
     expect(points.map((point) => point.tokenType)).toEqual(["cache_creation", "cache_read"]);
   });
 
+  it("classifies session/pull_request/commit counts", () => {
+    const batch = {
+      resourceMetrics: [
+        {
+          resource: { attributes: [{ key: "session.id", value: { stringValue: "s1" } }] },
+          scopeMetrics: [
+            {
+              metrics: [
+                { name: "claude_code.session.count", sum: { dataPoints: [{ asInt: "1", attributes: [{ key: "start_type", value: { stringValue: "fresh" } }] }] } },
+                { name: "claude_code.pull_request.count", sum: { dataPoints: [{ asInt: "2", attributes: [] }] } },
+                { name: "claude_code.commit.count", sum: { dataPoints: [{ asInt: "3", attributes: [] }] } }
+              ]
+            }
+          ]
+        }
+      ]
+    };
+
+    const points = parseOtelMetricPoints(batch);
+    expect(points.map((p) => [p.kind, p.tokenType, p.value])).toEqual([
+      ["session", "fresh", 1],
+      ["pull_request", null, 2],
+      ["commit", null, 3]
+    ]);
+  });
+
   it("prefers email, account id, then user id for identity", () => {
     expect(preferredIdentity({ userEmail: "a@example.com", userAccountId: "acct", userId: "user" })).toBe("a@example.com");
     expect(preferredIdentity({ userEmail: null, userAccountId: "acct", userId: "user" })).toBe("acct");

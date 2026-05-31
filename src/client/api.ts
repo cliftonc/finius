@@ -11,6 +11,8 @@ export type Summary = {
   linesRemoved: number;
   editsAccepted: number;
   editsRejected: number;
+  pullRequests: number;
+  commits: number;
   models: Array<{ model: string; totalCost: number; totalTokens: number; sessions: number }>;
   users: Array<{ user: string; totalCost: number; totalTokens: number; sessions: number }>;
   sources: Array<{ source: string; totalCost: number; totalTokens: number; sessions: number }>;
@@ -29,6 +31,8 @@ export type TimeseriesPoint = {
   linesRemoved: number;
   editsAccepted: number;
   editsRejected: number;
+  pullRequests: number;
+  commits: number;
 };
 
 export type SessionSummary = {
@@ -124,6 +128,19 @@ export async function getModels(filters: Filters = {}) {
 
 export async function getSession(id: number) {
   return getJson<SessionSummary>(`/api/sessions/${id}`);
+}
+
+export type TranscriptInfo = { source: string; importedAt: number; byteSize: number; lineCount: number };
+
+export async function getTranscriptInfo(id: number): Promise<TranscriptInfo | null> {
+  const response = await fetch(transcriptUrl(id, "info"));
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<TranscriptInfo>;
+}
+
+export function transcriptUrl(id: number, kind?: "info") {
+  return `/api/sessions/${id}/transcript${kind ? `/${kind}` : ""}`;
 }
 
 export async function getMeta() {

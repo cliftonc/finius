@@ -22,9 +22,9 @@ import {
 } from "@heroui/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ChartGPUOptions, TooltipParams } from "chartgpu";
-import { Activity, ArrowUpRight, Check, CircleDollarSign, Database, Layers, Minus, Plus, Radio, RefreshCcw, Settings, Users, X } from "lucide-react";
+import { Activity, ArrowUpRight, Check, CircleDollarSign, Database, GitCommit, GitPullRequest, Layers, Minus, Plus, Radio, RefreshCcw, Settings, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getMeta, getModels, getPeople, getSession, getSessions, getSummary, getTimeseries } from "../api";
+import { getMeta, getModels, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo, transcriptUrl } from "../api";
 import type { Filters, Granularity, ModelSummary, PersonSummary, SessionSummary, Summary, TimeseriesPoint } from "../api";
 import { GpuChart } from "./GpuChart";
 
@@ -119,6 +119,9 @@ const EDITS_SERIES = [
   { name: "Accepted", color: "#0f766e", get: (point: TimeseriesPoint) => point.editsAccepted },
   { name: "Rejected", color: "#ef4444", get: (point: TimeseriesPoint) => point.editsRejected }
 ] as const;
+
+const PR_SERIES = [{ name: "Pull requests", color: "#a855f7", get: (point: TimeseriesPoint) => point.pullRequests }] as const;
+const COMMIT_SERIES = [{ name: "Commits", color: "#2563eb", get: (point: TimeseriesPoint) => point.commits }] as const;
 
 const PALETTE = ["#2563eb", "#0f766e", "#a855f7", "#f59e0b", "#ef4444", "#14b8a6", "#6366f1", "#ec4899"];
 
@@ -361,8 +364,8 @@ function Kpis({ summary, onNavigate }: { summary?: Summary; onNavigate: (tab: Ta
       { label: "Lines removed", value: formatNumber(summary?.linesRemoved ?? 0), icon: Minus, tone: "danger" },
       { label: "Edits accepted", value: formatNumber(summary?.editsAccepted ?? 0), icon: Check, tone: "success" },
       { label: "Edits rejected", value: formatNumber(summary?.editsRejected ?? 0), icon: X, tone: "danger" },
-      { label: "Sessions", value: formatNumber(summary?.sessionCount ?? 0), icon: RefreshCcw, to: "sessions" },
-      { label: "People", value: formatNumber(summary?.activeSenders ?? 0), icon: Users, to: "people" }
+      { label: "Pull requests", value: formatNumber(summary?.pullRequests ?? 0), icon: GitPullRequest },
+      { label: "Commits", value: formatNumber(summary?.commits ?? 0), icon: GitCommit }
     ]
   ];
 
@@ -424,6 +427,16 @@ function UsageCharts({ points, from, granularity }: { points: TimeseriesPoint[];
     [dense, granularity]
   );
 
+  const prOptions = useMemo<ChartGPUOptions>(
+    () => seriesLineOptions(dense, granularity, PR_SERIES, formatCompact, formatNumber),
+    [dense, granularity]
+  );
+
+  const commitOptions = useMemo<ChartGPUOptions>(
+    () => seriesLineOptions(dense, granularity, COMMIT_SERIES, formatCompact, formatNumber),
+    [dense, granularity]
+  );
+
   return (
     <div className="flex flex-col gap-4">
       <div className="grid gap-4 lg:grid-cols-2">
@@ -450,6 +463,8 @@ function UsageCharts({ points, from, granularity }: { points: TimeseriesPoint[];
       <div className="grid gap-4 lg:grid-cols-2">
         <ActivityChart title="Lines of code" series={LINES_SERIES} options={linesOptions} empty={empty} />
         <ActivityChart title="Edit decisions" series={EDITS_SERIES} options={editsOptions} empty={empty} />
+        <ActivityChart title="Pull requests" series={PR_SERIES} options={prOptions} empty={empty} />
+        <ActivityChart title="Commits" series={COMMIT_SERIES} options={commitOptions} empty={empty} />
       </div>
     </div>
   );
@@ -640,12 +655,20 @@ function ModelsTable({ models, onOpen }: { models: ModelSummary[]; onOpen: (mode
 // dropdown. Resolves the numeric id to a friendly "shortId · user" label via the session detail route.
 function SessionFilterChip({ id, onClear }: { id: number; onClear: () => void }) {
   const session = useQuery({ queryKey: ["session", id], queryFn: () => getSession(id) });
+  const transcript = useQuery({ queryKey: ["transcript-info", id], queryFn: () => getTranscriptInfo(id) });
   const data = session.data;
   const label = data ? `${compact(data.sessionId)} · ${data.userEmail ?? data.userAccountId ?? data.userId ?? "unknown"}` : `Session #${id}`;
   return (
-    <Chip variant="flat" color="primary" startContent={<RefreshCcw size={14} className="ml-1" />} onClose={onClear} className="self-end">
-      {label}
-    </Chip>
+    <div className="flex items-center gap-2 self-end">
+      <Chip variant="flat" color="primary" startContent={<RefreshCcw size={14} className="ml-1" />} onClose={onClear}>
+        {label}
+      </Chip>
+      {transcript.data && (
+        <a href={transcriptUrl(id)} target="_blank" rel="noreferrer" className="text-sm text-primary hover:underline">
+          View transcript
+        </a>
+      )}
+    </div>
   );
 }
 
@@ -778,7 +801,9 @@ function densify(points: TimeseriesPoint[], from: number | undefined, stepMs: nu
         linesAdded: 0,
         linesRemoved: 0,
         editsAccepted: 0,
-        editsRejected: 0
+        editsRejected: 0,
+        pullRequests: 0,
+        commits: 0
       }
     );
   }

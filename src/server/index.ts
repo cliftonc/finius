@@ -4,13 +4,22 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createApp } from "./app.js";
 import { EventBus } from "./events.js";
+import { LocalBlobStore } from "./storage/blob.js";
 import { SqliteStorageAdapter } from "./storage/sqlite.js";
 
 const port = Number(process.env.PORT ?? 8787);
 const dbPath = process.env.FINIUS_DB_PATH ?? "data/finius.sqlite";
-const storage = new SqliteStorageAdapter(resolve(dbPath));
+const storeRawPayloads = (process.env.FINIUS_RAW_PAYLOADS ?? "retain") !== "off";
+const rawRetentionDays = Number(process.env.FINIUS_RAW_RETENTION_DAYS ?? 7);
+const blob = process.env.FINIUS_BLOB_DIR ? new LocalBlobStore(resolve(process.env.FINIUS_BLOB_DIR)) : undefined;
+const storage = new SqliteStorageAdapter(resolve(dbPath), { storeRawPayloads, blob });
 const events = new EventBus();
-const app = createApp({ storage, events });
+const app = createApp({
+  storage,
+  events,
+  cronToken: process.env.FINIUS_CRON_TOKEN,
+  rawRetentionDays: Number.isFinite(rawRetentionDays) ? rawRetentionDays : 7
+});
 const clientDist = resolve("dist/client");
 
 if (existsSync(clientDist)) {

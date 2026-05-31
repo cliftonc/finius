@@ -74,12 +74,33 @@ Besides live OTLP telemetry, you can backfill from JSONL transcripts:
 - `POST /api/import/claude-hook` — body `{ transcript_path, session_id?, cwd? }`; reads a local
   Claude Code transcript file (restricted to `~/.claude/projects` or the given `cwd`).
 
-Imports are idempotent — re-sending the same data is detected and skipped.
+Imports are idempotent — re-sending the same file (matched by content hash) is detected and skipped.
+The original transcript is stored as a file and can be viewed from the session drill-down
+(`GET /api/sessions/:id/transcript`).
 
 ## Storage
 
 Data is stored in `data/finius.sqlite` by default. Override with `FINIUS_DB_PATH=/path/to/db.sqlite`.
-Override the API port with `PORT`.
+Override the API port with `PORT`. Imported transcript files live under `<db-dir>/transcripts`
+(override with `FINIUS_BLOB_DIR`).
+
+Dashboard reads are served from a pre-aggregated hourly `metric_rollup`; raw `metric_points` keep
+the full-resolution data for the live view and drill-downs.
+
+### Raw batch retention
+
+The full OTLP payload of each ingest batch is kept in `raw_batches` only to allow replaying history
+into new metric classifications. Control it with:
+
+- `FINIUS_RAW_PAYLOADS=retain` (default) | `off` — `off` keeps only the dedup hash, not the payload.
+- `FINIUS_RAW_RETENTION_DAYS=7` (default) — age cutoff used by the prune endpoint below.
+- `FINIUS_CRON_TOKEN=<secret>` — enables `POST /api/maintenance/prune-raw-batches`. Without it the
+  endpoint is disabled (returns 503). Wire a cron to it:
+
+  ```bash
+  curl -fsS -X POST -H "Authorization: Bearer $FINIUS_CRON_TOKEN" \
+    http://127.0.0.1:8787/api/maintenance/prune-raw-batches
+  ```
 
 ## Other commands
 

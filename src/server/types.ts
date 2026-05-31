@@ -1,4 +1,12 @@
-export type MetricKind = "tokens" | "cost" | "lines" | "decision" | "active_time";
+export type MetricKind =
+  | "tokens"
+  | "cost"
+  | "lines"
+  | "decision"
+  | "active_time"
+  | "session"
+  | "pull_request"
+  | "commit";
 
 export type MetricPointInput = {
   source: string;
@@ -15,7 +23,6 @@ export type MetricPointInput = {
   unit?: string | null;
   timestamp: number;
   attributes?: Record<string, unknown>;
-  rawEventId?: number | null;
 };
 
 export type SessionSummary = {
@@ -88,6 +95,8 @@ export type Summary = {
   linesRemoved: number;
   editsAccepted: number;
   editsRejected: number;
+  pullRequests: number;
+  commits: number;
   models: Array<{ model: string; totalCost: number; totalTokens: number; sessions: number }>;
   users: Array<{ user: string; totalCost: number; totalTokens: number; sessions: number }>;
   sources: Array<{ source: string; totalCost: number; totalTokens: number; sessions: number }>;
@@ -108,6 +117,15 @@ export type TimeseriesPoint = {
   linesRemoved: number;
   editsAccepted: number;
   editsRejected: number;
+  pullRequests: number;
+  commits: number;
+};
+
+export type TranscriptInfo = {
+  source: string;
+  importedAt: number;
+  byteSize: number;
+  lineCount: number;
 };
 
 export type ImportResult = {
@@ -121,7 +139,9 @@ export type ImportResult = {
 export interface StorageAdapter {
   ingestOtelMetrics(batch: unknown): Promise<{ duplicate: boolean; points: number }>;
   ingestOtelLogs(batch: unknown): Promise<{ duplicate: boolean; events: number }>;
-  importJsonl(source: string, sessionHint: Partial<MetricPointInput>, lines: string[]): Promise<ImportResult>;
+  importJsonl(source: string, sessionHint: Partial<MetricPointInput>, content: string): Promise<ImportResult>;
+  getSessionTranscript(sessionRowId: number): Promise<{ content: string; source: string; importedAt: number } | null>;
+  getSessionTranscriptInfo(sessionRowId: number): Promise<TranscriptInfo | null>;
   getSummary(filters: SummaryFilters): Promise<Summary>;
   getTimeseries(filters: SummaryFilters & { granularity?: Granularity }): Promise<TimeseriesPoint[]>;
   listSessions(filters: SummaryFilters): Promise<SessionSummary[]>;
@@ -129,5 +149,6 @@ export interface StorageAdapter {
   listPeople(filters: SummaryFilters): Promise<PersonSummary[]>;
   listModels(filters: SummaryFilters): Promise<ModelSummary[]>;
   getFilterOptions(): Promise<FilterOptions>;
+  pruneRawBatches(beforeTimestampMs: number): Promise<{ deleted: number }>;
   close(): void;
 }

@@ -46,4 +46,68 @@ describe("API", () => {
     expect(summary).toMatchObject({ totalCost: 0, totalTokens: 0, sessionCount: 0 });
     expect(timeseries).toEqual([]);
   });
+
+  it("imports a transcript file and serves it back over the API", async () => {
+    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    const app = createApp({ storage, events: new EventBus() });
+    const content = '{"session_id":"s1","message":{"usage":{"input_tokens":10,"output_tokens":2}}}';
+
+    const imported = await app.request("/api/import/jsonl", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content, source: "manual-jsonl", sessionId: "s1" })
+    });
+    expect(imported.status).toBe(200);
+
+    const sessions = (await (await app.request("/api/sessions")).json()) as Array<{ id: number; sessionId: string }>;
+    const session = sessions.find((s) => s.sessionId === "s1")!;
+
+    const info = await app.request(`/api/sessions/${session.id}/transcript/info`);
+    expect(info.status).toBe(200);
+    expect(await info.json()).toMatchObject({ source: "manual-jsonl", lineCount: 1 });
+
+    const transcript = await app.request(`/api/sessions/${session.id}/transcript`);
+    expect(transcript.status).toBe(200);
+    expect(await transcript.text()).toBe(content);
+
+    // A session with no stored transcript returns 404 for both endpoints.
+    expect((await app.request("/api/sessions/999999/transcript")).status).toBe(404);
+    expect((await app.request("/api/sessions/999999/transcript/info")).status).toBe(404);
+  });
+
+  it("guards the prune endpoint with a bearer token and fails closed without one", async () => {
+    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+
+    // No token configured -> endpoint disabled.
+    const closed = createApp({ storage, events: new EventBus() });
+    expect((await closed.request("/api/maintenance/prune-raw-batches", { method: "POST" })).status).toBe(503);
+
+    // Token configured -> requires a matching bearer.
+    const app = createApp({ storage, events: new EventBus(), cronToken: "secret" });
+    expect((await app.request("/api/maintenance/prune-raw-batches", { method: "POST" })).status).toBe(401);
+    const bad = await app.request("/api/maintenance/prune-raw-batches", {
+      method: "POST",
+      headers: { authorization: "Bearer wrong" }
+    });
+    expect(bad.status).toBe(401);
+    const ok = await app.request("/api/maintenance/prune-raw-batches?olderThanDays=0", {
+      method: "POST",
+      headers: { authorization: "Bearer secret" }
+    });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toMatchObject({ deleted: expect.any(Number), olderThanDays: 0 });
+  });
+
+  it("prunes only raw batches older than the cutoff", async () => {
+    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
+
+    // Nothing is older than 7 days, so a default prune deletes nothing.
+    const keep = await storage.pruneRawBatches(Date.now() - 7 * 86_400_000);
+    expect(keep.deleted).toBe(0);
+
+    // Everything is older than "now", so a zero-day cutoff deletes the batch we just ingested.
+    const drop = await storage.pruneRawBatches(Date.now() + 1);
+    expect(drop.deleted).toBe(1);
+  });
 });

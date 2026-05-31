@@ -17,9 +17,12 @@ const COST_METRIC = "claude_code.cost.usage";
 const LINES_METRIC = "claude_code.lines_of_code.count";
 const DECISION_METRIC = "claude_code.code_edit_tool.decision";
 const ACTIVE_TIME_METRIC = "claude_code.active_time.total";
+const SESSION_METRIC = "claude_code.session.count";
+const PR_METRIC = "claude_code.pull_request.count";
+const COMMIT_METRIC = "claude_code.commit.count";
 
 // Maps an OTLP metric to our (kind, sub-type) for the metric_points table. Returns null for
-// metrics we don't aggregate (they're still captured in raw_events via parseOtelMetricRecords).
+// metrics we don't aggregate (those data points are dropped).
 function classifyMetric(metricName: string, attributes: Record<string, unknown>): { kind: MetricKind; tokenType: string | null } | null {
   switch (metricName) {
     case TOKEN_METRIC:
@@ -32,6 +35,12 @@ function classifyMetric(metricName: string, attributes: Record<string, unknown>)
       return { kind: "decision", tokenType: stringAttr(attributes, "decision") ?? null };
     case ACTIVE_TIME_METRIC:
       return { kind: "active_time", tokenType: stringAttr(attributes, "type") ?? null };
+    case SESSION_METRIC:
+      return { kind: "session", tokenType: stringAttr(attributes, "start_type") ?? null };
+    case PR_METRIC:
+      return { kind: "pull_request", tokenType: null };
+    case COMMIT_METRIC:
+      return { kind: "commit", tokenType: null };
     default:
       return null;
   }

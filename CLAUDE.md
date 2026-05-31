@@ -29,13 +29,19 @@ server. See that script for the canonical env-var set, or the README for the man
 - `src/server/index.ts` — entry point. Wires `SqliteStorageAdapter` + `EventBus` into the app,
   serves the built client from `dist/client` when present, binds to `127.0.0.1:8787`.
 - `src/server/app.ts` — Hono routes: `/otlp/v1/{metrics,logs}` ingest, `/api/metrics/{summary,timeseries}`,
-  `/api/sessions[/:id]`, `/api/people`, `/api/models`, `/api/meta` (filter options), `/api/import/{jsonl,claude-hook}`,
-  and the `/events` SSE stream. All list/metric routes accept the same filters (`from`, `to`, `source`,
-  `user`, `model`, `session`) parsed by `readFilters`.
+  `/api/sessions[/:id]` (+ `/:id/transcript[/info]`), `/api/people`, `/api/models`, `/api/meta` (filter
+  options), `/api/import/{jsonl,claude-hook}`, `/api/maintenance/prune-raw-batches` (bearer-token,
+  fails closed), and the `/events` SSE stream. All list/metric routes accept the same filters
+  (`from`, `to`, `source`, `user`, `model`, `session`) parsed by `readFilters`.
 - `src/server/storage/sqlite.ts` — the `StorageAdapter` implementation. Owns the schema (`migrate()`),
-  batch-level idempotency (`raw_batches.hash` UNIQUE), session upsert, and all aggregation SQL.
+  batch-level idempotency (`raw_batches.hash` UNIQUE), session upsert, the hourly `metric_rollup`
+  (`upsertRollup`, built once by `migrateRollup()` and maintained on ingest), and all aggregation SQL.
+  Reads route to the rollup when possible (`canUseRollup`/`rollupWhere`) and fall back to
+  `metric_points` for session filters, sub-hour timeseries, and distinct counts.
+- `src/server/storage/blob.ts` — `BlobStore` interface + `LocalBlobStore`; holds imported transcript
+  files (content-addressed by sha256), linked to sessions via the `source_files` table.
 - `src/server/otel.ts` — pure parsers: OTLP protobuf-JSON → `MetricPointInput[]`, attribute decoding,
-  `stableHash`, token-type normalization.
+  `stableHash`, `preferredIdentity`, token-type normalization.
 - `src/server/jsonl.ts` — pure parser: transcript lines → metric points (usage + cost extraction).
 - `src/server/events.ts` — in-process pub/sub `EventBus` backing the SSE stream.
 - `src/server/types.ts` — shared types and the `StorageAdapter` interface.
@@ -44,7 +50,9 @@ server. See that script for the canonical env-var set, or the README for the man
   share one filter set, and clicking a session/person/model row (or a Home breakdown row) drills into
   the Home view by setting the matching filter — the drill-down page is just `HomeView` re-filtered.
 
-Data lives in `data/finius.sqlite` (override with `FINIUS_DB_PATH`).
+Data lives in `data/finius.sqlite` (override with `FINIUS_DB_PATH`); imported transcripts live under
+`<db-dir>/transcripts` (override with `FINIUS_BLOB_DIR`). Env knobs: `FINIUS_RAW_PAYLOADS`
+(`retain`|`off`), `FINIUS_RAW_RETENTION_DAYS` (default 7), `FINIUS_CRON_TOKEN` (enables the prune endpoint).
 
 ## Conventions
 

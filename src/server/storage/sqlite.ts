@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { type BlobStore, LocalBlobStore } from "./blob.js";
 import { parseJsonl } from "../jsonl.js";
 import { parseOtelLogRecords, parseOtelMetricPoints, parseOtelMetricRecords, preferredIdentity, stableHash } from "../otel.js";
 import type { OtelMetricRecord } from "../otel.js";
@@ -15,7 +17,8 @@ import type {
   StorageAdapter,
   Summary,
   SummaryFilters,
-  TimeseriesPoint
+  TimeseriesPoint,
+  TranscriptInfo
 } from "../types.js";
 
 const GRANULARITY_MS: Record<Granularity, number> = {
@@ -29,10 +32,22 @@ const GRANULARITY_MS: Record<Granularity, number> = {
 
 type Database = InstanceType<typeof DatabaseSync>;
 
+export type SqliteStorageOptions = {
+  // When false (FINIUS_RAW_PAYLOADS=off), raw_batches stores only the dedup hash, not the payload.
+  // This disables replay/backfill of new metric kinds from history but keeps the DB lean.
+  storeRawPayloads?: boolean;
+  // Where imported transcript files are persisted. Defaults to a LocalBlobStore under the DB dir.
+  blob?: BlobStore;
+};
+
 export class SqliteStorageAdapter implements StorageAdapter {
   private db: Database;
+  private storeRawPayloads: boolean;
+  private blob: BlobStore;
 
-  constructor(path: string) {
+  constructor(path: string, options: SqliteStorageOptions = {}) {
+    this.storeRawPayloads = options.storeRawPayloads ?? true;
+    this.blob = options.blob ?? new LocalBlobStore(join(dirname(path), "transcripts"));
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -46,20 +61,14 @@ export class SqliteStorageAdapter implements StorageAdapter {
     if (rawBatchId === null) return { duplicate: true, points: 0 };
 
     const points = parseOtelMetricPoints(batch);
-    const records = parseOtelMetricRecords(batch);
-    warnIfCumulative(records);
-
-    const insertRaw = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
-    const now = Date.now();
+    // Still parsed (not persisted) so we can warn once if a backend sends CUMULATIVE temporality.
+    warnIfCumulative(parseOtelMetricRecords(batch));
 
     this.db.exec("BEGIN");
     try {
-      // Persist every metric data point (all metric names) so the raw log is complete.
-      for (const record of records) {
-        insertRaw.run(record.source, "otlp_metrics", rawBatchId, JSON.stringify(record), now);
-      }
       for (const point of points) {
         this.insertMetricPoint(point, rawBatchId);
+        this.upsertRollup(point);
       }
       this.db.exec("COMMIT");
     } catch (error) {
@@ -75,40 +84,43 @@ export class SqliteStorageAdapter implements StorageAdapter {
     const rawBatchId = this.insertRawBatch("otlp_logs", hash, batch);
     if (rawBatchId === null) return { duplicate: true, events: 0 };
 
+    // Logs are not aggregated into metric_points; we keep only the dedup hash (+ optional payload)
+    // in raw_batches and report the parsed event count.
     const records = parseOtelLogRecords(batch);
-    const insert = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
-    const now = Date.now();
-
-    this.db.exec("BEGIN");
-    try {
-      for (const record of records) {
-        insert.run("claude-code", "otlp_logs", rawBatchId, JSON.stringify(record), now);
-      }
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-
     return { duplicate: false, events: records.length };
   }
 
-  async importJsonl(source: string, sessionHint: Partial<MetricPointInput>, lines: string[]): Promise<ImportResult> {
-    const hash = stableHash("jsonl", { source, sessionHint, lines });
-    const rawBatchId = this.insertRawBatch("jsonl", hash, { source, sessionHint, lineCount: lines.length });
-    if (rawBatchId === null) return { duplicate: true, importedLines: 0, malformedLines: 0, metricPoints: 0, rawEvents: 0 };
+  async importJsonl(source: string, sessionHint: Partial<MetricPointInput>, content: string): Promise<ImportResult> {
+    // Dedup on the file's content hash; the stored file is the replay source, so the JSONL path no
+    // longer touches raw_batches at all.
+    const hash = createHash("sha256").update(content).digest("hex");
+    const existing = this.db.prepare("SELECT id FROM source_files WHERE hash = ?").get(hash);
+    if (existing) return { duplicate: true, importedLines: 0, malformedLines: 0, metricPoints: 0, rawEvents: 0 };
 
+    const lines = content.split(/\r?\n/);
     const parsed = parseJsonl(source, sessionHint, lines);
+
+    // Persist the original file before recording it, so a source_files row never dangles.
+    await this.blob.save(hash, content);
+
     this.db.exec("BEGIN");
     try {
-      const insertRaw = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
-      const now = Date.now();
-      for (const rawEvent of parsed.rawEvents) {
-        insertRaw.run(source, "jsonl", rawBatchId, JSON.stringify(rawEvent), now);
-      }
       for (const point of parsed.points) {
-        this.insertMetricPoint(point, rawBatchId);
+        this.insertMetricPoint(point, null);
+        this.upsertRollup(point);
       }
+      // Link the file to its dominant session (hint, else first parsed point). metric_points keep
+      // their own session_row_id, so a file spanning sessions still attributes correctly.
+      const sessionId = sessionHint.sessionId ?? parsed.points[0]?.sessionId ?? null;
+      const sessionRow = sessionId
+        ? (this.db.prepare("SELECT id FROM sessions WHERE source = ? AND session_id = ?").get(source, sessionId) as { id: number } | undefined)
+        : undefined;
+      this.db
+        .prepare(
+          `INSERT INTO source_files (source, session_row_id, session_id, hash, blob_key, byte_size, line_count, imported_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(source, sessionRow?.id ?? null, sessionId, hash, hash, Buffer.byteLength(content), parsed.result.importedLines, Date.now());
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -118,7 +130,85 @@ export class SqliteStorageAdapter implements StorageAdapter {
     return parsed.result;
   }
 
+  async getSessionTranscript(sessionRowId: number): Promise<{ content: string; source: string; importedAt: number } | null> {
+    const row = this.db
+      .prepare("SELECT blob_key AS blobKey, source, imported_at AS importedAt FROM source_files WHERE session_row_id = ? ORDER BY imported_at DESC LIMIT 1")
+      .get(sessionRowId) as { blobKey: string; source: string; importedAt: number } | undefined;
+    if (!row) return null;
+    const bytes = await this.blob.read(row.blobKey);
+    if (!bytes) return null;
+    return { content: bytes.toString("utf8"), source: row.source, importedAt: row.importedAt };
+  }
+
+  // Metadata only (no blob read) so the UI can decide whether to show a "view transcript" link.
+  async getSessionTranscriptInfo(sessionRowId: number): Promise<TranscriptInfo | null> {
+    const row = this.db
+      .prepare(
+        "SELECT source, imported_at AS importedAt, byte_size AS byteSize, line_count AS lineCount FROM source_files WHERE session_row_id = ? ORDER BY imported_at DESC LIMIT 1"
+      )
+      .get(sessionRowId) as TranscriptInfo | undefined;
+    return row ?? null;
+  }
+
   async getSummary(filters: SummaryFilters): Promise<Summary> {
+    // The rollup has no session dimension, so a session-filtered summary falls back to metric_points.
+    return canUseRollup(filters) ? this.summaryFromRollup(filters) : this.summaryFromPoints(filters);
+  }
+
+  // Served from the pre-aggregated rollup. Scalar totals + activeSenders sum cleanly from rollup
+  // rows; sessionCount is a distinct count that cannot be summed across buckets, so it stays on
+  // metric_points (see upsertRollup note).
+  private summaryFromRollup(filters: SummaryFilters): Summary {
+    const { where, params } = rollupWhere(filters);
+    const totals = this.db
+      .prepare(
+        `SELECT
+          COALESCE(SUM(CASE WHEN kind = 'cost' THEN sum_value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN sum_value ELSE 0 END), 0) AS inputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN sum_value ELSE 0 END), 0) AS outputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_creation' THEN sum_value ELSE 0 END), 0) AS cacheCreationTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_read' THEN sum_value ELSE 0 END), 0) AS cacheReadTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' THEN sum_value ELSE 0 END), 0) AS totalTokens,
+          COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'added' THEN sum_value ELSE 0 END), 0) AS linesAdded,
+          COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'removed' THEN sum_value ELSE 0 END), 0) AS linesRemoved,
+          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'accept' THEN sum_value ELSE 0 END), 0) AS editsAccepted,
+          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'reject' THEN sum_value ELSE 0 END), 0) AS editsRejected,
+          COALESCE(SUM(CASE WHEN kind = 'pull_request' THEN sum_value ELSE 0 END), 0) AS pullRequests,
+          COALESCE(SUM(CASE WHEN kind = 'commit' THEN sum_value ELSE 0 END), 0) AS commits,
+          COUNT(DISTINCT user_identity) AS activeSenders
+        FROM metric_rollup ${where}`
+      )
+      .get(...params) as Record<string, number>;
+
+    const point = pointWhere(filters);
+    const { sessionCount } = this.db
+      .prepare(`SELECT COUNT(DISTINCT session_row_id) AS sessionCount FROM metric_points ${point.where}`)
+      .get(...point.params) as { sessionCount: number };
+
+    return {
+      totalCost: totals.totalCost,
+      inputTokens: totals.inputTokens,
+      outputTokens: totals.outputTokens,
+      cacheCreationTokens: totals.cacheCreationTokens,
+      cacheReadTokens: totals.cacheReadTokens,
+      totalTokens: totals.totalTokens,
+      sessionCount,
+      activeSenders: totals.activeSenders,
+      linesAdded: totals.linesAdded,
+      linesRemoved: totals.linesRemoved,
+      editsAccepted: totals.editsAccepted,
+      editsRejected: totals.editsRejected,
+      pullRequests: totals.pullRequests,
+      commits: totals.commits,
+      models: this.rollupBreakdown("model", "model", filters),
+      users: this.rollupBreakdown("user_identity", "COALESCE(user_email, user_account_id, user_id, 'unknown')", filters, "user"),
+      sources: this.rollupBreakdown("source", "source", filters)
+    };
+  }
+
+  // Fallback path: aggregate directly over metric_points (used when a session filter is present,
+  // which the rollup can't express). Identical results to summaryFromRollup.
+  private summaryFromPoints(filters: SummaryFilters): Summary {
     const { where, params } = pointWhere(filters);
     const totals = this.db
       .prepare(
@@ -133,6 +223,8 @@ export class SqliteStorageAdapter implements StorageAdapter {
           COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'removed' THEN value ELSE 0 END), 0) AS linesRemoved,
           COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'accept' THEN value ELSE 0 END), 0) AS editsAccepted,
           COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'reject' THEN value ELSE 0 END), 0) AS editsRejected,
+          COALESCE(SUM(CASE WHEN kind = 'pull_request' THEN value ELSE 0 END), 0) AS pullRequests,
+          COALESCE(SUM(CASE WHEN kind = 'commit' THEN value ELSE 0 END), 0) AS commits,
           COUNT(DISTINCT session_row_id) AS sessionCount,
           COUNT(DISTINCT COALESCE(user_email, user_account_id, user_id, 'unknown')) AS activeSenders
         FROM metric_points ${where}`
@@ -152,6 +244,8 @@ export class SqliteStorageAdapter implements StorageAdapter {
       linesRemoved: totals.linesRemoved,
       editsAccepted: totals.editsAccepted,
       editsRejected: totals.editsRejected,
+      pullRequests: totals.pullRequests,
+      commits: totals.commits,
       models: this.breakdown("model", where, params),
       users: this.breakdown("COALESCE(user_email, user_account_id, user_id, 'unknown')", where, params, "user"),
       sources: this.breakdown("source", where, params)
@@ -159,7 +253,36 @@ export class SqliteStorageAdapter implements StorageAdapter {
   }
 
   async getTimeseries(filters: SummaryFilters & { granularity?: Granularity }): Promise<TimeseriesPoint[]> {
-    const bucketMs = GRANULARITY_MS[filters.granularity ?? "hour"];
+    const granularity = filters.granularity ?? "hour";
+    const bucketMs = GRANULARITY_MS[granularity];
+    // Hour/day/week (>= the hourly rollup grain) re-bucket from the rollup; sub-hour grains and
+    // session-filtered reads (the live view) fall back to metric_points for exact resolution.
+    if (canUseRollup(filters, granularity)) {
+      const { where, params } = rollupWhere(filters);
+      return this.db
+        .prepare(
+          `SELECT
+            CAST(bucket / ? AS INTEGER) * ? AS bucket,
+            COALESCE(SUM(CASE WHEN kind = 'cost' THEN sum_value ELSE 0 END), 0) AS totalCost,
+            COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN sum_value ELSE 0 END), 0) AS inputTokens,
+            COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN sum_value ELSE 0 END), 0) AS outputTokens,
+            COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_creation' THEN sum_value ELSE 0 END), 0) AS cacheCreationTokens,
+            COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_read' THEN sum_value ELSE 0 END), 0) AS cacheReadTokens,
+            COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type IN ('cache_creation', 'cache_read') THEN sum_value ELSE 0 END), 0) AS cacheTokens,
+            COALESCE(SUM(CASE WHEN kind = 'tokens' THEN sum_value ELSE 0 END), 0) AS totalTokens,
+            COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'added' THEN sum_value ELSE 0 END), 0) AS linesAdded,
+            COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'removed' THEN sum_value ELSE 0 END), 0) AS linesRemoved,
+            COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'accept' THEN sum_value ELSE 0 END), 0) AS editsAccepted,
+            COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'reject' THEN sum_value ELSE 0 END), 0) AS editsRejected,
+            COALESCE(SUM(CASE WHEN kind = 'pull_request' THEN sum_value ELSE 0 END), 0) AS pullRequests,
+            COALESCE(SUM(CASE WHEN kind = 'commit' THEN sum_value ELSE 0 END), 0) AS commits
+          FROM metric_rollup ${where}
+          GROUP BY bucket
+          ORDER BY bucket ASC`
+        )
+        .all(bucketMs, bucketMs, ...params) as TimeseriesPoint[];
+    }
+
     const { where, params } = pointWhere(filters);
     const rows = this.db
       .prepare(
@@ -175,7 +298,9 @@ export class SqliteStorageAdapter implements StorageAdapter {
           COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'added' THEN value ELSE 0 END), 0) AS linesAdded,
           COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'removed' THEN value ELSE 0 END), 0) AS linesRemoved,
           COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'accept' THEN value ELSE 0 END), 0) AS editsAccepted,
-          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'reject' THEN value ELSE 0 END), 0) AS editsRejected
+          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'reject' THEN value ELSE 0 END), 0) AS editsRejected,
+          COALESCE(SUM(CASE WHEN kind = 'pull_request' THEN value ELSE 0 END), 0) AS pullRequests,
+          COALESCE(SUM(CASE WHEN kind = 'commit' THEN value ELSE 0 END), 0) AS commits
         FROM metric_points ${where}
         GROUP BY bucket
         ORDER BY bucket ASC`
@@ -265,14 +390,13 @@ export class SqliteStorageAdapter implements StorageAdapter {
   }
 
   async getFilterOptions(): Promise<FilterOptions> {
-    const sources = this.db.prepare("SELECT DISTINCT source FROM metric_points ORDER BY source").all() as Array<{ source: string }>;
+    // Served from the rollup: same distinct dimension values, far fewer rows to scan.
+    const sources = this.db.prepare("SELECT DISTINCT source FROM metric_rollup ORDER BY source").all() as Array<{ source: string }>;
     const users = this.db
-      .prepare(
-        "SELECT DISTINCT COALESCE(user_email, user_account_id, user_id, 'unknown') AS user FROM metric_points ORDER BY user"
-      )
+      .prepare("SELECT DISTINCT user_identity AS user FROM metric_rollup ORDER BY user")
       .all() as Array<{ user: string }>;
     const models = this.db
-      .prepare("SELECT DISTINCT model FROM metric_points WHERE model IS NOT NULL ORDER BY model")
+      .prepare("SELECT DISTINCT model FROM metric_rollup WHERE model <> '' ORDER BY model")
       .all() as Array<{ model: string }>;
     return { sources: sources.map((r) => r.source), users: users.map((r) => r.user), models: models.map((r) => r.model) };
   }
@@ -289,16 +413,6 @@ export class SqliteStorageAdapter implements StorageAdapter {
         hash TEXT NOT NULL UNIQUE,
         payload_json TEXT NOT NULL,
         received_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS raw_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source TEXT NOT NULL,
-        signal TEXT NOT NULL,
-        raw_batch_id INTEGER,
-        event_json TEXT NOT NULL,
-        seen_at INTEGER NOT NULL,
-        FOREIGN KEY (raw_batch_id) REFERENCES raw_batches(id)
       );
 
       CREATE TABLE IF NOT EXISTS sessions (
@@ -331,16 +445,42 @@ export class SqliteStorageAdapter implements StorageAdapter {
         timestamp INTEGER NOT NULL,
         attributes_json TEXT,
         raw_batch_id INTEGER,
-        raw_event_id INTEGER,
         FOREIGN KEY (session_row_id) REFERENCES sessions(id),
-        FOREIGN KEY (raw_batch_id) REFERENCES raw_batches(id),
-        FOREIGN KEY (raw_event_id) REFERENCES raw_events(id)
+        FOREIGN KEY (raw_batch_id) REFERENCES raw_batches(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS metric_rollup (
+        bucket        INTEGER NOT NULL,
+        source        TEXT    NOT NULL,
+        user_identity TEXT    NOT NULL,
+        model         TEXT    NOT NULL,
+        kind          TEXT    NOT NULL,
+        token_type    TEXT    NOT NULL,
+        sum_value     REAL    NOT NULL DEFAULT 0,
+        cnt           INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, source, user_identity, model, kind, token_type)
+      ) WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS source_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        session_row_id INTEGER,
+        session_id TEXT,
+        hash TEXT NOT NULL UNIQUE,
+        blob_key TEXT NOT NULL,
+        byte_size INTEGER NOT NULL,
+        line_count INTEGER NOT NULL,
+        imported_at INTEGER NOT NULL,
+        FOREIGN KEY (session_row_id) REFERENCES sessions(id)
       );
 
       CREATE INDEX IF NOT EXISTS idx_metric_points_timestamp ON metric_points(timestamp);
       CREATE INDEX IF NOT EXISTS idx_metric_points_session ON metric_points(session_row_id);
       CREATE INDEX IF NOT EXISTS idx_metric_points_model ON metric_points(model);
       CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_rollup_bucket ON metric_rollup(bucket);
+      CREATE INDEX IF NOT EXISTS idx_raw_batches_received_at ON raw_batches(received_at);
+      CREATE INDEX IF NOT EXISTS idx_source_files_session ON source_files(session_row_id);
     `);
 
     // Repair token types ingested before camelCase cache types were normalized (cacheCreation/cacheRead).
@@ -351,11 +491,44 @@ export class SqliteStorageAdapter implements StorageAdapter {
     `);
 
     this.backfillActivityMetrics();
+    this.migrateRollup();
   }
 
-  // Older batches only stored token/cost metric points and no metric raw_events. Replay the stored
-  // OTLP payloads once to backfill the activity metric_points (lines/decision/active_time) and the
-  // per-metric raw_events. Gated on PRAGMA user_version so it runs exactly once.
+  // Build metric_rollup from existing metric_points once, and drop the now-unused raw_events audit
+  // log. Gated on PRAGMA user_version so it runs exactly once. Must run AFTER backfillActivityMetrics
+  // so the replayed activity points are included in the wholesale rollup backfill.
+  private migrateRollup() {
+    const { user_version: version } = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
+    if (version >= 2) return;
+
+    // foreign_keys cannot be toggled inside a transaction, and dropping raw_events would otherwise
+    // trip metric_points' (now-removed) FK on legacy databases.
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("DROP TABLE IF EXISTS raw_events");
+    this.db.exec("PRAGMA foreign_keys = ON");
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec(`
+        INSERT INTO metric_rollup (bucket, source, user_identity, model, kind, token_type, sum_value, cnt)
+        SELECT CAST(timestamp / 3600000 AS INTEGER) * 3600000, source,
+               COALESCE(user_email, user_account_id, user_id, 'unknown'),
+               COALESCE(model, ''), kind, COALESCE(token_type, ''), SUM(value), COUNT(*)
+        FROM metric_points
+        GROUP BY 1, 2, 3, 4, 5, 6
+      `);
+      this.db.exec("PRAGMA user_version = 2");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // Older batches only stored token/cost metric points. Replay the stored OTLP payloads once to
+  // backfill the activity metric_points (lines/decision/active_time) that older builds didn't
+  // classify. Gated on PRAGMA user_version so it runs exactly once. The rollup is built afterwards
+  // by migrateRollup() from the completed metric_points, so no rollup upsert is needed here.
   private backfillActivityMetrics() {
     const { user_version: version } = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
     if (version >= 1) return;
@@ -364,16 +537,12 @@ export class SqliteStorageAdapter implements StorageAdapter {
       id: number;
       payload_json: string;
     }>;
-    const insertRaw = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
-    const now = Date.now();
 
     this.db.exec("BEGIN");
     try {
       for (const batch of batches) {
+        if (!batch.payload_json) continue; // payload storage disabled (FINIUS_RAW_PAYLOADS=off) — nothing to replay.
         const payload = JSON.parse(batch.payload_json);
-        for (const record of parseOtelMetricRecords(payload)) {
-          insertRaw.run(record.source, "otlp_metrics", batch.id, JSON.stringify(record), now);
-        }
         // token/cost points already exist from the original ingest — only add the new kinds.
         for (const point of parseOtelMetricPoints(payload)) {
           if (point.kind === "tokens" || point.kind === "cost") continue;
@@ -389,13 +558,33 @@ export class SqliteStorageAdapter implements StorageAdapter {
   }
 
   private insertRawBatch(signal: string, hash: string, batch: unknown) {
+    // payload_json is NOT NULL in the schema; store '' (treated as "no payload") when payload
+    // storage is disabled, so we avoid a table rebuild while still keeping the dedup hash.
+    const payload = this.storeRawPayloads ? JSON.stringify(batch) : "";
     try {
       const result = this.db
         .prepare("INSERT INTO raw_batches (signal, hash, payload_json, received_at) VALUES (?, ?, ?, ?)")
-        .run(signal, hash, JSON.stringify(batch), Date.now());
+        .run(signal, hash, payload, Date.now());
       return Number(result.lastInsertRowid);
     } catch (error) {
       if (error instanceof Error && error.message.includes("UNIQUE")) return null;
+      throw error;
+    }
+  }
+
+  async pruneRawBatches(beforeTimestampMs: number): Promise<{ deleted: number }> {
+    this.db.exec("BEGIN");
+    try {
+      // Orphan any metric_points that reference the batches we're about to delete — they keep their
+      // aggregated data, just lose the back-reference to the now-gone raw payload (FK would block).
+      this.db
+        .prepare("UPDATE metric_points SET raw_batch_id = NULL WHERE raw_batch_id IN (SELECT id FROM raw_batches WHERE received_at < ?)")
+        .run(beforeTimestampMs);
+      const result = this.db.prepare("DELETE FROM raw_batches WHERE received_at < ?").run(beforeTimestampMs);
+      this.db.exec("COMMIT");
+      return { deleted: Number(result.changes) };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
       throw error;
     }
   }
@@ -406,8 +595,8 @@ export class SqliteStorageAdapter implements StorageAdapter {
       .prepare(
         `INSERT INTO metric_points (
           source, signal, session_row_id, session_id, user_id, user_email, user_account_id, model,
-          metric_name, kind, token_type, value, unit, timestamp, attributes_json, raw_batch_id, raw_event_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          metric_name, kind, token_type, value, unit, timestamp, attributes_json, raw_batch_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         point.source,
@@ -425,9 +614,24 @@ export class SqliteStorageAdapter implements StorageAdapter {
         point.unit ?? null,
         point.timestamp,
         JSON.stringify(point.attributes ?? {}),
-        rawBatchId,
-        point.rawEventId ?? null
+        rawBatchId
       );
+  }
+
+  // Maintain the pre-aggregated hourly rollup that serves the home view. Runs inside the same
+  // ingest transaction as insertMetricPoint, so the rollup is always consistent with metric_points.
+  // NOTE: sum_value/cnt are additive only — distinct counts (sessions/users) cannot be derived from
+  // here because an entity spans many buckets; those stay on metric_points.
+  private upsertRollup(point: MetricPointInput) {
+    const bucket = Math.floor(point.timestamp / 3_600_000) * 3_600_000;
+    this.db
+      .prepare(
+        `INSERT INTO metric_rollup (bucket, source, user_identity, model, kind, token_type, sum_value, cnt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+         ON CONFLICT(bucket, source, user_identity, model, kind, token_type)
+         DO UPDATE SET sum_value = sum_value + excluded.sum_value, cnt = cnt + excluded.cnt`
+      )
+      .run(bucket, point.source, preferredIdentity(point), point.model ?? "", point.kind, point.tokenType ?? "", point.value);
   }
 
   private upsertSession(point: MetricPointInput) {
@@ -473,6 +677,52 @@ export class SqliteStorageAdapter implements StorageAdapter {
       sessions: Number(row.sessions)
     })) as never;
   }
+
+  // Rollup equivalent of breakdown(): cost/tokens sum from the rollup, but the per-group distinct
+  // session count must still come from metric_points (distinct counts can't be summed across
+  // buckets). `rollupDim` is the rollup column; `pointDim` is the matching metric_points expression.
+  private rollupBreakdown(rollupDim: string, pointDim: string, filters: SummaryFilters, alias = rollupDim) {
+    const { where, params } = rollupWhere(filters);
+    const scoped = where ? `${where} AND kind IN ('tokens', 'cost')` : "WHERE kind IN ('tokens', 'cost')";
+    const rows = this.db
+      .prepare(
+        `SELECT
+          ${rollupDim} AS ${alias},
+          COALESCE(SUM(CASE WHEN kind = 'cost' THEN sum_value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' THEN sum_value ELSE 0 END), 0) AS totalTokens
+        FROM metric_rollup ${scoped}
+        GROUP BY ${rollupDim}
+        ORDER BY totalCost DESC, totalTokens DESC
+        LIMIT 10`
+      )
+      .all(...params) as Array<Record<string, string | number | null>>;
+
+    const sessionsByGroup = this.distinctSessionsByGroup(pointDim, filters);
+    return rows.map((row) => {
+      const label = String(row[alias] || "unknown"); // rollup '' sentinel (NULL model) -> "unknown"
+      return {
+        [alias]: label,
+        totalCost: Number(row.totalCost),
+        totalTokens: Number(row.totalTokens),
+        sessions: sessionsByGroup.get(label) ?? 0
+      };
+    }) as never;
+  }
+
+  // Distinct session counts per dimension group, from metric_points. Keyed by the same "unknown"
+  // normalization rollupBreakdown uses so the maps line up.
+  private distinctSessionsByGroup(pointDim: string, filters: SummaryFilters): Map<string, number> {
+    const { where, params } = pointWhere(filters);
+    const scoped = where ? `${where} AND kind IN ('tokens', 'cost')` : "WHERE kind IN ('tokens', 'cost')";
+    const rows = this.db
+      .prepare(
+        `SELECT ${pointDim} AS grp, COUNT(DISTINCT session_row_id) AS sessions
+         FROM metric_points ${scoped}
+         GROUP BY ${pointDim}`
+      )
+      .all(...params) as Array<{ grp: string | null; sessions: number }>;
+    return new Map(rows.map((r) => [String(r.grp || "unknown"), r.sessions]));
+  }
 }
 
 let warnedCumulative = false;
@@ -490,6 +740,41 @@ function warnIfCumulative(records: OtelMetricRecord[]) {
       "[finius] OTLP metrics arrived with CUMULATIVE temporality; token/cost totals assume DELTA and will overcount. Set OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta."
     );
   }
+}
+
+// The rollup can serve a read when it isn't session-filtered (no session dimension) and the
+// requested granularity is at least the hourly rollup grain (sub-hour grains need metric_points).
+function canUseRollup(filters: SummaryFilters, granularity?: Granularity) {
+  if (filters.session != null) return false;
+  return granularity == null || GRANULARITY_MS[granularity] >= GRANULARITY_MS.hour;
+}
+
+// WHERE builder for metric_rollup. Mirrors pointWhere but maps onto rollup columns: user_identity
+// is pre-resolved (no COALESCE), time compares against the hourly bucket, and there is no session.
+function rollupWhere(filters: SummaryFilters) {
+  const clauses: string[] = [];
+  const params: SQLInputValue[] = [];
+  if (filters.from) {
+    clauses.push("bucket >= ?");
+    params.push(filters.from);
+  }
+  if (filters.to) {
+    clauses.push("bucket <= ?");
+    params.push(filters.to);
+  }
+  if (filters.user) {
+    clauses.push("user_identity = ?");
+    params.push(filters.user);
+  }
+  if (filters.model) {
+    clauses.push("model = ?");
+    params.push(filters.model);
+  }
+  if (filters.source) {
+    clauses.push("source = ?");
+    params.push(filters.source);
+  }
+  return { where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", params };
 }
 
 function pointWhere(filters: SummaryFilters) {

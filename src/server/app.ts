@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -12,14 +13,33 @@ const GRANULARITIES: Granularity[] = ["minute", "five_minute", "quarter_hour", "
 type AppOptions = {
   storage: StorageAdapter;
   events: EventBus;
+  // Bearer token required to call maintenance endpoints. When unset, those endpoints are disabled
+  // (fail closed) rather than left open.
+  cronToken?: string;
+  // Default retention window (days) for the raw-batch prune endpoint.
+  rawRetentionDays?: number;
 };
 
-export function createApp({ storage, events }: AppOptions) {
+export function createApp({ storage, events, cronToken, rawRetentionDays = 7 }: AppOptions) {
   const app = new Hono();
 
   app.use("*", cors());
 
   app.get("/api/health", (c) => c.json({ ok: true, now: Date.now() }));
+
+  // Cron-driven cleanup of old raw_batches. Secured by a bearer token; fails closed when no token
+  // is configured. Wire a cron to: curl -X POST -H "Authorization: Bearer $FINIUS_CRON_TOKEN" …
+  app.post("/api/maintenance/prune-raw-batches", async (c) => {
+    if (!cronToken) return c.json({ error: "maintenance endpoints are disabled (set FINIUS_CRON_TOKEN)" }, 503);
+    if (!timingSafeEqualStr(bearerToken(c.req.header("authorization")), cronToken)) {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+    const days = Number(c.req.query("olderThanDays") ?? rawRetentionDays);
+    const olderThanDays = Number.isFinite(days) && days >= 0 ? days : rawRetentionDays;
+    const cutoff = Date.now() - olderThanDays * 86_400_000;
+    const result = await storage.pruneRawBatches(cutoff);
+    return c.json({ ...result, olderThanDays, cutoff });
+  });
 
   app.post("/otlp/v1/metrics", async (c) => {
     const body = await c.req.json();
@@ -55,6 +75,17 @@ export function createApp({ storage, events }: AppOptions) {
     return session ? c.json(session) : c.json({ error: "Session not found" }, 404);
   });
 
+  app.get("/api/sessions/:id/transcript/info", async (c) => {
+    const info = await storage.getSessionTranscriptInfo(Number(c.req.param("id")));
+    return info ? c.json(info) : c.json({ error: "No transcript stored for this session" }, 404);
+  });
+
+  app.get("/api/sessions/:id/transcript", async (c) => {
+    const transcript = await storage.getSessionTranscript(Number(c.req.param("id")));
+    if (!transcript) return c.json({ error: "No transcript stored for this session" }, 404);
+    return c.body(transcript.content, 200, { "content-type": "application/x-ndjson; charset=utf-8" });
+  });
+
   app.post("/api/import/jsonl", async (c) => {
     const contentType = c.req.header("content-type") ?? "";
     let content = "";
@@ -70,7 +101,7 @@ export function createApp({ storage, events }: AppOptions) {
       content = await c.req.text();
     }
 
-    const result = await storage.importJsonl(source, { sessionId }, content.split(/\r?\n/));
+    const result = await storage.importJsonl(source, { sessionId }, content);
     if (!result.duplicate) events.publish("ingest", { signal: "jsonl", ...result });
     return c.json(result);
   });
@@ -90,7 +121,7 @@ export function createApp({ storage, events }: AppOptions) {
     const result = await storage.importJsonl(
       "claude-code-jsonl",
       { sessionId: body.session_id ?? body.sessionId ?? undefined },
-      content.split(/\r?\n/)
+      content
     );
     if (!result.duplicate) events.publish("ingest", { signal: "claude-hook", ...result });
     return c.json(result);
@@ -140,6 +171,19 @@ function parseId(value?: string) {
 
 function readGranularity(value?: string): Granularity {
   return GRANULARITIES.includes(value as Granularity) ? (value as Granularity) : "hour";
+}
+
+function bearerToken(header?: string) {
+  const match = /^Bearer\s+(.+)$/i.exec(header ?? "");
+  return match ? match[1].trim() : "";
+}
+
+// Constant-time string compare that doesn't leak length via early return.
+function timingSafeEqualStr(a: string, b: string) {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
 }
 
 function parseTime(value?: string) {
