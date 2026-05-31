@@ -67,7 +67,7 @@ export async function runSetup(args: string[] = []): Promise<number> {
     );
     if (wantGlobal) {
       const s = spinner();
-      s.start("Running `npm install -g finius`");
+      s.start("Running `npm install -g @cliftonc/finius`");
       onPath = installGlobally();
       s.stop(
         onPath

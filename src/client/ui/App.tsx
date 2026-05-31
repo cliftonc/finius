@@ -314,7 +314,7 @@ export function App() {
                     upload hook{health.data?.secure ? ", including the auth token for Secure Mode" : ""}.
                   </p>
                   <Snippet hideSymbol variant="bordered" className="w-full" classNames={{ pre: "whitespace-pre-wrap" }}>
-                    {`npx finius setup ${window.location.origin}`}
+                    {`npx @cliftonc/finius setup ${window.location.origin}`}
                   </Snippet>
                   <p className="text-sm text-default-500">
                     Then launch Claude Code as you normally would. Re-run any time to reconfigure, or

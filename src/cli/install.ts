@@ -15,7 +15,7 @@ export function isFiniusOnPath(): boolean {
 // hooks). Returns true once `finius` is on PATH. Output is streamed so the user sees npm's progress.
 export function installGlobally(): boolean {
   try {
-    execSync("npm install -g finius", { stdio: "inherit" });
+    execSync("npm install -g @cliftonc/finius", { stdio: "inherit" });
   } catch {
     return false;
   }

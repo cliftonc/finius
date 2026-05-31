@@ -20,9 +20,9 @@ The fastest way to get running locally is the `finius` CLI. You need **Node 22.5
 built-in `node:sqlite` module; developed on Node 24).
 
 ```bash
-npx finius          # first run: installs finius globally, then walks you through setup
-finius serve        # start the server + dashboard at http://localhost:8787
-finius import all   # optional: import old Claude Code + Codex sessions
+npx @cliftonc/finius # first run: installs finius globally, then walks you through setup
+finius serve         # start the server + dashboard at http://localhost:8787
+finius import all    # optional: import old Claude Code + Codex sessions
 ```
 
 Then launch Claude Code in a new terminal and start coding — the dashboard at
@@ -30,7 +30,7 @@ Then launch Claude Code in a new terminal and start coding — the dashboard at
 
 That's it. Three things just happened:
 
-1. **`npx finius`** installed `finius` globally and ran `finius setup`, which saved
+1. **`npx @cliftonc/finius`** installed `finius` globally and ran `finius setup`, which saved
    `~/.finius/config.json` and — with your consent — edited `~/.claude/settings.json` to add the OTLP
    env vars plus a `SessionEnd` + `PreCompact` hook (`finius hook`) that uploads each session
    transcript.
