@@ -1,87 +1,26 @@
-export type Summary = {
-  totalCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-  totalTokens: number;
-  sessionCount: number;
-  activeSenders: number;
-  linesAdded: number;
-  linesRemoved: number;
-  editsAccepted: number;
-  editsRejected: number;
-  pullRequests: number;
-  commits: number;
-  models: Array<{ model: string; totalCost: number; totalTokens: number; sessions: number }>;
-  users: Array<{ user: string; totalCost: number; totalTokens: number; sessions: number }>;
-  sources: Array<{ source: string; totalCost: number; totalTokens: number; sessions: number }>;
-};
+import type {
+  FilterOptions,
+  Granularity,
+  ModelSummary,
+  ModelTimeseriesPoint,
+  PersonSummary,
+  SessionSummary,
+  Summary,
+  TimeseriesPoint,
+  TranscriptInfo
+} from "../shared/api-types";
 
-export type TimeseriesPoint = {
-  bucket: number;
-  totalCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-  cacheTokens: number;
-  totalTokens: number;
-  linesAdded: number;
-  linesRemoved: number;
-  editsAccepted: number;
-  editsRejected: number;
-  pullRequests: number;
-  commits: number;
-};
-
-export type SessionSummary = {
-  id: number;
-  source: string;
-  sessionId: string;
-  userId: string | null;
-  userEmail: string | null;
-  userAccountId: string | null;
-  firstSeenAt: number;
-  lastSeenAt: number;
-  totalCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-  totalTokens: number;
-  models: string[];
-};
-
-export type PersonSummary = {
-  user: string;
-  sessions: number;
-  totalCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheTokens: number;
-  totalTokens: number;
-  lastSeenAt: number;
-  models: string[];
-};
-
-export type ModelSummary = {
-  model: string;
-  sessions: number;
-  users: number;
-  totalCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheTokens: number;
-  totalTokens: number;
-  lastSeenAt: number;
-};
-
-export type FilterOptions = {
-  sources: string[];
-  users: string[];
-  models: string[];
-};
+export type {
+  FilterOptions,
+  Granularity,
+  ModelSummary,
+  ModelTimeseriesPoint,
+  PersonSummary,
+  SessionSummary,
+  Summary,
+  TimeseriesPoint,
+  TranscriptInfo
+} from "../shared/api-types";
 
 export type Filters = {
   from?: number;
@@ -108,10 +47,12 @@ export async function getSummary(filters: Filters = {}) {
   return getJson<Summary>(withFilters("/api/metrics/summary", filters));
 }
 
-export type Granularity = "minute" | "five_minute" | "quarter_hour" | "hour" | "day" | "week";
-
 export async function getTimeseries(filters: Filters = {}, granularity: Granularity = "hour") {
   return getJson<TimeseriesPoint[]>(withFilters("/api/metrics/timeseries", filters, { granularity }));
+}
+
+export async function getModelTimeseries(filters: Filters = {}, granularity: Granularity = "hour") {
+  return getJson<ModelTimeseriesPoint[]>(withFilters("/api/metrics/timeseries/by-model", filters, { granularity }));
 }
 
 export async function getSessions(filters: Filters = {}) {
@@ -130,11 +71,10 @@ export async function getSession(id: number) {
   return getJson<SessionSummary>(`/api/sessions/${id}`);
 }
 
-export type TranscriptInfo = { source: string; importedAt: number; byteSize: number; lineCount: number };
-
 export async function getTranscriptInfo(id: number): Promise<TranscriptInfo | null> {
-  const response = await fetch(transcriptUrl(id, "info"));
+  const response = await fetch(transcriptUrl(id, "info"), { credentials: "include" });
   if (response.status === 404) return null;
+  if (response.status === 401) throw new AuthError();
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<TranscriptInfo>;
 }
@@ -143,12 +83,48 @@ export function transcriptUrl(id: number, kind?: "info") {
   return `/api/sessions/${id}/transcript${kind ? `/${kind}` : ""}`;
 }
 
+export async function getTranscript(id: number): Promise<string | null> {
+  const response = await fetch(transcriptUrl(id), { credentials: "include" });
+  if (response.status === 404) return null;
+  if (response.status === 401) throw new AuthError();
+  if (!response.ok) throw new Error(await response.text());
+  return response.text();
+}
+
 export async function getMeta() {
   return getJson<FilterOptions>("/api/meta");
 }
 
+// Thrown on a 401 so the UI can show the login screen instead of a generic error.
+export class AuthError extends Error {
+  constructor() {
+    super("unauthorized");
+    this.name = "AuthError";
+  }
+}
+
+export type Health = { ok: boolean; now: number; secure: boolean };
+
+export async function getHealth(): Promise<Health> {
+  const response = await fetch("/api/health", { credentials: "include" });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<Health>;
+}
+
+// Exchange the server password for a session cookie. Returns true on success, false on a bad password.
+export async function login(password: string): Promise<boolean> {
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ password, label: "browser" })
+  });
+  return response.ok;
+}
+
 async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+  const response = await fetch(url, { credentials: "include" });
+  if (response.status === 401) throw new AuthError();
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<T>;
 }

@@ -1,15 +1,21 @@
 import type { ImportResult, MetricPointInput } from "./types.js";
+import type { ParsedTranscript } from "./transcripts.js";
 
-type ParsedJsonl = {
-  result: ImportResult;
-  points: MetricPointInput[];
-  rawEvents: unknown[];
-};
-
-export function parseJsonl(source: string, sessionHint: Partial<MetricPointInput>, lines: string[]): ParsedJsonl {
+// Parser for Claude Code transcripts (`~/.claude/projects/**/<session>.jsonl`). Pure / side-effect-free
+// so it stays unit-testable; the Codex equivalent is codex.ts and both are dispatched from transcripts.ts.
+export function parseClaudeTranscript(
+  source: string,
+  sessionHint: Partial<MetricPointInput>,
+  lines: string[]
+): ParsedTranscript {
   const result: ImportResult = { importedLines: 0, malformedLines: 0, metricPoints: 0, rawEvents: 0 };
   const points: MetricPointInput[] = [];
   const rawEvents: unknown[] = [];
+  // Claude Code writes one API response across several transcript lines (one per content
+  // block — text, tool_use, thinking) and stamps the SAME `usage` object on each. Summing
+  // every usage-bearing line double-counts tokens ~2-3.6x. Dedupe by the request identity so
+  // each API request contributes its tokens exactly once.
+  const seenRequests = new Set<string>();
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -27,7 +33,7 @@ export function parseJsonl(source: string, sessionHint: Partial<MetricPointInput
     result.rawEvents += 1;
     rawEvents.push(event);
 
-    const extracted = extractUsage(source, sessionHint, event);
+    const extracted = extractUsage(source, sessionHint, event, seenRequests);
     points.push(...extracted);
     result.metricPoints += extracted.length;
   }
@@ -35,10 +41,25 @@ export function parseJsonl(source: string, sessionHint: Partial<MetricPointInput
   return { result, points, rawEvents };
 }
 
-function extractUsage(source: string, sessionHint: Partial<MetricPointInput>, event: unknown): MetricPointInput[] {
+function extractUsage(
+  source: string,
+  sessionHint: Partial<MetricPointInput>,
+  event: unknown,
+  seenRequests: Set<string>
+): MetricPointInput[] {
   const obj = event as Record<string, unknown>;
   const usage = findUsageObject(obj);
   if (!usage) return [];
+
+  // One token/cost record per API request. `requestId` (or the API `message.id`) is repeated
+  // across the split lines of a single response; the first occurrence wins, the rest are skipped.
+  // No stable id → fall back to never-deduping rather than risk merging distinct requests.
+  const message = obj.message as Record<string, unknown> | undefined;
+  const requestKey = stringValue(obj.requestId) ?? stringValue(message?.id);
+  if (requestKey !== undefined) {
+    if (seenRequests.has(requestKey)) return [];
+    seenRequests.add(requestKey);
+  }
 
   const timestamp = parseTimestamp(obj.timestamp) ?? parseTimestamp(obj.created_at) ?? Date.now();
   const sessionId = String(obj.session_id ?? obj.sessionId ?? sessionHint.sessionId ?? "unknown-session");
@@ -50,6 +71,8 @@ function extractUsage(source: string, sessionHint: Partial<MetricPointInput>, ev
     userId: sessionHint.userId ?? null,
     userEmail: sessionHint.userEmail ?? null,
     userAccountId: sessionHint.userAccountId ?? null,
+    githubLogin: sessionHint.githubLogin ?? null,
+    displayName: sessionHint.displayName ?? null,
     model,
     timestamp,
     attributes: obj

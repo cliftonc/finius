@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseOtelMetricPoints, parseOtelMetricRecords, preferredIdentity } from "../src/server/otel";
-import { otlpMetricBatch } from "./fixtures";
+import { parseOtelLogRecords, parseOtelMetricPoints, parseOtelMetricRecords, preferredIdentity } from "../src/server/otel";
+import { codexLogBatch, otlpMetricBatch } from "./fixtures";
 
 describe("OTLP parser", () => {
   it("extracts Claude Code token and cost metrics", () => {
@@ -78,6 +78,14 @@ describe("OTLP parser", () => {
       ["pull_request", null, 2],
       ["commit", null, 3]
     ]);
+  });
+
+  it("resolves a log record's event name from the event.name attribute over Codex's source-location eventName", () => {
+    // Codex's tracing appender pollutes the top-level eventName with a Rust source location and carries
+    // the real id in the event.name attribute, so the attribute must win.
+    const records = parseOtelLogRecords(codexLogBatch());
+    expect(records.map((r) => r.eventName)).toEqual(["codex.sse_event", "codex.api_request", "codex.sse_event"]);
+    expect(records[0].sessionId).toBe("codex-session-1");
   });
 
   it("prefers email, account id, then user id for identity", () => {

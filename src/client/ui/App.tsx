@@ -21,20 +21,28 @@ import {
   useDisclosure
 } from "@heroui/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ChartGPUOptions, TooltipParams } from "chartgpu";
-import { Activity, ArrowUpRight, Check, CircleDollarSign, Database, GitCommit, GitPullRequest, Layers, Minus, Plus, Radio, RefreshCcw, Settings, Users, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { getMeta, getModels, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo, transcriptUrl } from "../api";
-import type { Filters, Granularity, ModelSummary, PersonSummary, SessionSummary, Summary, TimeseriesPoint } from "../api";
+import type { ChartGPUOptions } from "chartgpu";
+import { Activity, ArrowUpRight, Check, CircleDollarSign, Database, FileText, GitCommit, GitPullRequest, Layers, Minus, Moon, Plus, Radio, RefreshCcw, Settings, Sun, Users, X } from "lucide-react";
+import { lazy, Suspense, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { AuthError, getHealth, getMeta, getModels, getModelTimeseries, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo } from "../api";
+import type { Filters, Granularity, ModelSummary, ModelTimeseriesPoint, PersonSummary, SessionSummary, Summary, TimeseriesPoint } from "../api";
+import { formatCurrency, formatCurrencyCompact, formatExact, formatNumber, formatRelativeTime } from "../format";
+import { UserAvatar, UserCell, userLabel } from "./UserCell";
+import { useTheme } from "../theme";
 import { GpuChart } from "./GpuChart";
+import { PROVIDER_COLOR, PROVIDER_LABEL, ProviderLogo, providerForSource, type Provider } from "./ProviderLogo";
+import { FiniusLogo } from "./FiniusLogo";
+import { LoginScreen } from "./LoginScreen";
+import { RANGES, RANGE_KEYS, rangeWindow, type RangeKey } from "./state/dateRange";
+import { densify, modelSeries } from "./charts/chartData";
+import { granularityLabel, lineOptions, multiSeriesLineOptions, seriesLineOptions } from "./charts/chartOptions";
 
-type RangeKey = "now" | "today" | "week" | "month" | "year";
 type TabKey = "home" | "sessions" | "people" | "models";
 
 const ALL = "__all__";
 
 const TAB_KEYS: TabKey[] = ["home", "sessions", "people", "models"];
-const RANGE_KEYS: RangeKey[] = ["now", "today", "week", "month", "year"];
+const TranscriptView = lazy(() => import("./TranscriptView").then((module) => ({ default: module.TranscriptView })));
 
 type ViewState = {
   tab: TabKey;
@@ -43,6 +51,7 @@ type ViewState = {
   user: string;
   model: string;
   session: string;
+  transcript: string;
 };
 
 function readState(): ViewState {
@@ -55,7 +64,8 @@ function readState(): ViewState {
     source: p.get("source") ?? "",
     user: p.get("user") ?? "",
     model: p.get("model") ?? "",
-    session: p.get("session") ?? ""
+    session: p.get("session") ?? "",
+    transcript: p.get("transcript") ?? ""
   };
 }
 
@@ -67,6 +77,7 @@ function writeState(state: ViewState) {
   if (state.user) p.set("user", state.user);
   if (state.model) p.set("model", state.model);
   if (state.session) p.set("session", state.session);
+  if (state.transcript) p.set("transcript", state.transcript);
   const qs = p.toString();
   window.history.replaceState(null, "", qs ? `${window.location.pathname}?${qs}` : window.location.pathname);
 }
@@ -89,14 +100,6 @@ function useUrlState() {
   }, []);
   return [state, update] as const;
 }
-
-const RANGES: Array<{ key: RangeKey; label: string }> = [
-  { key: "now", label: "Now" },
-  { key: "today", label: "Today" },
-  { key: "week", label: "This week" },
-  { key: "month", label: "This month" },
-  { key: "year", label: "This year" }
-];
 
 const GRANULARITY_MS: Record<Granularity, number> = {
   minute: 60_000,
@@ -125,31 +128,16 @@ const COMMIT_SERIES = [{ name: "Commits", color: "#2563eb", get: (point: Timeser
 
 const PALETTE = ["#2563eb", "#0f766e", "#a855f7", "#f59e0b", "#ef4444", "#14b8a6", "#6366f1", "#ec4899"];
 
-const SETUP_SCRIPT = [
-  "# Launch Claude Code with telemetry pointed at this Finius server.",
-  "export CLAUDE_CODE_ENABLE_TELEMETRY=1",
-  "export OTEL_METRICS_EXPORTER=otlp",
-  "export OTEL_LOGS_EXPORTER=otlp",
-  "export OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/json",
-  "export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/json",
-  "export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://localhost:8787/otlp/v1/metrics",
-  "export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://localhost:8787/otlp/v1/logs",
-  "export OTEL_METRIC_EXPORT_INTERVAL=5000",
-  "export OTEL_LOGS_EXPORT_INTERVAL=2000",
-  "claude",
-  "",
-  "# Or just run the bundled helper:  ./scripts/run-claude.sh"
-];
-
 export function App() {
   const queryClient = useQueryClient();
   const setup = useDisclosure();
   const [live, setLive] = useState(false);
   const [state, update] = useUrlState();
-  const { tab, range, source, user, model, session } = state;
+  const { tab, range, source, user, model, session, transcript } = state;
   const [clock, setClock] = useState(0);
 
   const meta = useQuery({ queryKey: ["meta"], queryFn: getMeta });
+  const health = useQuery({ queryKey: ["health"], queryFn: getHealth, retry: false });
 
   // Advance a clock for the live "Now" range so its rolling 3h window (and query key) moves
   // forward in real time even when no new telemetry arrives.
@@ -183,11 +171,30 @@ export function App() {
     return () => stream.close();
   }, [queryClient]);
 
+  // Secure Mode: any 401 surfaces as an AuthError on the always-running `meta` query. Show the login
+  // screen until a successful login sets the finius_auth cookie, then refetch everything.
+  if (meta.error instanceof AuthError) {
+    return <LoginScreen onSuccess={() => void queryClient.invalidateQueries()} />;
+  }
+
+  if (transcript) {
+    return (
+      <main className="mx-auto w-full max-w-[1440px] p-7 text-foreground">
+        <Suspense fallback={<EmptyState>Loading transcript...</EmptyState>}>
+          <TranscriptView id={Number(transcript)} onBack={() => update({ transcript: "" })} />
+        </Suspense>
+      </main>
+    );
+  }
+
   return (
     <main className="mx-auto w-full max-w-[1440px] p-7 text-foreground">
       <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-6">
-          <h1 className="text-5xl font-bold leading-none text-default-900">Finius</h1>
+          <div className="flex items-center gap-3">
+            <FiniusLogo size={44} />
+            <h1 className="font-display text-5xl font-semibold leading-none tracking-tight text-default-900">Finius</h1>
+          </div>
           <Tabs aria-label="Views" color="primary" radius="full" selectedKey={tab} onSelectionChange={(key) => update({ tab: key as TabKey })}>
             <Tab key="home" title="Home" />
             <Tab key="sessions" title="Sessions" />
@@ -196,6 +203,7 @@ export function App() {
           </Tabs>
         </div>
         <div className="flex items-center gap-3">
+          <ThemeToggle />
           <Button isIconOnly radius="full" variant="bordered" aria-label="Telemetry setup" onPress={setup.onOpen}>
             <Settings size={18} />
           </Button>
@@ -251,12 +259,24 @@ export function App() {
               <SelectItem key={item.key}>{item.label}</SelectItem>
             ))}
           </Select>
-          {session && <SessionFilterChip id={Number(session)} onClear={() => update({ session: "" })} />}
+          {session && (
+            <SessionFilterChip
+              id={Number(session)}
+              onClear={() => update({ session: "" })}
+              onView={() => update({ transcript: session })}
+            />
+          )}
         </CardBody>
       </Card>
 
       {tab === "home" && <HomeView filters={filters} range={range} onNavigate={(next) => update({ tab: next })} onFilter={update} />}
-      {tab === "sessions" && <SessionsView filters={filters} onOpen={(id) => update({ session: String(id), tab: "home" })} />}
+      {tab === "sessions" && (
+        <SessionsView
+          filters={filters}
+          onOpen={(id) => update({ session: String(id), tab: "home" })}
+          onViewTranscript={(id) => update({ transcript: String(id) })}
+        />
+      )}
       {tab === "people" && <PeopleView filters={filters} onOpen={(value) => update({ user: value, tab: "home" })} />}
       {tab === "models" && <ModelsView filters={filters} onOpen={(value) => update({ model: value, tab: "home" })} />}
 
@@ -268,7 +288,7 @@ export function App() {
           </ModalHeader>
           <ModalBody className="pb-6">
             <Snippet hideSymbol variant="bordered" className="w-full" classNames={{ pre: "whitespace-pre-wrap" }}>
-              {SETUP_SCRIPT.map((line, index) => (
+              {setupScript(health.data?.secure ?? false).map((line, index) => (
                 <span key={index}>{line}</span>
               ))}
             </Snippet>
@@ -276,6 +296,22 @@ export function App() {
         </ModalContent>
       </Modal>
     </main>
+  );
+}
+
+function ThemeToggle() {
+  const { theme, toggle } = useTheme();
+  const dark = theme === "dark";
+  return (
+    <Button
+      isIconOnly
+      radius="full"
+      variant="bordered"
+      aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}
+      onPress={toggle}
+    >
+      {dark ? <Sun size={18} /> : <Moon size={18} />}
+    </Button>
   );
 }
 
@@ -297,11 +333,24 @@ function HomeView({
     queryFn: () => getTimeseries(filters, granularity),
     refetchInterval: range === "today" ? 30_000 : false
   });
+  const modelTimeseries = useQuery({
+    queryKey: ["model-timeseries", filters, granularity],
+    queryFn: () => getModelTimeseries(filters, granularity),
+    refetchInterval: range === "today" ? 30_000 : false
+  });
 
   const breakdowns = useMemo(
     () => ({
       models: (summary.data?.models ?? []).map((row) => ({ label: row.model, cost: row.totalCost, tokens: row.totalTokens })),
-      users: (summary.data?.users ?? []).map((row) => ({ label: row.user, cost: row.totalCost, tokens: row.totalTokens })),
+      // `label` stays the canonical identity (the filter value); `display`/`icon` give the row a
+      // GitHub-login-preferred name and avatar without changing what clicking it filters on.
+      users: (summary.data?.users ?? []).map((row) => ({
+        label: row.user,
+        cost: row.totalCost,
+        tokens: row.totalTokens,
+        display: userLabel(row),
+        icon: <UserAvatar id={row} />
+      })),
       sources: (summary.data?.sources ?? []).map((row) => ({ label: row.source, cost: row.totalCost, tokens: row.totalTokens }))
     }),
     [summary.data]
@@ -312,7 +361,7 @@ function HomeView({
   return (
     <div className="flex flex-col gap-4">
       <Kpis summary={summary.data} onNavigate={onNavigate} />
-      <UsageCharts points={timeseries.data ?? []} from={from} granularity={granularity} />
+      <UsageCharts points={timeseries.data ?? []} modelPoints={modelTimeseries.data ?? []} from={from} granularity={granularity} />
       <div className="grid gap-4 md:grid-cols-3">
         <BreakdownCard title="Models" rows={breakdowns.models} onSelect={(label) => onFilter({ model: label })} />
         <BreakdownCard title="Users" rows={breakdowns.users} onSelect={(label) => onFilter({ user: label })} />
@@ -322,10 +371,18 @@ function HomeView({
   );
 }
 
-function SessionsView({ filters, onOpen }: { filters: Filters; onOpen: (id: number) => void }) {
+function SessionsView({
+  filters,
+  onOpen,
+  onViewTranscript
+}: {
+  filters: Filters;
+  onOpen: (id: number) => void;
+  onViewTranscript: (id: number) => void;
+}) {
   const sessions = useQuery({ queryKey: ["sessions", filters], queryFn: () => getSessions(filters) });
   if (sessions.isLoading) return <EmptyState>Loading sessions...</EmptyState>;
-  return <SessionsTable sessions={sessions.data ?? []} onOpen={onOpen} />;
+  return <SessionsTable sessions={sessions.data ?? []} onOpen={onOpen} onViewTranscript={onViewTranscript} />;
 }
 
 function PeopleView({ filters, onOpen }: { filters: Filters; onOpen: (user: string) => void }) {
@@ -403,38 +460,70 @@ function KpiCard({ item, onNavigate }: { item: KpiItem; onNavigate: (tab: TabKey
   );
 }
 
-function UsageCharts({ points, from, granularity }: { points: TimeseriesPoint[]; from?: number; granularity: Granularity }) {
+function UsageCharts({
+  points,
+  modelPoints,
+  from,
+  granularity
+}: {
+  points: TimeseriesPoint[];
+  modelPoints: ModelTimeseriesPoint[];
+  from?: number;
+  granularity: Granularity;
+}) {
+  const { theme } = useTheme();
   const dense = useMemo(() => densify(points, from, GRANULARITY_MS[granularity]), [points, from, granularity]);
   const empty = dense.length === 0;
 
+  // Pivot the flat per-(bucket, model) rows into one densified line per model (top models only, so
+  // the legend stays readable), once for tokens and once for distinct session counts.
+  const tokenByModel = useMemo(
+    () => modelSeries(modelPoints, "totalTokens", from, GRANULARITY_MS[granularity]),
+    [modelPoints, from, granularity]
+  );
+  const sessionByModel = useMemo(
+    () => modelSeries(modelPoints, "sessions", from, GRANULARITY_MS[granularity]),
+    [modelPoints, from, granularity]
+  );
+  const modelEmpty = tokenByModel.length === 0;
+
+  const tokenByModelOptions = useMemo<ChartGPUOptions>(
+    () => multiSeriesLineOptions(tokenByModel, granularity, formatNumber, formatNumber, theme),
+    [tokenByModel, granularity, theme]
+  );
+  const sessionByModelOptions = useMemo<ChartGPUOptions>(
+    () => multiSeriesLineOptions(sessionByModel, granularity, formatNumber, formatNumber, theme),
+    [sessionByModel, granularity, theme]
+  );
+
   const tokenOptions = useMemo<ChartGPUOptions>(
-    () => lineOptions(dense, granularity, "totalTokens", TOKEN_COLOR, (value) => `${formatNumber(value)} tokens`, formatCompact),
-    [dense, granularity]
+    () => lineOptions(dense, granularity, "totalTokens", TOKEN_COLOR, (value) => `${formatNumber(value)} tokens`, formatNumber, theme),
+    [dense, granularity, theme]
   );
 
   const costOptions = useMemo<ChartGPUOptions>(
-    () => lineOptions(dense, granularity, "totalCost", COST_COLOR, formatCurrency, formatCurrencyShort),
-    [dense, granularity]
+    () => lineOptions(dense, granularity, "totalCost", COST_COLOR, formatCurrency, formatCurrencyCompact, theme),
+    [dense, granularity, theme]
   );
 
   const linesOptions = useMemo<ChartGPUOptions>(
-    () => seriesLineOptions(dense, granularity, LINES_SERIES, formatCompact, formatNumber),
-    [dense, granularity]
+    () => seriesLineOptions(dense, granularity, LINES_SERIES, formatNumber, formatNumber, theme),
+    [dense, granularity, theme]
   );
 
   const editsOptions = useMemo<ChartGPUOptions>(
-    () => seriesLineOptions(dense, granularity, EDITS_SERIES, formatCompact, formatNumber),
-    [dense, granularity]
+    () => seriesLineOptions(dense, granularity, EDITS_SERIES, formatNumber, formatNumber, theme),
+    [dense, granularity, theme]
   );
 
   const prOptions = useMemo<ChartGPUOptions>(
-    () => seriesLineOptions(dense, granularity, PR_SERIES, formatCompact, formatNumber),
-    [dense, granularity]
+    () => seriesLineOptions(dense, granularity, PR_SERIES, formatNumber, formatNumber, theme),
+    [dense, granularity, theme]
   );
 
   const commitOptions = useMemo<ChartGPUOptions>(
-    () => seriesLineOptions(dense, granularity, COMMIT_SERIES, formatCompact, formatNumber),
-    [dense, granularity]
+    () => seriesLineOptions(dense, granularity, COMMIT_SERIES, formatNumber, formatNumber, theme),
+    [dense, granularity, theme]
   );
 
   return (
@@ -443,7 +532,7 @@ function UsageCharts({ points, from, granularity }: { points: TimeseriesPoint[];
         <Card shadow="sm">
           <CardBody className="gap-3">
             <div className="flex items-center justify-between gap-3">
-              <h2 className="text-lg font-semibold text-default-900">Tokens over time</h2>
+              <h2 className="font-display text-xl font-semibold tracking-tight text-default-900">Tokens over time</h2>
               <span className="text-sm text-default-500">
                 {dense.length} {granularityLabel(granularity)} buckets
               </span>
@@ -454,10 +543,15 @@ function UsageCharts({ points, from, granularity }: { points: TimeseriesPoint[];
 
         <Card shadow="sm">
           <CardBody className="gap-3">
-            <h2 className="text-lg font-semibold text-default-900">Cost over time</h2>
+            <h2 className="font-display text-xl font-semibold tracking-tight text-default-900">Cost over time</h2>
             {empty ? <EmptyState>No telemetry yet</EmptyState> : <GpuChart options={costOptions} style={{ width: "100%", height: 220 }} />}
           </CardBody>
         </Card>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <ActivityChart title="Tokens by model" series={tokenByModel} options={tokenByModelOptions} empty={modelEmpty} emptyLabel="No model telemetry yet" />
+        <ActivityChart title="Sessions by model" series={sessionByModel} options={sessionByModelOptions} empty={modelEmpty} emptyLabel="No model telemetry yet" />
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
@@ -474,34 +568,44 @@ function ActivityChart({
   title,
   series,
   options,
-  empty
+  empty,
+  emptyLabel = "No telemetry yet"
 }: {
   title: string;
   series: ReadonlyArray<{ name: string; color: string }>;
   options: ChartGPUOptions;
   empty: boolean;
+  emptyLabel?: string;
 }) {
   return (
     <Card shadow="sm">
       <CardBody className="gap-3">
-        <div className="flex items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold text-default-900">{title}</h2>
-          <div className="flex items-center gap-4">
+        <div className="flex items-start justify-between gap-3">
+          <h2 className="font-display text-xl font-semibold tracking-tight text-default-900">{title}</h2>
+          <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1">
             {series.map((entry) => (
               <span key={entry.name} className="flex items-center gap-1.5 text-sm text-default-600">
-                <span className="h-2.5 w-2.5 rounded-full" style={{ background: entry.color }} />
+                <span className="h-2.5 w-2.5 flex-none rounded-full" style={{ background: entry.color }} />
                 {entry.name}
               </span>
             ))}
           </div>
         </div>
-        {empty ? <EmptyState>No telemetry yet</EmptyState> : <GpuChart options={options} style={{ width: "100%", height: 220 }} />}
+        {empty ? <EmptyState>{emptyLabel}</EmptyState> : <GpuChart options={options} style={{ width: "100%", height: 220 }} />}
       </CardBody>
     </Card>
   );
 }
 
-function BreakdownCard({ title, rows, onSelect }: { title: string; rows: Array<{ label: string; cost: number; tokens: number }>; onSelect: (label: string) => void }) {
+function BreakdownCard({
+  title,
+  rows,
+  onSelect
+}: {
+  title: string;
+  rows: Array<{ label: string; cost: number; tokens: number; display?: string; icon?: ReactNode }>;
+  onSelect: (label: string) => void;
+}) {
   const top = useMemo(() => rows.slice(0, 8).filter((row) => row.cost > 0 || row.tokens > 0), [rows]);
   const byCost = top.some((row) => row.cost > 0);
   const max = Math.max(...top.map((row) => (byCost ? row.cost : row.tokens)), 1);
@@ -509,7 +613,7 @@ function BreakdownCard({ title, rows, onSelect }: { title: string; rows: Array<{
   return (
     <Card shadow="sm">
       <CardBody className="gap-3">
-        <h2 className="text-base font-semibold text-default-900">{title}</h2>
+        <h2 className="font-display text-lg font-semibold tracking-tight text-default-900">{title}</h2>
         {top.length === 0 ? (
           <p className="text-sm text-default-500">No data</p>
         ) : (
@@ -523,10 +627,13 @@ function BreakdownCard({ title, rows, onSelect }: { title: string; rows: Array<{
                     onClick={() => onSelect(row.label)}
                     className="-mx-2 flex w-[calc(100%+1rem)] flex-col gap-1.5 rounded-lg px-2 py-1 text-left transition-colors hover:bg-default-100"
                   >
-                    <div className="flex items-baseline justify-between gap-3 text-sm">
-                      <span className="truncate text-default-700">{row.label}</span>
+                    <div className="flex items-center justify-between gap-3 text-sm">
+                      <span className="flex min-w-0 items-center gap-2 text-default-700">
+                        {row.icon}
+                        <span className="truncate">{row.display ?? row.label}</span>
+                      </span>
                       <span className="flex-none tabular-nums text-default-500">
-                        {formatCurrency(row.cost)} · {formatCompact(row.tokens)}
+                        {formatCurrency(row.cost)} · {formatNumber(row.tokens)}
                       </span>
                     </div>
                     <div className="h-2 overflow-hidden rounded-full bg-default-100">
@@ -546,32 +653,163 @@ function BreakdownCard({ title, rows, onSelect }: { title: string; rows: Array<{
   );
 }
 
-function SessionsTable({ sessions, onOpen }: { sessions: SessionSummary[]; onOpen: (id: number) => void }) {
+// One badge per signal a session carries (OTEL and/or JSONL). Color identifies the provider (Claude
+// today, Codex etc. later) — every signal from one provider shares it — so only the OTEL/JSONL label
+// distinguishes them.
+function SignalBadge({ kind, active, provider = "claude" }: { kind: "otel" | "jsonl"; active: boolean; provider?: Provider }) {
+  const label = kind === "otel" ? "OTEL" : "JSONL";
+  const color = PROVIDER_COLOR[provider];
+  const title = active ? `${label} · shown` : `${label} · present, not shown (OTel wins)`;
+  return (
+    <span
+      title={`${PROVIDER_LABEL[provider]} · ${title}`}
+      style={{ backgroundColor: `${color}33`, color }}
+      className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium"
+    >
+      <ProviderLogo provider={provider} size={11} />
+      {label}
+    </span>
+  );
+}
+
+function SourceBadges({
+  hasOtel,
+  hasJsonl,
+  metricSource,
+  source
+}: {
+  hasOtel: boolean;
+  hasJsonl: boolean;
+  metricSource: "otel" | "jsonl";
+  source: string;
+}) {
+  const provider = providerForSource(source);
+  return (
+    <span className="inline-flex items-center gap-1">
+      {hasOtel && <SignalBadge kind="otel" active={metricSource === "otel"} provider={provider} />}
+      {hasJsonl && <SignalBadge kind="jsonl" active={metricSource === "jsonl"} provider={provider} />}
+    </span>
+  );
+}
+
+// When a session carries both OTel and a transcript, the two ingest paths usually disagree (OTel
+// commonly misses requests the transcript captured). Show JSONL's signed delta vs OTel so the gap is
+// visible at a glance; hidden when either signal is absent (nothing to compare).
+function TokenDiffBadge({ otel, jsonl }: { otel: number; jsonl: number }) {
+  if (otel <= 0 || jsonl <= 0) return null;
+  const delta = jsonl - otel;
+  if (delta === 0) return null;
+  const pct = Math.round((delta / otel) * 100);
+  const sign = delta > 0 ? "+" : "−";
+  const tone = Math.abs(pct) >= 25 ? "bg-warning/10 text-warning-600" : "bg-default-100 text-default-500";
+  return (
+    <span
+      title={`JSONL ${formatExact(jsonl)} vs OTEL ${formatExact(otel)} tokens (${sign}${formatExact(Math.abs(delta))}, ${sign}${Math.abs(pct)}%)`}
+      className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium tabular-nums ${tone}`}
+    >
+      {sign}
+      {formatNumber(Math.abs(delta))}
+    </span>
+  );
+}
+
+// Same idea as TokenDiffBadge for cost: OTel reports cost directly while JSONL cost is synthesized from
+// pricing, so the two can diverge. Show JSONL's signed delta vs OTel; hidden when either signal lacks a
+// cost figure (nothing to compare).
+function CostDiffBadge({ otel, jsonl }: { otel: number; jsonl: number }) {
+  if (otel <= 0 || jsonl <= 0) return null;
+  const delta = jsonl - otel;
+  if (delta === 0) return null;
+  const pct = Math.round((delta / otel) * 100);
+  const sign = delta > 0 ? "+" : "−";
+  const tone = Math.abs(pct) >= 25 ? "bg-warning/10 text-warning-600" : "bg-default-100 text-default-500";
+  return (
+    <span
+      title={`JSONL ${formatCurrency(jsonl)} vs OTEL ${formatCurrency(otel)} (${sign}${formatCurrency(Math.abs(delta))}, ${sign}${Math.abs(pct)}%)`}
+      className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium tabular-nums ${tone}`}
+    >
+      {sign}
+      {formatCurrency(Math.abs(delta))}
+    </span>
+  );
+}
+
+function SessionsTable({
+  sessions,
+  onOpen,
+  onViewTranscript
+}: {
+  sessions: SessionSummary[];
+  onOpen: (id: number) => void;
+  onViewTranscript: (id: number) => void;
+}) {
   return (
     <Card shadow="sm">
       <CardBody className="gap-4">
         <div className="flex items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold text-default-900">Recent sessions</h2>
+          <h2 className="font-display text-xl font-semibold tracking-tight text-default-900">Recent sessions</h2>
           <span className="text-sm text-default-500">{sessions.length} shown · click to drill in</span>
         </div>
         <Table aria-label="Recent sessions" removeWrapper selectionMode="none" onRowAction={(key) => onOpen(Number(key))}>
           <TableHeader>
             <TableColumn>SESSION</TableColumn>
             <TableColumn>USER</TableColumn>
+            <TableColumn>SOURCE</TableColumn>
             <TableColumn>MODEL</TableColumn>
             <TableColumn>TOKENS</TableColumn>
             <TableColumn>COST</TableColumn>
             <TableColumn>LAST SEEN</TableColumn>
+            <TableColumn>TRANSCRIPT</TableColumn>
           </TableHeader>
           <TableBody emptyContent="No sessions yet" items={sessions}>
             {(session) => (
               <TableRow key={session.id} className="cursor-pointer transition-colors hover:bg-default-100">
                 <TableCell>{compact(session.sessionId)}</TableCell>
-                <TableCell>{session.userEmail ?? session.userAccountId ?? session.userId ?? "unknown"}</TableCell>
+                <TableCell>
+                  <UserCell
+                    id={{
+                      user: session.userEmail ?? session.userAccountId ?? session.userId,
+                      email: session.userEmail,
+                      displayName: session.displayName,
+                      githubLogin: session.githubLogin
+                    }}
+                  />
+                </TableCell>
+                <TableCell>
+                  <SourceBadges hasOtel={session.hasOtel} hasJsonl={session.hasJsonl} metricSource={session.metricSource} source={session.source} />
+                </TableCell>
                 <TableCell>{session.models.join(", ") || "unknown"}</TableCell>
-                <TableCell>{formatNumber(session.totalTokens)}</TableCell>
-                <TableCell>{formatCurrency(session.totalCost)}</TableCell>
-                <TableCell>{new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "short" }).format(session.lastSeenAt)}</TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <span>{formatNumber(session.totalTokens)}</span>
+                    <TokenDiffBadge otel={session.otelTotalTokens} jsonl={session.jsonlTotalTokens} />
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-2">
+                    <span>{formatCurrency(session.totalCost)}</span>
+                    <CostDiffBadge otel={session.otelTotalCost} jsonl={session.jsonlTotalCost} />
+                  </div>
+                </TableCell>
+                <TableCell title={new Date(session.lastSeenAt).toLocaleString()}>{formatRelativeTime(session.lastSeenAt)}</TableCell>
+                <TableCell>
+                  {session.hasTranscript ? (
+                    <button
+                      type="button"
+                      aria-label="View transcript"
+                      title="View transcript"
+                      className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs text-primary transition-colors hover:bg-primary/10"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onViewTranscript(session.id);
+                      }}
+                    >
+                      <FileText size={14} /> View
+                    </button>
+                  ) : (
+                    <span className="text-xs text-default-400">—</span>
+                  )}
+                </TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -586,7 +824,7 @@ function PeopleTable({ people, onOpen }: { people: PersonSummary[]; onOpen: (use
     <Card shadow="sm">
       <CardBody className="gap-4">
         <div className="flex items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold text-default-900">People</h2>
+          <h2 className="font-display text-xl font-semibold tracking-tight text-default-900">People</h2>
           <span className="text-sm text-default-500">{people.length} senders · click to drill in</span>
         </div>
         <Table aria-label="People" removeWrapper selectionMode="none" onRowAction={(key) => onOpen(String(key))}>
@@ -601,12 +839,14 @@ function PeopleTable({ people, onOpen }: { people: PersonSummary[]; onOpen: (use
           <TableBody emptyContent="No senders yet" items={people}>
             {(person) => (
               <TableRow key={person.user} className="cursor-pointer transition-colors hover:bg-default-100">
-                <TableCell>{person.user}</TableCell>
+                <TableCell>
+                  <UserCell id={person} />
+                </TableCell>
                 <TableCell>{formatNumber(person.sessions)}</TableCell>
                 <TableCell>{person.models.join(", ") || "unknown"}</TableCell>
                 <TableCell>{formatNumber(person.totalTokens)}</TableCell>
                 <TableCell>{formatCurrency(person.totalCost)}</TableCell>
-                <TableCell>{new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "short" }).format(person.lastSeenAt)}</TableCell>
+                <TableCell title={new Date(person.lastSeenAt).toLocaleString()}>{formatRelativeTime(person.lastSeenAt)}</TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -621,7 +861,7 @@ function ModelsTable({ models, onOpen }: { models: ModelSummary[]; onOpen: (mode
     <Card shadow="sm">
       <CardBody className="gap-4">
         <div className="flex items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold text-default-900">Models</h2>
+          <h2 className="font-display text-xl font-semibold tracking-tight text-default-900">Models</h2>
           <span className="text-sm text-default-500">{models.length} models · click to drill in</span>
         </div>
         <Table aria-label="Models" removeWrapper selectionMode="none" onRowAction={(key) => onOpen(String(key))}>
@@ -641,7 +881,7 @@ function ModelsTable({ models, onOpen }: { models: ModelSummary[]; onOpen: (mode
                 <TableCell>{formatNumber(model.users)}</TableCell>
                 <TableCell>{formatNumber(model.totalTokens)}</TableCell>
                 <TableCell>{formatCurrency(model.totalCost)}</TableCell>
-                <TableCell>{new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "short" }).format(model.lastSeenAt)}</TableCell>
+                <TableCell title={new Date(model.lastSeenAt).toLocaleString()}>{formatRelativeTime(model.lastSeenAt)}</TableCell>
               </TableRow>
             )}
           </TableBody>
@@ -653,20 +893,23 @@ function ModelsTable({ models, onOpen }: { models: ModelSummary[]; onOpen: (mode
 
 // Sessions are unbounded, so the active session drill-down is shown as a removable chip rather than a
 // dropdown. Resolves the numeric id to a friendly "shortId · user" label via the session detail route.
-function SessionFilterChip({ id, onClear }: { id: number; onClear: () => void }) {
+function SessionFilterChip({ id, onClear, onView }: { id: number; onClear: () => void; onView: () => void }) {
   const session = useQuery({ queryKey: ["session", id], queryFn: () => getSession(id) });
   const transcript = useQuery({ queryKey: ["transcript-info", id], queryFn: () => getTranscriptInfo(id) });
   const data = session.data;
-  const label = data ? `${compact(data.sessionId)} · ${data.userEmail ?? data.userAccountId ?? data.userId ?? "unknown"}` : `Session #${id}`;
+  const label = data
+    ? `${compact(data.sessionId)} · ${userLabel({ user: data.userEmail ?? data.userAccountId ?? data.userId, email: data.userEmail, displayName: data.displayName, githubLogin: data.githubLogin })}`
+    : `Session #${id}`;
   return (
     <div className="flex items-center gap-2 self-end">
       <Chip variant="flat" color="primary" startContent={<RefreshCcw size={14} className="ml-1" />} onClose={onClear}>
         {label}
       </Chip>
+      {data && <SourceBadges hasOtel={data.hasOtel} hasJsonl={data.hasJsonl} metricSource={data.metricSource} source={data.source} />}
       {transcript.data && (
-        <a href={transcriptUrl(id)} target="_blank" rel="noreferrer" className="text-sm text-primary hover:underline">
+        <button type="button" onClick={onView} className="text-sm text-primary hover:underline">
           View transcript
-        </a>
+        </button>
       )}
     </div>
   );
@@ -682,181 +925,25 @@ function pickKey(keys: "all" | Set<React.Key>): string {
   return value && value !== ALL ? value : "";
 }
 
-function rangeWindow(range: RangeKey): { from?: number; granularity: Granularity } {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  switch (range) {
-    case "now":
-      return { from: Date.now() - 3 * 3_600_000, granularity: "five_minute" };
-    case "today":
-      return { from: date.getTime(), granularity: "quarter_hour" };
-    case "week":
-      date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
-      return { from: date.getTime(), granularity: "hour" };
-    case "month":
-      date.setDate(1);
-      return { from: date.getTime(), granularity: "day" };
-    case "year":
-      date.setMonth(0, 1);
-      return { from: date.getTime(), granularity: "week" };
-    default:
-      return { from: undefined, granularity: "day" };
-  }
-}
-
-function lineOptions(
-  dense: TimeseriesPoint[],
-  granularity: Granularity,
-  key: "totalTokens" | "totalCost",
-  color: string,
-  tooltipValue: (value: number) => string,
-  axisValue: (value: number) => string
-): ChartGPUOptions {
-  return {
-    theme: "light",
-    animation: { duration: 280, easing: "cubicOut" },
-    legend: { show: false },
-    grid: { left: 64, right: 22, top: 16, bottom: 28 },
-    gridLines: { horizontal: true, vertical: false, color: "#eef2f6" },
-    palette: [color],
-    xAxis: { type: "time", tickFormatter: (value) => formatAxisTime(value, granularity) },
-    yAxis: { type: "value", tickFormatter: axisValue },
-    tooltip: {
-      trigger: "axis",
-      formatter: (params: TooltipParams | readonly TooltipParams[]) => {
-        const first = Array.isArray(params) ? params[0] : params;
-        if (!first) return "";
-        return `${formatTooltipTime(first.value[0], granularity)}<br/>${tooltipValue(first.value[1])}`;
-      }
-    },
-    series: [
-      {
-        type: "line",
-        name: key === "totalCost" ? "Cost" : "Tokens",
-        color,
-        lineStyle: { width: 2.5 },
-        connectNulls: true,
-        data: dense.map((point) => ({ x: point.bucket, y: point[key] }))
-      }
-    ]
-  };
-}
-
-function seriesLineOptions(
-  dense: TimeseriesPoint[],
-  granularity: Granularity,
-  series: ReadonlyArray<{ name: string; color: string; get: (point: TimeseriesPoint) => number }>,
-  axisValue: (value: number) => string,
-  tooltipValue: (value: number) => string
-): ChartGPUOptions {
-  return {
-    theme: "light",
-    animation: { duration: 280, easing: "cubicOut" },
-    legend: { show: false },
-    grid: { left: 64, right: 22, top: 16, bottom: 28 },
-    gridLines: { horizontal: true, vertical: false, color: "#eef2f6" },
-    palette: series.map((entry) => entry.color),
-    xAxis: { type: "time", tickFormatter: (value) => formatAxisTime(value, granularity) },
-    yAxis: { type: "value", tickFormatter: axisValue },
-    tooltip: {
-      trigger: "axis",
-      formatter: (params: TooltipParams | readonly TooltipParams[]) => {
-        const arr = Array.isArray(params) ? params : [params];
-        if (arr.length === 0) return "";
-        const lines = arr.map((item) => `${item.seriesName}: ${tooltipValue(item.value[1])}`);
-        return `${formatTooltipTime(arr[0].value[0], granularity)}<br/>${lines.join("<br/>")}`;
-      }
-    },
-    series: series.map((entry) => ({
-      type: "line",
-      name: entry.name,
-      color: entry.color,
-      lineStyle: { width: 2.5 },
-      connectNulls: true,
-      data: dense.map((point) => ({ x: point.bucket, y: entry.get(point) }))
-    }))
-  };
-}
-
-function densify(points: TimeseriesPoint[], from: number | undefined, stepMs: number): TimeseriesPoint[] {
-  if (points.length === 0 && from == null) return [];
-  const byBucket = new Map(points.map((point) => [point.bucket, point]));
-  const firstData = points.length ? points[0].bucket : (from ?? Date.now());
-  const start = Math.floor((from ?? firstData) / stepMs) * stepMs;
-  const now = Math.floor(Date.now() / stepMs) * stepMs;
-  const lastData = points.length ? points[points.length - 1].bucket : start;
-  const end = Math.max(now, lastData);
-  const out: TimeseriesPoint[] = [];
-  for (let t = start, i = 0; t <= end && i < 2000; t += stepMs, i++) {
-    out.push(
-      byBucket.get(t) ?? {
-        bucket: t,
-        totalCost: 0,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheCreationTokens: 0,
-        cacheReadTokens: 0,
-        cacheTokens: 0,
-        totalTokens: 0,
-        linesAdded: 0,
-        linesRemoved: 0,
-        editsAccepted: 0,
-        editsRejected: 0,
-        pullRequests: 0,
-        commits: 0
-      }
-    );
-  }
-  return out;
-}
-
-function isIntradayMinutes(granularity: Granularity): boolean {
-  return granularity === "minute" || granularity === "five_minute" || granularity === "quarter_hour";
-}
-
-function formatAxisTime(value: number, granularity: Granularity): string {
-  const date = new Date(value);
-  if (isIntradayMinutes(granularity)) {
-    return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(date);
-  }
-  if (granularity === "hour") {
-    return new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "2-digit" }).format(date);
-  }
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
-}
-
-function formatTooltipTime(value: number, granularity: Granularity): string {
-  const date = new Date(value);
-  if (isIntradayMinutes(granularity)) {
-    return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
-  }
-  if (granularity === "hour") {
-    return new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric", hour: "2-digit" }).format(date);
-  }
-  if (granularity === "week") {
-    return `Week of ${new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date)}`;
-  }
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
-}
-
-function granularityLabel(granularity: Granularity): string {
-  return { minute: "minute", five_minute: "5-min", quarter_hour: "15-min", hour: "hourly", day: "daily", week: "weekly" }[granularity];
-}
-
-function formatCompact(value: number): string {
-  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
-}
-
-function formatCurrencyShort(value: number): string {
-  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 2 }).format(value);
-}
-
-function formatNumber(value: number) {
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
-}
-
-function formatCurrency(value: number) {
-  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 4 }).format(value);
+function setupScript(secure: boolean): string[] {
+  const origin = window.location.origin;
+  return [
+    "# Recommended: let the CLI configure server URL, auth, and shell hooks.",
+    "finius setup",
+    "",
+    "# Manual open-mode launch for Claude Code telemetry:",
+    "export CLAUDE_CODE_ENABLE_TELEMETRY=1",
+    "export OTEL_METRICS_EXPORTER=otlp",
+    "export OTEL_LOGS_EXPORTER=otlp",
+    "export OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/json",
+    "export OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/json",
+    `export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=${origin}/otlp/v1/metrics`,
+    `export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=${origin}/otlp/v1/logs`,
+    "export OTEL_METRIC_EXPORT_INTERVAL=5000",
+    "export OTEL_LOGS_EXPORT_INTERVAL=2000",
+    ...(secure ? ["", "# Secure Mode requires CLI-managed setup so telemetry gets an auth token."] : []),
+    "claude"
+  ];
 }
 
 function compact(value: string) {

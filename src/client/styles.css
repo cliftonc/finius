@@ -12,5 +12,90 @@
   body {
     @apply min-w-[320px] bg-default-50 font-sans text-foreground;
     margin: 0;
+    /* Lining, tabular figures so currency and token counts align like a ledger. */
+    font-variant-numeric: tabular-nums lining-nums;
   }
+
+  /* Display serif for the wordmark + section headings: optical sizing on, no tabular figures. */
+  .font-display {
+    font-optical-sizing: auto;
+    font-variant-numeric: normal;
+  }
+}
+
+/* Prose tuning for markdown rendered inside transcript message cards. */
+.ll-prose {
+  @apply text-sm leading-relaxed text-foreground;
+  /* Prose reads better with proportional figures than the ledger-aligned dashboard default. */
+  font-variant-numeric: normal;
+}
+.ll-prose p {
+  @apply my-2;
+}
+.ll-prose p:first-child {
+  @apply mt-0;
+}
+.ll-prose p:last-child {
+  @apply mb-0;
+}
+.ll-prose code {
+  @apply font-mono text-xs bg-default-200 text-foreground px-1 py-0.5 rounded;
+}
+.ll-prose pre {
+  @apply font-mono text-xs bg-[#0d1117] text-[#c9d1d9] p-3 rounded my-2 overflow-x-auto;
+}
+.ll-prose pre code {
+  @apply bg-transparent text-inherit p-0;
+}
+.ll-prose a {
+  @apply text-primary underline underline-offset-2 hover:text-primary/80;
+}
+.ll-prose ul,
+.ll-prose ol {
+  @apply my-2 pl-5;
+}
+.ll-prose ul {
+  @apply list-disc;
+}
+.ll-prose ol {
+  @apply list-decimal;
+}
+.ll-prose li {
+  @apply my-1;
+}
+.ll-prose strong {
+  @apply font-semibold text-foreground;
+}
+.ll-prose em {
+  @apply italic text-foreground/90;
+}
+.ll-prose blockquote {
+  @apply border-l-2 border-default-300 pl-3 my-2 text-foreground/80;
+}
+.ll-prose h1,
+.ll-prose h2,
+.ll-prose h3,
+.ll-prose h4 {
+  @apply font-semibold text-foreground mt-3 mb-1;
+}
+.ll-prose h1 {
+  @apply text-base;
+}
+.ll-prose h2,
+.ll-prose h3,
+.ll-prose h4 {
+  @apply text-sm;
+}
+.ll-prose table {
+  @apply my-2 text-xs border-collapse;
+}
+.ll-prose th,
+.ll-prose td {
+  @apply border border-default-200 px-2 py-1 text-left;
+}
+.ll-prose th {
+  @apply bg-default-100 font-semibold;
+}
+.ll-prose hr {
+  @apply border-default-200 my-3;
 }

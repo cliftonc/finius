@@ -16,6 +16,19 @@ type Point = { x: number; y: number };
  * The entry animation only runs on the very first paint.
  */
 export function GpuChart({ options, className, style }: { options: ChartGPUOptions; className?: string; style?: React.CSSProperties }) {
+  // Re-create the chart whenever the theme changes. ChartGPU resolves its palette/background at
+  // creation time, and the streaming data-diff below short-circuits when only the theme changed
+  // (identical data → no setOption), so a key-based remount is the reliable way to re-theme.
+  return <GpuChartInstance key={themeKey(options.theme)} options={options} className={className} style={style} />;
+}
+
+// A stable string identifying the active theme, so a light<->dark switch forces a remount.
+function themeKey(theme: ChartGPUOptions["theme"]): string {
+  if (typeof theme === "string") return theme;
+  return theme?.backgroundColor ?? "default";
+}
+
+function GpuChartInstance({ options, className, style }: { options: ChartGPUOptions; className?: string; style?: React.CSSProperties }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ChartGPUInstance | null>(null);
   const optionsRef = useRef(options);

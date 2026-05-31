@@ -1,14 +1,46 @@
+<div align="center">
+
+<img src="public/favicon.svg" alt="Finius" width="96" height="96" />
+
 # Finius
 
-Local-first Claude Code usage tracker. A [Hono](https://hono.dev) server ingests OTLP HTTP/JSON
-metrics & logs (and JSONL transcripts) into SQLite; a React + Vite dashboard renders cost, token,
-session, person, and model breakdowns with live SSE updates.
+**Local-first Claude Code usage & cost tracker.**
 
-## How to run it
+A [Hono](https://hono.dev) server ingests OTLP HTTP/JSON metrics & logs (and JSONL transcripts) into
+SQLite; a React + Vite dashboard renders cost, token, session, person, and model breakdowns with live
+SSE updates. Everything runs on your machine — no data leaves your laptop.
 
-### Prerequisites
+</div>
 
-- Node **22.5+** (uses the built-in `node:sqlite` module; developed on Node 24).
+## Quick start (local)
+
+The fastest way to get running locally is the `finius` CLI. You need **Node 22.5+** (Finius uses the
+built-in `node:sqlite` module; developed on Node 24).
+
+```bash
+npx finius          # first run: installs finius globally, then walks you through setup
+finius serve        # start the server + dashboard at http://localhost:8787
+```
+
+Then launch Claude Code in a new terminal and start coding — the dashboard at
+**http://localhost:8787** updates live as telemetry arrives.
+
+That's it. Three things just happened:
+
+1. **`npx finius`** installed `finius` globally and ran `finius setup`, which saved
+   `~/.finius/config.json` and — with your consent — edited `~/.claude/settings.json` to add the OTLP
+   env vars plus a `SessionEnd` + `PreCompact` hook (`finius hook`) that uploads each session
+   transcript.
+2. **`finius serve`** started a single process exposing the API **and** the dashboard on one port.
+   Its data lives under `~/.finius` (override with `FINIUS_DB_PATH` / `FINIUS_BLOB_DIR`).
+3. Any Claude Code session you run now reports usage to that local server.
+
+Re-run `finius setup` any time to reconfigure, or `finius doctor` to diagnose telemetry that isn't
+arriving.
+
+## Running from source (development)
+
+Prefer to hack on Finius itself? Clone the repo and run the dev servers.
 
 ### 1. Install & start
 

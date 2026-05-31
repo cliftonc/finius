@@ -58,6 +58,10 @@ describe("API", () => {
       body: JSON.stringify({ content, source: "manual-jsonl", sessionId: "s1" })
     });
     expect(imported.status).toBe(200);
+    expect(await imported.json()).toMatchObject({ queued: true });
+
+    // Uploads are processed on a background queue; wait for it to drain before reading back.
+    await storage.settleIngest();
 
     const sessions = (await (await app.request("/api/sessions")).json()) as Array<{ id: number; sessionId: string }>;
     const session = sessions.find((s) => s.sessionId === "s1")!;

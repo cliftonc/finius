@@ -1,12 +1,19 @@
-import { timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
+import { getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "./events.js";
-import type { Granularity, StorageAdapter, SummaryFilters } from "./types.js";
+import type { Granularity, MetricPointInput, StorageAdapter, SummaryFilters, TranscriptFormat } from "./types.js";
+
+// Cookie holding a client's minted session token. The browser presents this on every request and on
+// the EventSource /events stream (which can't set headers but does send cookies).
+const AUTH_COOKIE = "finius_auth";
+// Session-token cookie lifetime. Long-lived; revocation is via the DB, not expiry.
+const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 
 const GRANULARITIES: Granularity[] = ["minute", "five_minute", "quarter_hour", "hour", "day", "week"];
 
@@ -18,14 +25,65 @@ type AppOptions = {
   cronToken?: string;
   // Default retention window (days) for the raw-batch prune endpoint.
   rawRetentionDays?: number;
+  // Master password ("Secure Mode" bootstrap secret). When set, every endpoint except the public
+  // ones requires a credential; clients exchange this password for a session token via /api/auth/login.
+  // When unset, Finius stays fully open (the default local-first behavior).
+  authSecret?: string;
 };
 
-export function createApp({ storage, events, cronToken, rawRetentionDays = 7 }: AppOptions) {
+export function createApp({ storage, events, cronToken, rawRetentionDays = 7, authSecret }: AppOptions) {
   const app = new Hono();
+  const secure = !!authSecret;
+
+  // JSONL uploads are processed on a background queue; publish the SSE 'ingest' event when each
+  // queued job actually completes (not when it was accepted).
+  storage.setProcessingListener((signal, result) => events.publish("ingest", { signal, ...result }));
 
   app.use("*", cors());
 
-  app.get("/api/health", (c) => c.json({ ok: true, now: Date.now() }));
+  // Single pluggable auth gate. In open mode it's a no-op; in Secure Mode it admits a request that
+  // carries a valid credential (the master password, or a minted+non-revoked session token) via the
+  // Authorization: Bearer header or the finius_auth cookie. New login methods (e.g. GitHub) would
+  // extend isValidCredential rather than touch any route.
+  const isValidCredential = (cred: string): boolean => {
+    if (!cred) return false;
+    if (timingSafeEqualStr(cred, authSecret ?? "")) return true;
+    const row = storage.findAuthToken(sha256(cred));
+    return !!row && row.revoked === 0;
+  };
+
+  app.use("*", async (c, next) => {
+    if (!secure) return next();
+    if (!isProtectedPath(c.req.path)) return next();
+    const cred = bearerToken(c.req.header("authorization")) || getCookie(c, AUTH_COOKIE) || "";
+    if (isValidCredential(cred)) return next();
+    return c.json({ error: "unauthorized" }, 401);
+  });
+
+  // Public so setup/doctor can probe Secure Mode without a credential, and so the dashboard knows
+  // whether to show the login screen.
+  app.get("/api/health", (c) => c.json({ ok: true, now: Date.now(), secure }));
+
+  // Exchange the master password for a client session token. Public (it's the bootstrap), constant-time.
+  // The minted token is stored hashed in auth_tokens and set as the finius_auth cookie for browsers;
+  // the CLI also reads it from the JSON body to persist in its config.
+  app.post("/api/auth/login", async (c) => {
+    if (!secure) return c.json({ error: "auth is not enabled on this server" }, 400);
+    const body = (await c.req.json().catch(() => ({}))) as { password?: string; label?: string };
+    if (!timingSafeEqualStr(body.password ?? "", authSecret ?? "")) {
+      return c.json({ error: "invalid password" }, 401);
+    }
+    const token = randomBytes(32).toString("hex");
+    const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 200) : "client";
+    storage.createAuthToken(sha256(token), label, Date.now());
+    setCookie(c, AUTH_COOKIE, token, {
+      httpOnly: true,
+      sameSite: "Lax",
+      path: "/",
+      maxAge: AUTH_COOKIE_MAX_AGE
+    });
+    return c.json({ token });
+  });
 
   // Cron-driven cleanup of old raw_batches. Secured by a bearer token; fails closed when no token
   // is configured. Wire a cron to: curl -X POST -H "Authorization: Bearer $FINIUS_CRON_TOKEN" …
@@ -42,24 +100,48 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7 }: 
   });
 
   app.post("/otlp/v1/metrics", async (c) => {
-    const body = await c.req.json();
+    const body = await readOtlpBody(c, "metrics");
+    if (body === null) return c.json({ error: "expected an OTLP/JSON body" }, 415);
     const result = await storage.ingestOtelMetrics(body);
     if (!result.duplicate) events.publish("ingest", { signal: "metrics", ...result });
     return c.json(result);
   });
 
   app.post("/otlp/v1/logs", async (c) => {
-    const body = await c.req.json();
+    const body = await readOtlpBody(c, "logs");
+    if (body === null) return c.json({ error: "expected an OTLP/JSON body" }, 415);
     const result = await storage.ingestOtelLogs(body);
     if (!result.duplicate) events.publish("ingest", { signal: "logs", ...result });
     return c.json(result);
   });
+
+  // Cron-driven recompute of synthesized cost (e.g. after a pricing update). Same bearer guard /
+  // fail-closed semantics as prune-raw-batches.
+  app.post("/api/maintenance/recompute-cost", async (c) => {
+    if (!cronToken) return c.json({ error: "maintenance endpoints are disabled (set FINIUS_CRON_TOKEN)" }, 503);
+    if (!timingSafeEqualStr(bearerToken(c.req.header("authorization")), cronToken)) {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+    return c.json(await storage.recomputeComputedCost());
+  });
+
+  // Inspection surface for captured OTLP log records (Codex telemetry is logs-only): one entry per
+  // distinct event name with a count + a sample, so we can see the real shape before parsing it.
+  app.get("/api/logs/events", async (c) => c.json(await storage.getLogEventSummary()));
+
+  // The model pricing currently loaded (for debugging cost computation).
+  app.get("/api/pricing", async (c) => c.json(await storage.getPricing()));
 
   app.get("/api/metrics/summary", async (c) => c.json(await storage.getSummary(readFilters(c.req.query()))));
 
   app.get("/api/metrics/timeseries", async (c) => {
     const query = c.req.query();
     return c.json(await storage.getTimeseries({ ...readFilters(query), granularity: readGranularity(query.granularity) }));
+  });
+
+  app.get("/api/metrics/timeseries/by-model", async (c) => {
+    const query = c.req.query();
+    return c.json(await storage.getModelTimeseries({ ...readFilters(query), granularity: readGranularity(query.granularity) }));
   });
 
   app.get("/api/sessions", async (c) => c.json(await storage.listSessions(readFilters(c.req.query()))));
@@ -91,39 +173,59 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7 }: 
     let content = "";
     let source = "manual-jsonl";
     let sessionId: string | undefined;
+    let format: TranscriptFormat | undefined;
 
+    let identity: ReturnType<typeof identityHint> = {};
     if (contentType.includes("application/json")) {
-      const body = (await c.req.json()) as { content?: string; source?: string; sessionId?: string };
+      const body = (await c.req.json()) as {
+        content?: string;
+        source?: string;
+        sessionId?: string;
+        format?: TranscriptFormat;
+      } & IdentityBody;
       content = body.content ?? "";
       source = body.source ?? source;
       sessionId = body.sessionId;
+      format = body.format;
+      identity = identityHint(body);
     } else {
       content = await c.req.text();
     }
 
-    const result = await storage.importJsonl(source, { sessionId }, content);
-    if (!result.duplicate) events.publish("ingest", { signal: "jsonl", ...result });
+    // Persist + queue; the blob is stored immediately and processing happens on the background queue.
+    const result = await storage.enqueueImport(source, { sessionId, ...identity }, content, format);
     return c.json(result);
   });
 
   app.post("/api/import/claude-hook", async (c) => {
-    const body = (await c.req.json()) as { session_id?: string; sessionId?: string; transcript_path?: string; cwd?: string };
-    const transcriptPath = body.transcript_path;
-    if (!transcriptPath) return c.json({ error: "transcript_path is required" }, 400);
+    const body = (await c.req.json()) as {
+      session_id?: string;
+      sessionId?: string;
+      transcript_path?: string;
+      transcript?: string;
+      cwd?: string;
+    } & IdentityBody;
+    const sessionHint = { sessionId: body.session_id ?? body.sessionId ?? undefined, ...identityHint(body) };
 
-    const resolvedPath = resolve(transcriptPath.replace(/^~(?=$|\/)/, homedir()));
-    if (!isAllowedTranscriptPath(resolvedPath, body.cwd)) {
-      return c.json({ error: "transcript_path is outside allowed local Claude/project directories" }, 403);
+    // Preferred path: the client (e.g. the `finius` CLI hook) sends the transcript inline, so the
+    // server never needs to share a filesystem with Claude Code. Works for remote servers too.
+    let content = typeof body.transcript === "string" ? body.transcript : undefined;
+
+    // Fallback: read a local transcript file. Only safe when the server runs on the same machine as
+    // Claude Code, so it is restricted to known Claude/project directories.
+    if (content === undefined) {
+      const transcriptPath = body.transcript_path;
+      if (!transcriptPath) return c.json({ error: "transcript or transcript_path is required" }, 400);
+
+      const resolvedPath = resolve(transcriptPath.replace(/^~(?=$|\/)/, homedir()));
+      if (!isAllowedTranscriptPath(resolvedPath, body.cwd)) {
+        return c.json({ error: "transcript_path is outside allowed local Claude/project directories" }, 403);
+      }
+      if (!existsSync(resolvedPath)) return c.json({ error: "transcript_path does not exist" }, 404);
+      content = readFileSync(resolvedPath, "utf8");
     }
-    if (!existsSync(resolvedPath)) return c.json({ error: "transcript_path does not exist" }, 404);
 
-    const content = readFileSync(resolvedPath, "utf8");
-    const result = await storage.importJsonl(
-      "claude-code-jsonl",
-      { sessionId: body.session_id ?? body.sessionId ?? undefined },
-      content
-    );
-    if (!result.duplicate) events.publish("ingest", { signal: "claude-hook", ...result });
+    const result = await storage.enqueueImport("claude-code-jsonl", sessionHint, content);
     return c.json(result);
   });
 
@@ -169,6 +271,31 @@ function parseId(value?: string) {
   return Number.isInteger(numeric) ? numeric : undefined;
 }
 
+// User identity an importing client (the `finius` CLI hook/backfill) attaches to a transcript upload.
+// Accepts both snake_case (claude-hook body) and camelCase (jsonl body) so either route can carry it.
+type IdentityBody = {
+  user_email?: string;
+  user_account_id?: string;
+  user_id?: string;
+  github_login?: string;
+  display_name?: string;
+  userEmail?: string;
+  userAccountId?: string;
+  userId?: string;
+  githubLogin?: string;
+  displayName?: string;
+};
+
+function identityHint(body: IdentityBody): Partial<MetricPointInput> {
+  return {
+    userEmail: body.user_email ?? body.userEmail ?? undefined,
+    userAccountId: body.user_account_id ?? body.userAccountId ?? undefined,
+    userId: body.user_id ?? body.userId ?? undefined,
+    githubLogin: body.github_login ?? body.githubLogin ?? undefined,
+    displayName: body.display_name ?? body.displayName ?? undefined
+  };
+}
+
 function readGranularity(value?: string): Granularity {
   return GRANULARITIES.includes(value as Granularity) ? (value as Granularity) : "hour";
 }
@@ -176,6 +303,42 @@ function readGranularity(value?: string): Granularity {
 function bearerToken(header?: string) {
   const match = /^Bearer\s+(.+)$/i.exec(header ?? "");
   return match ? match[1].trim() : "";
+}
+
+// Reads an OTLP request body as text (so a debug dump can capture the exact bytes the agent sent —
+// even non-JSON), optionally captures it, then parses JSON. Returns null when the body isn't valid
+// OTLP/JSON (e.g. an agent that sends protobuf). Set FINIUS_DEBUG_OTEL to a file path to append every
+// batch as `{kind, at, contentType, raw}` NDJSON — used to discover what a new agent (e.g. Codex)
+// actually emits before writing a parser for it.
+async function readOtlpBody(c: Context, kind: "metrics" | "logs"): Promise<unknown> {
+  const raw = await c.req.text();
+  const debugPath = process.env.FINIUS_DEBUG_OTEL;
+  if (debugPath) {
+    const line = JSON.stringify({ kind, at: Date.now(), contentType: c.req.header("content-type") ?? null, raw });
+    try {
+      appendFileSync(debugPath, `${line}\n`);
+      console.log(`[finius] OTLP ${kind} batch captured -> ${debugPath} (${raw.length} bytes)`);
+    } catch (err) {
+      console.error(`[finius] OTLP debug capture failed: ${(err as Error).message}`);
+    }
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function sha256(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+// Which paths the Secure Mode gate guards. Data + ingest + the live stream require a credential;
+// everything else (static client assets, index.html, /api/health, /api/auth/login) is public so the
+// login page can load and clients can bootstrap. /api/auth/login is under /api/ but allow-listed.
+function isProtectedPath(path: string) {
+  if (path === "/api/health" || path === "/api/auth/login") return false;
+  return path.startsWith("/api/") || path.startsWith("/otlp/") || path === "/events";
 }
 
 // Constant-time string compare that doesn't leak length via early return.

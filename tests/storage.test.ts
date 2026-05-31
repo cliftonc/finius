@@ -1,10 +1,9 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { SqliteStorageAdapter } from "../src/server/storage/sqlite";
-import { otlpLogBatch, otlpMetricBatch } from "./fixtures";
+import { jsonlTranscript, otlpLogBatch, otlpMetricBatch } from "./fixtures";
 
 function tmpDbPath() {
   return join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite");
@@ -135,6 +134,78 @@ describe("SQLite storage adapter", () => {
     expect(fine.reduce((sum, b) => sum + b.inputTokens, 0)).toBe(30);
   });
 
+  it("answers mid-hour `from`/`to` windows from metric_points, not the hourly rollup", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    // One point at 00:30; the hourly rollup buckets it under 00:00. A `from` later than the top of
+    // the hour must still see it (regression: a raw `bucket >= from` compare dropped the bucket).
+    const content = '{"session_id":"s1","timestamp":"2024-01-01T00:30:00Z","message":{"usage":{"input_tokens":42}}}';
+    await storage.importJsonl("manual-jsonl", {}, content);
+
+    const at0015 = Date.parse("2024-01-01T00:15:00Z"); // mid-hour, after the 00:00 bucket start
+    const within = await storage.getSummary({ from: at0015 });
+    expect(within.inputTokens).toBe(42); // point at 00:30 is inside the window
+
+    const at0045 = Date.parse("2024-01-01T00:45:00Z"); // mid-hour, after the point
+    const after = await storage.getSummary({ from: at0045 });
+    expect(after.inputTokens).toBe(0); // point at 00:30 is genuinely excluded
+  });
+
+  it("returns a per-model token and session timeseries", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    // Two sessions on the same model in the same hour bucket...
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-b"));
+    // ...plus a third session on a different model, in the same bucket.
+    const opusBatch = {
+      resourceMetrics: [
+        {
+          resource: {
+            attributes: [
+              { key: "session.id", value: { stringValue: "session-c" } },
+              { key: "user.email", value: { stringValue: "dev@example.com" } },
+              { key: "model", value: { stringValue: "claude-opus-4-1" } }
+            ]
+          },
+          scopeMetrics: [
+            {
+              metrics: [
+                {
+                  name: "claude_code.token.usage",
+                  unit: "tokens",
+                  sum: { dataPoints: [{ timeUnixNano: "1760000000000000000", asInt: "500", attributes: [{ key: "type", value: { stringValue: "input" } }] }] }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    };
+    await storage.ingestOtelMetrics(opusBatch);
+
+    const series = await storage.getModelTimeseries({ granularity: "hour" });
+    const byModel = new Map(series.map((row) => [row.model, row]));
+    expect(byModel.size).toBe(2);
+    // Both sonnet sessions land in one (bucket, model) row: tokens summed, sessions distinct-counted.
+    expect(byModel.get("claude-sonnet-4-5")).toMatchObject({ totalTokens: 3100, sessions: 2 });
+    expect(byModel.get("claude-opus-4-1")).toMatchObject({ totalTokens: 500, sessions: 1 });
+
+    // Filtering by model narrows to that model's line.
+    const onlyOpus = await storage.getModelTimeseries({ granularity: "hour", model: "claude-opus-4-1" });
+    expect(onlyOpus).toHaveLength(1);
+    expect(onlyOpus[0]).toMatchObject({ model: "claude-opus-4-1", totalTokens: 500, sessions: 1 });
+  });
+
+  it("does not double-count a session that has both OTel and a transcript in the per-model timeseries", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-a")); // OTel: 1200 in / 350 out
+    // Shadowed transcript for the same session/model — must not add a second session or extra tokens.
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "session-a" }, jsonlTranscript("session-a", { input_tokens: 999, output_tokens: 111 }, 0.5));
+
+    const series = await storage.getModelTimeseries({ granularity: "hour" });
+    expect(series).toHaveLength(1);
+    expect(series[0]).toMatchObject({ model: "claude-sonnet-4-5", totalTokens: 1550, sessions: 1 });
+  });
+
   it("aggregates pull_request and commit counts into the summary and timeseries", async () => {
     storage = new SqliteStorageAdapter(tmpDbPath());
     const batch = {
@@ -188,48 +259,95 @@ describe("SQLite storage adapter", () => {
     expect(await storage.getSessionTranscript(999_999)).toBeNull();
   });
 
-  it("migrates a legacy database: drops raw_events and backfills the rollup", async () => {
-    const path = tmpDbPath();
-    // Hand-build a pre-rollup database (schema version 1, with a raw_events table and points).
-    const legacy = new DatabaseSync(path);
-    legacy.exec(`
-      CREATE TABLE raw_events (id INTEGER PRIMARY KEY, event_json TEXT);
-      CREATE TABLE sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, session_id TEXT NOT NULL,
-        user_id TEXT, user_email TEXT, user_account_id TEXT,
-        first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, UNIQUE(source, session_id)
-      );
-      CREATE TABLE metric_points (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, signal TEXT NOT NULL,
-        session_row_id INTEGER NOT NULL, session_id TEXT NOT NULL, user_id TEXT, user_email TEXT,
-        user_account_id TEXT, model TEXT, metric_name TEXT NOT NULL, kind TEXT NOT NULL,
-        token_type TEXT, value REAL NOT NULL, unit TEXT, timestamp INTEGER NOT NULL,
-        attributes_json TEXT, raw_batch_id INTEGER, raw_event_id INTEGER
-      );
-      INSERT INTO sessions (source, session_id, user_email, first_seen_at, last_seen_at)
-        VALUES ('claude-code', 's1', 'dev@example.com', 1700000000000, 1700000000000);
-      INSERT INTO metric_points (source, signal, session_row_id, session_id, user_email, model, metric_name, kind, token_type, value, timestamp)
-        VALUES ('claude-code', 'otlp_metrics', 1, 's1', 'dev@example.com', 'claude-sonnet-4-5', 'claude_code.token.usage', 'tokens', 'input', 500, 1700000000000);
-      INSERT INTO raw_events (event_json) VALUES ('{"legacy":true}');
-      PRAGMA user_version = 1;
-    `);
-    legacy.close();
+  it("links an uploaded transcript to the OTel session without double-counting", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
 
-    storage = new SqliteStorageAdapter(path);
-    const summary = await storage.getSummary({}); // served from the freshly-backfilled rollup
-    expect(summary.inputTokens).toBe(500);
+    // Same session UUID, but the transcript reports different numbers (and a cost). OTel is
+    // authoritative, so importing it must NOT change the totals.
+    const content = jsonlTranscript("session-a", { input_tokens: 999, output_tokens: 111 }, 0.5);
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "session-a" }, content);
 
-    const probe = new DatabaseSync(path);
-    const { user_version } = probe.prepare("PRAGMA user_version").get() as { user_version: number };
-    expect(user_version).toBe(3);
-    const tables = probe
-      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-      .all()
-      .map((r) => (r as { name: string }).name);
-    expect(tables).toContain("metric_rollup");
-    expect(tables).not.toContain("raw_events");
-    const { n } = probe.prepare("SELECT COUNT(*) AS n FROM metric_rollup").get() as { n: number };
-    expect(n).toBeGreaterThan(0);
-    probe.close();
+    const summary = await storage.getSummary({});
+    expect(summary.inputTokens).toBe(1200);
+    expect(summary.outputTokens).toBe(350);
+    expect(summary.totalCost).toBe(0.024);
+    expect(summary.sessionCount).toBe(1);
+
+    // The transcript attaches to the OTel session row (source 'claude-code'), and the shadowed
+    // jsonl twin is hidden from the default list — one row for the UUID, with the transcript.
+    const sessionA = (await storage.listSessions({})).filter((s) => s.sessionId === "session-a");
+    expect(sessionA).toHaveLength(1);
+    expect(sessionA[0].source).toBe("claude-code");
+    expect(sessionA[0].hasTranscript).toBe(true);
+    expect((await storage.getSessionTranscript(sessionA[0].id))?.content).toBe(content);
+
+    // The transcript-derived numbers are still retained under their own source for comparison.
+    const otelOnly = await storage.getSummary({ source: "claude-code" });
+    expect(otelOnly.inputTokens).toBe(1200);
+    const jsonlOnly = await storage.getSummary({ source: "claude-code-jsonl" });
+    expect(jsonlOnly.inputTokens).toBe(999);
+    expect(jsonlOnly.outputTokens).toBe(111);
+
+    const options = await storage.getFilterOptions();
+    expect(options.sources).toEqual(expect.arrayContaining(["claude-code", "claude-code-jsonl"]));
+  });
+
+  it("falls back to transcript-derived metrics for sessions with no OTel", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "solo" }, jsonlTranscript("solo", { input_tokens: 40, output_tokens: 7 }, 0.01));
+
+    const summary = await storage.getSummary({});
+    expect(summary.inputTokens).toBe(40);
+    expect(summary.outputTokens).toBe(7);
+    expect(summary.totalCost).toBe(0.01);
+    expect(summary.sessionCount).toBe(1);
+    expect((await storage.listSessions({})).find((s) => s.sessionId === "solo")).toBeDefined();
+  });
+
+  it("mixes OTel and transcript-only sessions with per-session precedence", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-a")); // OTel: 1200 in / 350 out / 0.024
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "session-a" }, jsonlTranscript("session-a", { input_tokens: 999, output_tokens: 111 }, 0.5)); // shadowed by OTel
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "solo" }, jsonlTranscript("solo", { input_tokens: 40, output_tokens: 7 }, 0.01)); // fallback
+
+    const summary = await storage.getSummary({});
+    expect(summary.inputTokens).toBe(1200 + 40);
+    expect(summary.outputTokens).toBe(350 + 7);
+    expect(summary.totalCost).toBeCloseTo(0.024 + 0.01, 6);
+    expect(summary.sessionCount).toBe(2);
+
+    // Timeseries (rollup path) must match the summary total — no double count there either.
+    const series = await storage.getTimeseries({ granularity: "day" });
+    expect(series.reduce((sum, p) => sum + p.inputTokens, 0)).toBe(1240);
+  });
+
+  it("records explicit per-session source state (otel / jsonl / both) on one session row", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    // OTel-only session, JSONL-only session, and a session that has both signals.
+    await storage.ingestOtelMetrics(otlpMetricBatch("otel-only"));
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "jsonl-only" }, jsonlTranscript("jsonl-only", { input_tokens: 5 }, 0.001));
+    await storage.ingestOtelMetrics(otlpMetricBatch("both"));
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "both" }, jsonlTranscript("both", { input_tokens: 999 }, 0.5));
+
+    const byId = new Map((await storage.listSessions({})).map((s) => [s.sessionId, s]));
+
+    // Each UUID is exactly one session row (no per-source twins).
+    expect(byId.size).toBe(3);
+
+    const otel = byId.get("otel-only")!;
+    expect(otel).toMatchObject({ hasOtel: true, hasJsonl: false, metricSource: "otel", source: "claude-code" });
+
+    const jsonl = byId.get("jsonl-only")!;
+    expect(jsonl).toMatchObject({ hasOtel: false, hasJsonl: true, metricSource: "jsonl", source: "claude-code-jsonl" });
+
+    // Both signals present -> OTel is authoritative, but has_jsonl is still recorded for the UI.
+    const both = byId.get("both")!;
+    expect(both).toMatchObject({ hasOtel: true, hasJsonl: true, metricSource: "otel", source: "claude-code" });
+    // The authoritative (OTel) numbers are shown, not the shadowed transcript's 999.
+    expect(both.inputTokens).toBe(1200);
+
+    // getSession resolves by id directly (not capped to the recent-100 list).
+    expect((await storage.getSession(both.id))?.sessionId).toBe("both");
   });
 });

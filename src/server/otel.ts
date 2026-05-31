@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { MetricKind, MetricPointInput } from "./types.js";
+import type { MetricKind, MetricPointInput, OtelLogRecord } from "./types.js";
 
 type AttributeValue = {
   stringValue?: string;
@@ -192,14 +192,55 @@ export function parseOtelMetricRecords(batch: unknown, source = "claude-code"): 
   return records;
 }
 
-export function parseOtelLogRecords(batch: unknown): unknown[] {
-  const records: unknown[] = [];
+// Flattens an OTLP/JSON logs batch into structured records, merging resource + record attributes and
+// decoding the body. Codex's native telemetry is logs-only, so this is the seam through which we
+// capture (and, later, parse) what it sends. Pure / side-effect-free.
+//
+// Codex's native telemetry is logs-only, so this is the visibility path for it: records are indexed
+// into log_events for inspection (GET /api/logs/events), but token/cost for Codex come from the
+// authoritative rollout-JSONL path (`codex-cli-jsonl`), not from these logs — the OTel `codex.sse_event`
+// stream is a partial, cost-less subset of the rollout, so ingesting it as metrics would undercount.
+export function parseOtelLogRecords(batch: unknown): OtelLogRecord[] {
+  const records: OtelLogRecord[] = [];
   const resourceLogs = asArray((batch as { resourceLogs?: unknown[] })?.resourceLogs);
 
   for (const resourceLog of resourceLogs) {
-    const scopeLogs = asArray((resourceLog as { scopeLogs?: unknown[] }).scopeLogs);
-    for (const scopeLog of scopeLogs) {
-      records.push(...asArray((scopeLog as { logRecords?: unknown[] }).logRecords));
+    const resourceAttrs = attributesToObject((resourceLog as { resource?: { attributes?: Attribute[] } }).resource?.attributes);
+    for (const scopeLog of asArray((resourceLog as { scopeLogs?: unknown[] }).scopeLogs)) {
+      for (const logRecord of asArray((scopeLog as { logRecords?: unknown[] }).logRecords)) {
+        const lr = logRecord as {
+          eventName?: string;
+          name?: string;
+          severityText?: string;
+          timeUnixNano?: string | number;
+          observedTimeUnixNano?: string | number;
+          attributes?: Attribute[];
+          body?: AttributeValue;
+        };
+        const attributes = { ...resourceAttrs, ...attributesToObject(lr.attributes) };
+        // Event name: the semantic `event.name` attribute FIRST (what both Claude Code and Codex
+        // actually set to the real id), then the loose top-level `eventName`/`name`. Codex's tracing
+        // appender pollutes the top-level `eventName` with a Rust source location (e.g.
+        // "event otel/src/.../session_telemetry.rs:778") and carries the true id (`codex.sse_event`, …)
+        // only in the attribute — so attribute-first is what keeps records from being mislabeled.
+        const eventName =
+          stringAttr(attributes, "event.name") ||
+          (typeof lr.eventName === "string" && lr.eventName) ||
+          (typeof lr.name === "string" && lr.name) ||
+          null;
+        records.push({
+          eventName,
+          severityText: typeof lr.severityText === "string" ? lr.severityText : null,
+          timestamp: Number(unixNanoToMs(lr.timeUnixNano ?? lr.observedTimeUnixNano) ?? Date.now()),
+          sessionId:
+            stringAttr(attributes, "session.id") ??
+            stringAttr(attributes, "session_id") ??
+            stringAttr(attributes, "conversation.id") ??
+            null,
+          attributes,
+          body: decodeAttributeValue(lr.body)
+        });
+      }
     }
   }
 
