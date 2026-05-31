@@ -1,0 +1,555 @@
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { parseJsonl } from "../jsonl.js";
+import { parseOtelLogRecords, parseOtelMetricPoints, parseOtelMetricRecords, preferredIdentity, stableHash } from "../otel.js";
+import type { OtelMetricRecord } from "../otel.js";
+import type {
+  FilterOptions,
+  Granularity,
+  ImportResult,
+  MetricPointInput,
+  ModelSummary,
+  PersonSummary,
+  SessionSummary,
+  StorageAdapter,
+  Summary,
+  SummaryFilters,
+  TimeseriesPoint
+} from "../types.js";
+
+const GRANULARITY_MS: Record<Granularity, number> = {
+  minute: 60_000,
+  five_minute: 300_000,
+  quarter_hour: 900_000,
+  hour: 3_600_000,
+  day: 86_400_000,
+  week: 604_800_000
+};
+
+type Database = InstanceType<typeof DatabaseSync>;
+
+export class SqliteStorageAdapter implements StorageAdapter {
+  private db: Database;
+
+  constructor(path: string) {
+    mkdirSync(dirname(path), { recursive: true });
+    this.db = new DatabaseSync(path);
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.migrate();
+  }
+
+  async ingestOtelMetrics(batch: unknown) {
+    const hash = stableHash("otlp_metrics", batch);
+    const rawBatchId = this.insertRawBatch("otlp_metrics", hash, batch);
+    if (rawBatchId === null) return { duplicate: true, points: 0 };
+
+    const points = parseOtelMetricPoints(batch);
+    const records = parseOtelMetricRecords(batch);
+    warnIfCumulative(records);
+
+    const insertRaw = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
+    const now = Date.now();
+
+    this.db.exec("BEGIN");
+    try {
+      // Persist every metric data point (all metric names) so the raw log is complete.
+      for (const record of records) {
+        insertRaw.run(record.source, "otlp_metrics", rawBatchId, JSON.stringify(record), now);
+      }
+      for (const point of points) {
+        this.insertMetricPoint(point, rawBatchId);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    return { duplicate: false, points: points.length };
+  }
+
+  async ingestOtelLogs(batch: unknown) {
+    const hash = stableHash("otlp_logs", batch);
+    const rawBatchId = this.insertRawBatch("otlp_logs", hash, batch);
+    if (rawBatchId === null) return { duplicate: true, events: 0 };
+
+    const records = parseOtelLogRecords(batch);
+    const insert = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
+    const now = Date.now();
+
+    this.db.exec("BEGIN");
+    try {
+      for (const record of records) {
+        insert.run("claude-code", "otlp_logs", rawBatchId, JSON.stringify(record), now);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    return { duplicate: false, events: records.length };
+  }
+
+  async importJsonl(source: string, sessionHint: Partial<MetricPointInput>, lines: string[]): Promise<ImportResult> {
+    const hash = stableHash("jsonl", { source, sessionHint, lines });
+    const rawBatchId = this.insertRawBatch("jsonl", hash, { source, sessionHint, lineCount: lines.length });
+    if (rawBatchId === null) return { duplicate: true, importedLines: 0, malformedLines: 0, metricPoints: 0, rawEvents: 0 };
+
+    const parsed = parseJsonl(source, sessionHint, lines);
+    this.db.exec("BEGIN");
+    try {
+      const insertRaw = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
+      const now = Date.now();
+      for (const rawEvent of parsed.rawEvents) {
+        insertRaw.run(source, "jsonl", rawBatchId, JSON.stringify(rawEvent), now);
+      }
+      for (const point of parsed.points) {
+        this.insertMetricPoint(point, rawBatchId);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    return parsed.result;
+  }
+
+  async getSummary(filters: SummaryFilters): Promise<Summary> {
+    const { where, params } = pointWhere(filters);
+    const totals = this.db
+      .prepare(
+        `SELECT
+          COALESCE(SUM(CASE WHEN kind = 'cost' THEN value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN value ELSE 0 END), 0) AS inputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN value ELSE 0 END), 0) AS outputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_creation' THEN value ELSE 0 END), 0) AS cacheCreationTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_read' THEN value ELSE 0 END), 0) AS cacheReadTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' THEN value ELSE 0 END), 0) AS totalTokens,
+          COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'added' THEN value ELSE 0 END), 0) AS linesAdded,
+          COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'removed' THEN value ELSE 0 END), 0) AS linesRemoved,
+          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'accept' THEN value ELSE 0 END), 0) AS editsAccepted,
+          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'reject' THEN value ELSE 0 END), 0) AS editsRejected,
+          COUNT(DISTINCT session_row_id) AS sessionCount,
+          COUNT(DISTINCT COALESCE(user_email, user_account_id, user_id, 'unknown')) AS activeSenders
+        FROM metric_points ${where}`
+      )
+      .get(...params) as Record<string, number>;
+
+    return {
+      totalCost: totals.totalCost,
+      inputTokens: totals.inputTokens,
+      outputTokens: totals.outputTokens,
+      cacheCreationTokens: totals.cacheCreationTokens,
+      cacheReadTokens: totals.cacheReadTokens,
+      totalTokens: totals.totalTokens,
+      sessionCount: totals.sessionCount,
+      activeSenders: totals.activeSenders,
+      linesAdded: totals.linesAdded,
+      linesRemoved: totals.linesRemoved,
+      editsAccepted: totals.editsAccepted,
+      editsRejected: totals.editsRejected,
+      models: this.breakdown("model", where, params),
+      users: this.breakdown("COALESCE(user_email, user_account_id, user_id, 'unknown')", where, params, "user"),
+      sources: this.breakdown("source", where, params)
+    };
+  }
+
+  async getTimeseries(filters: SummaryFilters & { granularity?: Granularity }): Promise<TimeseriesPoint[]> {
+    const bucketMs = GRANULARITY_MS[filters.granularity ?? "hour"];
+    const { where, params } = pointWhere(filters);
+    const rows = this.db
+      .prepare(
+        `SELECT
+          CAST(timestamp / ? AS INTEGER) * ? AS bucket,
+          COALESCE(SUM(CASE WHEN kind = 'cost' THEN value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN value ELSE 0 END), 0) AS inputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN value ELSE 0 END), 0) AS outputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_creation' THEN value ELSE 0 END), 0) AS cacheCreationTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'cache_read' THEN value ELSE 0 END), 0) AS cacheReadTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type IN ('cache_creation', 'cache_read') THEN value ELSE 0 END), 0) AS cacheTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' THEN value ELSE 0 END), 0) AS totalTokens,
+          COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'added' THEN value ELSE 0 END), 0) AS linesAdded,
+          COALESCE(SUM(CASE WHEN kind = 'lines' AND token_type = 'removed' THEN value ELSE 0 END), 0) AS linesRemoved,
+          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'accept' THEN value ELSE 0 END), 0) AS editsAccepted,
+          COALESCE(SUM(CASE WHEN kind = 'decision' AND token_type = 'reject' THEN value ELSE 0 END), 0) AS editsRejected
+        FROM metric_points ${where}
+        GROUP BY bucket
+        ORDER BY bucket ASC`
+      )
+      .all(bucketMs, bucketMs, ...params) as TimeseriesPoint[];
+    return rows;
+  }
+
+  async listSessions(filters: SummaryFilters): Promise<SessionSummary[]> {
+    const { where, params } = sessionWhere(filters);
+    const rows = this.db
+      .prepare(
+        `SELECT
+          s.id, s.source, s.session_id AS sessionId, s.user_id AS userId, s.user_email AS userEmail,
+          s.user_account_id AS userAccountId, s.first_seen_at AS firstSeenAt, s.last_seen_at AS lastSeenAt,
+          COALESCE(SUM(CASE WHEN p.kind = 'cost' THEN p.value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'input' THEN p.value ELSE 0 END), 0) AS inputTokens,
+          COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'output' THEN p.value ELSE 0 END), 0) AS outputTokens,
+          COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'cache_creation' THEN p.value ELSE 0 END), 0) AS cacheCreationTokens,
+          COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'cache_read' THEN p.value ELSE 0 END), 0) AS cacheReadTokens,
+          COALESCE(SUM(CASE WHEN p.kind = 'tokens' THEN p.value ELSE 0 END), 0) AS totalTokens,
+          GROUP_CONCAT(DISTINCT p.model) AS models
+        FROM sessions s
+        LEFT JOIN metric_points p ON p.session_row_id = s.id
+        ${where}
+        GROUP BY s.id
+        ORDER BY s.last_seen_at DESC
+        LIMIT 100`
+      )
+      .all(...params) as Array<Omit<SessionSummary, "models"> & { models: string | null }>;
+
+    return rows.map((row) => ({ ...row, models: row.models?.split(",").filter(Boolean) ?? [] }));
+  }
+
+  async getSession(id: number): Promise<SessionSummary | null> {
+    const rows = await this.listSessions({});
+    return rows.find((row) => row.id === id) ?? null;
+  }
+
+  async listPeople(filters: SummaryFilters): Promise<PersonSummary[]> {
+    const identity = "COALESCE(user_email, user_account_id, user_id, 'unknown')";
+    const { where, params } = pointWhere(filters);
+    const rows = this.db
+      .prepare(
+        `SELECT
+          ${identity} AS user,
+          COUNT(DISTINCT session_row_id) AS sessions,
+          COALESCE(SUM(CASE WHEN kind = 'cost' THEN value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN value ELSE 0 END), 0) AS inputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN value ELSE 0 END), 0) AS outputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type IN ('cache_creation', 'cache_read') THEN value ELSE 0 END), 0) AS cacheTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' THEN value ELSE 0 END), 0) AS totalTokens,
+          MAX(timestamp) AS lastSeenAt,
+          GROUP_CONCAT(DISTINCT model) AS models
+        FROM metric_points ${where}
+        GROUP BY ${identity}
+        ORDER BY totalCost DESC, totalTokens DESC`
+      )
+      .all(...params) as Array<Omit<PersonSummary, "models"> & { models: string | null }>;
+
+    return rows.map((row) => ({ ...row, models: row.models?.split(",").filter(Boolean) ?? [] }));
+  }
+
+  async listModels(filters: SummaryFilters): Promise<ModelSummary[]> {
+    const identity = "COALESCE(user_email, user_account_id, user_id, 'unknown')";
+    const { where, params } = pointWhere(filters);
+    // Only token/cost points carry a model; other kinds (lines/decision) have NULL model.
+    const scoped = where ? `${where} AND model IS NOT NULL` : "WHERE model IS NOT NULL";
+    const rows = this.db
+      .prepare(
+        `SELECT
+          model,
+          COUNT(DISTINCT session_row_id) AS sessions,
+          COUNT(DISTINCT ${identity}) AS users,
+          COALESCE(SUM(CASE WHEN kind = 'cost' THEN value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN value ELSE 0 END), 0) AS inputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN value ELSE 0 END), 0) AS outputTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type IN ('cache_creation', 'cache_read') THEN value ELSE 0 END), 0) AS cacheTokens,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' THEN value ELSE 0 END), 0) AS totalTokens,
+          MAX(timestamp) AS lastSeenAt
+        FROM metric_points ${scoped}
+        GROUP BY model
+        ORDER BY totalCost DESC, totalTokens DESC`
+      )
+      .all(...params) as ModelSummary[];
+    return rows;
+  }
+
+  async getFilterOptions(): Promise<FilterOptions> {
+    const sources = this.db.prepare("SELECT DISTINCT source FROM metric_points ORDER BY source").all() as Array<{ source: string }>;
+    const users = this.db
+      .prepare(
+        "SELECT DISTINCT COALESCE(user_email, user_account_id, user_id, 'unknown') AS user FROM metric_points ORDER BY user"
+      )
+      .all() as Array<{ user: string }>;
+    const models = this.db
+      .prepare("SELECT DISTINCT model FROM metric_points WHERE model IS NOT NULL ORDER BY model")
+      .all() as Array<{ model: string }>;
+    return { sources: sources.map((r) => r.source), users: users.map((r) => r.user), models: models.map((r) => r.model) };
+  }
+
+  close() {
+    this.db.close();
+  }
+
+  private migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS raw_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal TEXT NOT NULL,
+        hash TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL,
+        received_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS raw_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        signal TEXT NOT NULL,
+        raw_batch_id INTEGER,
+        event_json TEXT NOT NULL,
+        seen_at INTEGER NOT NULL,
+        FOREIGN KEY (raw_batch_id) REFERENCES raw_batches(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        user_id TEXT,
+        user_email TEXT,
+        user_account_id TEXT,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        UNIQUE(source, session_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS metric_points (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        signal TEXT NOT NULL,
+        session_row_id INTEGER NOT NULL,
+        session_id TEXT NOT NULL,
+        user_id TEXT,
+        user_email TEXT,
+        user_account_id TEXT,
+        model TEXT,
+        metric_name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        token_type TEXT,
+        value REAL NOT NULL,
+        unit TEXT,
+        timestamp INTEGER NOT NULL,
+        attributes_json TEXT,
+        raw_batch_id INTEGER,
+        raw_event_id INTEGER,
+        FOREIGN KEY (session_row_id) REFERENCES sessions(id),
+        FOREIGN KEY (raw_batch_id) REFERENCES raw_batches(id),
+        FOREIGN KEY (raw_event_id) REFERENCES raw_events(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_metric_points_timestamp ON metric_points(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_metric_points_session ON metric_points(session_row_id);
+      CREATE INDEX IF NOT EXISTS idx_metric_points_model ON metric_points(model);
+      CREATE INDEX IF NOT EXISTS idx_sessions_seen ON sessions(last_seen_at);
+    `);
+
+    // Repair token types ingested before camelCase cache types were normalized (cacheCreation/cacheRead).
+    // Idempotent: matches nothing once the data is clean.
+    this.db.exec(`
+      UPDATE metric_points SET token_type = 'cache_creation' WHERE token_type IN ('cachecreation', 'cache-creation');
+      UPDATE metric_points SET token_type = 'cache_read' WHERE token_type IN ('cacheread', 'cache-read');
+    `);
+
+    this.backfillActivityMetrics();
+  }
+
+  // Older batches only stored token/cost metric points and no metric raw_events. Replay the stored
+  // OTLP payloads once to backfill the activity metric_points (lines/decision/active_time) and the
+  // per-metric raw_events. Gated on PRAGMA user_version so it runs exactly once.
+  private backfillActivityMetrics() {
+    const { user_version: version } = this.db.prepare("PRAGMA user_version").get() as { user_version: number };
+    if (version >= 1) return;
+
+    const batches = this.db.prepare("SELECT id, payload_json FROM raw_batches WHERE signal = 'otlp_metrics' ORDER BY id ASC").all() as Array<{
+      id: number;
+      payload_json: string;
+    }>;
+    const insertRaw = this.db.prepare("INSERT INTO raw_events (source, signal, raw_batch_id, event_json, seen_at) VALUES (?, ?, ?, ?, ?)");
+    const now = Date.now();
+
+    this.db.exec("BEGIN");
+    try {
+      for (const batch of batches) {
+        const payload = JSON.parse(batch.payload_json);
+        for (const record of parseOtelMetricRecords(payload)) {
+          insertRaw.run(record.source, "otlp_metrics", batch.id, JSON.stringify(record), now);
+        }
+        // token/cost points already exist from the original ingest — only add the new kinds.
+        for (const point of parseOtelMetricPoints(payload)) {
+          if (point.kind === "tokens" || point.kind === "cost") continue;
+          this.insertMetricPoint(point, batch.id);
+        }
+      }
+      this.db.exec("PRAGMA user_version = 1");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private insertRawBatch(signal: string, hash: string, batch: unknown) {
+    try {
+      const result = this.db
+        .prepare("INSERT INTO raw_batches (signal, hash, payload_json, received_at) VALUES (?, ?, ?, ?)")
+        .run(signal, hash, JSON.stringify(batch), Date.now());
+      return Number(result.lastInsertRowid);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("UNIQUE")) return null;
+      throw error;
+    }
+  }
+
+  private insertMetricPoint(point: MetricPointInput, rawBatchId: number | null) {
+    const sessionRowId = this.upsertSession(point);
+    this.db
+      .prepare(
+        `INSERT INTO metric_points (
+          source, signal, session_row_id, session_id, user_id, user_email, user_account_id, model,
+          metric_name, kind, token_type, value, unit, timestamp, attributes_json, raw_batch_id, raw_event_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        point.source,
+        point.signal,
+        sessionRowId,
+        point.sessionId,
+        point.userId ?? null,
+        point.userEmail ?? null,
+        point.userAccountId ?? null,
+        point.model ?? null,
+        point.metricName,
+        point.kind,
+        point.tokenType ?? null,
+        point.value,
+        point.unit ?? null,
+        point.timestamp,
+        JSON.stringify(point.attributes ?? {}),
+        rawBatchId,
+        point.rawEventId ?? null
+      );
+  }
+
+  private upsertSession(point: MetricPointInput) {
+    this.db
+      .prepare(
+        `INSERT INTO sessions (source, session_id, user_id, user_email, user_account_id, first_seen_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source, session_id) DO UPDATE SET
+          user_id = COALESCE(excluded.user_id, sessions.user_id),
+          user_email = COALESCE(excluded.user_email, sessions.user_email),
+          user_account_id = COALESCE(excluded.user_account_id, sessions.user_account_id),
+          first_seen_at = MIN(sessions.first_seen_at, excluded.first_seen_at),
+          last_seen_at = MAX(sessions.last_seen_at, excluded.last_seen_at)`
+      )
+      .run(point.source, point.sessionId, point.userId ?? null, point.userEmail ?? null, point.userAccountId ?? null, point.timestamp, point.timestamp);
+
+    const row = this.db.prepare("SELECT id FROM sessions WHERE source = ? AND session_id = ?").get(point.source, point.sessionId) as { id: number };
+    return row.id;
+  }
+
+  private breakdown(field: string, where: string, params: SQLInputValue[], alias = field) {
+    // Breakdowns attribute cost/tokens, so restrict to those rows — otherwise lines/decision/
+    // active_time points (which carry no model) would add a spurious "unknown" group.
+    const scoped = where ? `${where} AND kind IN ('tokens', 'cost')` : "WHERE kind IN ('tokens', 'cost')";
+    const rows = this.db
+      .prepare(
+        `SELECT
+          ${field} AS ${alias},
+          COALESCE(SUM(CASE WHEN kind = 'cost' THEN value ELSE 0 END), 0) AS totalCost,
+          COALESCE(SUM(CASE WHEN kind = 'tokens' THEN value ELSE 0 END), 0) AS totalTokens,
+          COUNT(DISTINCT session_row_id) AS sessions
+        FROM metric_points ${scoped}
+        GROUP BY ${field}
+        ORDER BY totalCost DESC, totalTokens DESC
+        LIMIT 10`
+      )
+      .all(...params) as Array<Record<string, string | number | null>>;
+
+    return rows.map((row) => ({
+      [alias]: String(row[alias] ?? "unknown"),
+      totalCost: Number(row.totalCost),
+      totalTokens: Number(row.totalTokens),
+      sessions: Number(row.sessions)
+    })) as never;
+  }
+}
+
+let warnedCumulative = false;
+
+// Our token/cost aggregation sums data points, which is only correct for DELTA temporality
+// (Claude Code's default). Warn once if a backend ever sends CUMULATIVE, which would overcount.
+function warnIfCumulative(records: OtelMetricRecord[]) {
+  if (warnedCumulative) return;
+  const cumulative = records.some(
+    (record) => record.temporality === 2 && (record.metricName === "claude_code.token.usage" || record.metricName === "claude_code.cost.usage")
+  );
+  if (cumulative) {
+    warnedCumulative = true;
+    console.warn(
+      "[finius] OTLP metrics arrived with CUMULATIVE temporality; token/cost totals assume DELTA and will overcount. Set OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta."
+    );
+  }
+}
+
+function pointWhere(filters: SummaryFilters) {
+  const clauses: string[] = [];
+  const params: SQLInputValue[] = [];
+  if (filters.from) {
+    clauses.push("timestamp >= ?");
+    params.push(filters.from);
+  }
+  if (filters.to) {
+    clauses.push("timestamp <= ?");
+    params.push(filters.to);
+  }
+  if (filters.user) {
+    clauses.push("COALESCE(user_email, user_account_id, user_id, 'unknown') = ?");
+    params.push(filters.user);
+  }
+  if (filters.model) {
+    clauses.push("model = ?");
+    params.push(filters.model);
+  }
+  if (filters.source) {
+    clauses.push("source = ?");
+    params.push(filters.source);
+  }
+  if (filters.session) {
+    clauses.push("session_row_id = ?");
+    params.push(filters.session);
+  }
+  return { where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", params };
+}
+
+function sessionWhere(filters: SummaryFilters) {
+  const clauses: string[] = [];
+  const params: SQLInputValue[] = [];
+  if (filters.from) {
+    clauses.push("s.last_seen_at >= ?");
+    params.push(filters.from);
+  }
+  if (filters.to) {
+    clauses.push("s.first_seen_at <= ?");
+    params.push(filters.to);
+  }
+  if (filters.user) {
+    clauses.push("COALESCE(s.user_email, s.user_account_id, s.user_id, 'unknown') = ?");
+    params.push(filters.user);
+  }
+  if (filters.model) {
+    clauses.push("p.model = ?");
+    params.push(filters.model);
+  }
+  if (filters.source) {
+    clauses.push("s.source = ?");
+    params.push(filters.source);
+  }
+  if (filters.session) {
+    clauses.push("s.id = ?");
+    params.push(filters.session);
+  }
+  return { where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "", params };
+}
+
+export { preferredIdentity };
