@@ -29,7 +29,9 @@ server. See that script for the canonical env-var set, or the README for the man
 - `src/server/index.ts` — entry point. Wires `SqliteStorageAdapter` + `EventBus` into the app,
   serves the built client from `dist/client` when present, binds to `127.0.0.1:8787`.
 - `src/server/app.ts` — Hono routes: `/otlp/v1/{metrics,logs}` ingest, `/api/metrics/{summary,timeseries}`,
-  `/api/sessions[/:id]`, `/api/import/{jsonl,claude-hook}`, and the `/events` SSE stream.
+  `/api/sessions[/:id]`, `/api/people`, `/api/models`, `/api/meta` (filter options), `/api/import/{jsonl,claude-hook}`,
+  and the `/events` SSE stream. All list/metric routes accept the same filters (`from`, `to`, `source`,
+  `user`, `model`, `session`) parsed by `readFilters`.
 - `src/server/storage/sqlite.ts` — the `StorageAdapter` implementation. Owns the schema (`migrate()`),
   batch-level idempotency (`raw_batches.hash` UNIQUE), session upsert, and all aggregation SQL.
 - `src/server/otel.ts` — pure parsers: OTLP protobuf-JSON → `MetricPointInput[]`, attribute decoding,
@@ -38,6 +40,9 @@ server. See that script for the canonical env-var set, or the README for the man
 - `src/server/events.ts` — in-process pub/sub `EventBus` backing the SSE stream.
 - `src/server/types.ts` — shared types and the `StorageAdapter` interface.
 - `src/client/` — React app. `api.ts` is the typed fetch layer; `ui/App.tsx` is the whole dashboard.
+  View + filter state lives in the URL query string (`useUrlState`); Home/Sessions/People/Models tabs
+  share one filter set, and clicking a session/person/model row (or a Home breakdown row) drills into
+  the Home view by setting the matching filter — the drill-down page is just `HomeView` re-filtered.
 
 Data lives in `data/finius.sqlite` (override with `FINIUS_DB_PATH`).
 
