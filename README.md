@@ -10,6 +10,8 @@ A [Hono](https://hono.dev) server ingests OTLP HTTP/JSON metrics & logs (and JSO
 SQLite; a React + Vite dashboard renders cost, token, session, person, and model breakdowns with live
 SSE updates. Everything runs on your machine — no data leaves your laptop.
 
+<img src="public/finius-dashboard.png" alt="Finius dashboard showing local usage and cost analytics" width="900" />
+
 </div>
 
 ## Quick start (local)
