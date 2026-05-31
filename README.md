@@ -20,6 +20,7 @@ built-in `node:sqlite` module; developed on Node 24).
 ```bash
 npx finius          # first run: installs finius globally, then walks you through setup
 finius serve        # start the server + dashboard at http://localhost:8787
+finius import all   # optional: import old Claude Code + Codex sessions
 ```
 
 Then launch Claude Code in a new terminal and start coding — the dashboard at
@@ -33,7 +34,9 @@ That's it. Three things just happened:
    transcript.
 2. **`finius serve`** started a single process exposing the API **and** the dashboard on one port.
    Its data lives under `~/.finius` (override with `FINIUS_DB_PATH` / `FINIUS_BLOB_DIR`).
-3. Any Claude Code session you run now reports usage to that local server.
+3. Any Claude Code session you run now reports usage to that local server. If you ran
+   `finius import all`, Finius also backfilled historical Claude Code and Codex transcripts already on
+   disk. Use `finius import claude` or `finius import codex` to import only one agent.
 
 Re-run `finius setup` any time to reconfigure, or `finius doctor` to diagnose telemetry that isn't
 arriving.
