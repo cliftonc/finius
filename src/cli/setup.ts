@@ -14,27 +14,33 @@ import { applyCodexConfig, CODEX_CONFIG_PATH, CODEX_SOURCE, findCodexRollouts, i
 import { type FiniusConfig, CONFIG_PATH, DEFAULT_SERVER_URL, loadConfig, normalizeUrl, resolveAuthToken, saveConfig } from "./config.js";
 import { readClaudeAccount, readCodexAccount, readGithub, readGitIdentity } from "./identity.js";
 import { installGlobally, isFiniusOnPath } from "./install.js";
-import { generatePassword } from "./password.js";
+import { generateAuthToken, generatePassword } from "./password.js";
 import { ask, banner, pc } from "./ui.js";
 
 const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
 
-export async function runSetup(): Promise<number> {
+export async function runSetup(args: string[] = []): Promise<number> {
   banner("setup");
   intro(pc.bgCyan(pc.black(" Configure Finius ")));
 
   const current = loadConfig();
   const defaultUrl = current?.serverUrl ?? DEFAULT_SERVER_URL;
-  const serverUrl = normalizeUrl(
-    ask(
-      await text({
-        message: "Finius server URL",
-        placeholder: defaultUrl,
-        defaultValue: defaultUrl,
-        validate: (value) => (value && !normalizeUrl(value) ? "Enter a valid URL" : undefined)
-      })
-    )
-  ) || defaultUrl;
+
+  // A server URL can be passed directly (e.g. `finius setup http://localhost:8787`, the form the
+  // dashboard's setup modal hands you) — when valid we skip the prompt and use it.
+  const argUrl = args.map((a) => normalizeUrl(a)).find((a): a is string => Boolean(a));
+  const serverUrl = argUrl
+    ? (log.info(`Using server URL ${pc.cyan(argUrl)}`), argUrl)
+    : normalizeUrl(
+        ask(
+          await text({
+            message: "Finius server URL",
+            placeholder: defaultUrl,
+            defaultValue: defaultUrl,
+            validate: (value) => (value && !normalizeUrl(value) ? "Enter a valid URL" : undefined)
+          })
+        )
+      ) || defaultUrl;
 
   const health = await checkServer(serverUrl);
 
@@ -76,8 +82,8 @@ export async function runSetup(): Promise<number> {
   const haveClaude = isClaudeInstalled();
   const haveCodex = isCodexInstalled();
 
-  if (haveClaude) await configureClaude(serverUrl, credential, onPath);
-  if (haveCodex) await configureCodex(serverUrl, credential, onPath);
+  if (haveClaude) await configureClaude(serverUrl, credential, onPath, health.reachable);
+  if (haveCodex) await configureCodex(serverUrl, credential, onPath, health.reachable);
   if (!haveClaude && !haveCodex) {
     log.warn(
       "No Claude Code or Codex install detected — skipping agent configuration.\n" +
@@ -113,14 +119,22 @@ type AuthState = { authPassword?: string; authToken?: string };
 // Resolve this machine's auth credential. Two paths:
 //  • Joining an existing Secure Mode server → prompt for the password and exchange it for a per-client
 //    session token (persisted as authToken).
-//  • An open/new server → offer to enable Secure Mode by generating a master password (persisted as
-//    authPassword), which takes effect when this machine runs `finius serve`.
+//  • An open/new server → offer to enable Secure Mode by generating a master password plus an owner
+//    token. The password starts the server; the token is seeded into the DB and used by clients.
 // Existing credentials are kept on re-run (doctor verifies them).
 async function configureAuth(serverUrl: string, health: ServerHealth, current: AuthState): Promise<AuthState> {
   if (health.secure) {
-    if (current.authToken || current.authPassword) {
-      log.info("Server requires authentication — keeping the credential already in your config.");
+    if (current.authToken) {
+      log.info("Server requires authentication — keeping the client token already in your config.");
       return current;
+    }
+    if (current.authPassword) {
+      const token = await login(serverUrl, current.authPassword);
+      if (token) {
+        log.success("Authenticated with the saved password — saved a client token for this machine.");
+        return { ...current, authToken: token };
+      }
+      log.warn("Saved password was rejected by the server login endpoint.");
     }
     log.warn("This Finius server requires authentication.");
     for (;;) {
@@ -142,8 +156,12 @@ async function configureAuth(serverUrl: string, health: ServerHealth, current: A
   }
 
   if (current.authPassword) {
-    log.info("Auth is enabled (this machine owns the password). Keeping it.");
-    return current;
+    if (current.authToken) {
+      log.info("Auth is enabled (this machine owns the password). Keeping it.");
+      return current;
+    }
+    log.info("Auth is enabled (this machine owns the password). Creating an owner token.");
+    return { ...current, authToken: generateAuthToken() };
   }
 
   const wantAuth = ask(
@@ -156,11 +174,12 @@ async function configureAuth(serverUrl: string, health: ServerHealth, current: A
   if (!wantAuth) return {};
 
   const pw = generatePassword();
+  const token = generateAuthToken();
   note(
     `${pc.bold(pc.cyan(pw))}\n\n${pc.dim("Save it now — other machines need it to connect, and\nyou'll use it to log in to the dashboard.")}`,
     "Secure Mode enabled — your Finius password"
   );
-  return { authPassword: pw };
+  return { authPassword: pw, authToken: token };
 }
 
 // Detect a user identity from the local agent state and confirm it with the user, so the hook/backfill
@@ -269,7 +288,7 @@ function isClaudeInstalled(): boolean {
 }
 
 // Configure Claude Code: OTEL env vars + the transcript-upload hook, both opt-in.
-async function configureClaude(serverUrl: string, credential: string | undefined, onPath: boolean): Promise<void> {
+async function configureClaude(serverUrl: string, credential: string | undefined, onPath: boolean, canImport: boolean): Promise<void> {
   log.step(pc.bold("Claude Code") + pc.dim(` — edits ${CLAUDE_SETTINGS_PATH}`));
   const wantEnv = ask(await confirm({ message: "Add OpenTelemetry env vars (so Claude Code reports usage)?" }));
   const wantHook = ask(await confirm({ message: "Install the SessionEnd/PreCompact hook (so transcripts upload)?" }));
@@ -287,15 +306,16 @@ async function configureClaude(serverUrl: string, credential: string | undefined
     log.info("Skipped Claude Code configuration.");
   }
 
-  // The hook only catches future sessions; offer to import what's already on disk (one at a time).
-  if (ask(await confirm({ message: "Import your existing Claude sessions now?" }))) {
+  // The hook only catches future sessions; offer to import what's already on disk (one at a time),
+  // but only when the server is reachable. Otherwise the uploads would fail immediately.
+  if (canImport && ask(await confirm({ message: "Import your existing Claude sessions now?" }))) {
     await backfill(findClaudeTranscripts(), { source: "claude-code-jsonl", format: "claude", label: "Claude sessions" });
   }
 }
 
 // Configure Codex: the Stop hook (uploads rollouts), optional OTEL log capture, and a one-time
 // backfill of existing sessions. Codex config is TOML; we own a clearly-delimited managed block.
-async function configureCodex(serverUrl: string, credential: string | undefined, onPath: boolean): Promise<void> {
+async function configureCodex(serverUrl: string, credential: string | undefined, onPath: boolean, canImport: boolean): Promise<void> {
   log.step(pc.bold("Codex") + pc.dim(` — edits ${CODEX_CONFIG_PATH}`));
   const wantHook = ask(await confirm({ message: "Install the Stop hook (upload Codex rollouts to Finius)?" }));
   const wantOtel = ask(await confirm({ message: "Enable OpenTelemetry log capture (event inspection only)?", initialValue: false }));
@@ -321,8 +341,9 @@ async function configureCodex(serverUrl: string, credential: string | undefined,
     log.info("Skipped Codex configuration.");
   }
 
-  // The hook only catches future sessions; offer to import what's already on disk (one at a time).
-  if (ask(await confirm({ message: "Import your existing Codex sessions now?" }))) {
+  // The hook only catches future sessions; offer to import what's already on disk (one at a time),
+  // but only when the server is reachable. Otherwise the uploads would fail immediately.
+  if (canImport && ask(await confirm({ message: "Import your existing Codex sessions now?" }))) {
     await backfill(findCodexRollouts(), { source: CODEX_SOURCE, format: "codex", label: "Codex sessions" });
   }
 }

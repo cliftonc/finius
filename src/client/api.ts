@@ -31,6 +31,21 @@ export type Filters = {
   session?: number;
 };
 
+const AUTH_STORAGE_KEY = "finius_auth_token";
+
+export function getAuthToken(): string {
+  return window.localStorage.getItem(AUTH_STORAGE_KEY) ?? "";
+}
+
+export function clearAuthToken() {
+  window.localStorage.removeItem(AUTH_STORAGE_KEY);
+}
+
+function authHeaders(): HeadersInit | undefined {
+  const token = getAuthToken();
+  return token ? { authorization: `Bearer ${token}` } : undefined;
+}
+
 function withFilters(path: string, filters: Filters = {}, extra: Record<string, string> = {}) {
   const params = new URLSearchParams(extra);
   if (filters.from !== undefined) params.set("from", String(filters.from));
@@ -72,9 +87,12 @@ export async function getSession(id: number) {
 }
 
 export async function getTranscriptInfo(id: number): Promise<TranscriptInfo | null> {
-  const response = await fetch(transcriptUrl(id, "info"), { credentials: "include" });
+  const response = await fetch(transcriptUrl(id, "info"), { headers: authHeaders() });
   if (response.status === 404) return null;
-  if (response.status === 401) throw new AuthError();
+  if (response.status === 401) {
+    clearAuthToken();
+    throw new AuthError();
+  }
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<TranscriptInfo>;
 }
@@ -84,9 +102,12 @@ export function transcriptUrl(id: number, kind?: "info") {
 }
 
 export async function getTranscript(id: number): Promise<string | null> {
-  const response = await fetch(transcriptUrl(id), { credentials: "include" });
+  const response = await fetch(transcriptUrl(id), { headers: authHeaders() });
   if (response.status === 404) return null;
-  if (response.status === 401) throw new AuthError();
+  if (response.status === 401) {
+    clearAuthToken();
+    throw new AuthError();
+  }
   if (!response.ok) throw new Error(await response.text());
   return response.text();
 }
@@ -106,25 +127,31 @@ export class AuthError extends Error {
 export type Health = { ok: boolean; now: number; secure: boolean };
 
 export async function getHealth(): Promise<Health> {
-  const response = await fetch("/api/health", { credentials: "include" });
+  const response = await fetch("/api/health");
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<Health>;
 }
 
-// Exchange the server password for a session cookie. Returns true on success, false on a bad password.
+// Exchange the server password for a session token. Returns true on success, false on a bad password.
 export async function login(password: string): Promise<boolean> {
   const response = await fetch("/api/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    credentials: "include",
     body: JSON.stringify({ password, label: "browser" })
   });
+  if (response.ok) {
+    const body = (await response.json()) as { token?: string };
+    if (body.token) window.localStorage.setItem(AUTH_STORAGE_KEY, body.token);
+  }
   return response.ok;
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { credentials: "include" });
-  if (response.status === 401) throw new AuthError();
+  const response = await fetch(url, { headers: authHeaders() });
+  if (response.status === 401) {
+    clearAuthToken();
+    throw new AuthError();
+  }
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<T>;
 }

@@ -52,10 +52,10 @@ export function loadConfig(): FiniusConfig | null {
   }
 }
 
-// This machine's credential for Secure Mode: a minted session token if it joined an existing server,
-// else the master password (which the server accepts directly). Undefined when auth isn't configured.
+// This machine's credential for Secure Mode. Only minted session tokens are valid on protected
+// endpoints; the master password is accepted solely by /api/auth/login.
 export function resolveAuthToken(config: FiniusConfig | null): string | undefined {
-  return config?.authToken ?? config?.authPassword ?? undefined;
+  return config?.authToken ?? undefined;
 }
 
 export function saveConfig(config: FiniusConfig): void {

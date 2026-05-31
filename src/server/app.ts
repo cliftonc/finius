@@ -3,17 +3,10 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { Hono, type Context } from "hono";
-import { getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "./events.js";
 import type { Granularity, MetricPointInput, StorageAdapter, SummaryFilters, TranscriptFormat } from "./types.js";
-
-// Cookie holding a client's minted session token. The browser presents this on every request and on
-// the EventSource /events stream (which can't set headers but does send cookies).
-const AUTH_COOKIE = "finius_auth";
-// Session-token cookie lifetime. Long-lived; revocation is via the DB, not expiry.
-const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 
 const GRANULARITIES: Granularity[] = ["minute", "five_minute", "quarter_hour", "hour", "day", "week"];
 
@@ -41,13 +34,11 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
 
   app.use("*", cors());
 
-  // Single pluggable auth gate. In open mode it's a no-op; in Secure Mode it admits a request that
-  // carries a valid credential (the master password, or a minted+non-revoked session token) via the
-  // Authorization: Bearer header or the finius_auth cookie. New login methods (e.g. GitHub) would
-  // extend isValidCredential rather than touch any route.
+  // Single pluggable auth gate. In open mode it's a no-op; in Secure Mode it admits only
+  // minted+non-revoked session tokens. The master password is a bootstrap secret for /api/auth/login
+  // and is never accepted as a runtime API credential.
   const isValidCredential = (cred: string): boolean => {
     if (!cred) return false;
-    if (timingSafeEqualStr(cred, authSecret ?? "")) return true;
     const row = storage.findAuthToken(sha256(cred));
     return !!row && row.revoked === 0;
   };
@@ -55,7 +46,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
   app.use("*", async (c, next) => {
     if (!secure) return next();
     if (!isProtectedPath(c.req.path)) return next();
-    const cred = bearerToken(c.req.header("authorization")) || getCookie(c, AUTH_COOKIE) || "";
+    const cred = bearerToken(c.req.header("authorization")) || eventSourceToken(c) || "";
     if (isValidCredential(cred)) return next();
     return c.json({ error: "unauthorized" }, 401);
   });
@@ -64,9 +55,9 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
   // whether to show the login screen.
   app.get("/api/health", (c) => c.json({ ok: true, now: Date.now(), secure }));
 
-  // Exchange the master password for a client session token. Public (it's the bootstrap), constant-time.
-  // The minted token is stored hashed in auth_tokens and set as the finius_auth cookie for browsers;
-  // the CLI also reads it from the JSON body to persist in its config.
+  // Exchange the master password for a client session token. Public (it's the bootstrap),
+  // constant-time. The minted token is stored hashed in auth_tokens; browsers persist the returned
+  // token in localStorage and send it as Authorization: Bearer on API requests.
   app.post("/api/auth/login", async (c) => {
     if (!secure) return c.json({ error: "auth is not enabled on this server" }, 400);
     const body = (await c.req.json().catch(() => ({}))) as { password?: string; label?: string };
@@ -76,12 +67,6 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
     const token = randomBytes(32).toString("hex");
     const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 200) : "client";
     storage.createAuthToken(sha256(token), label, Date.now());
-    setCookie(c, AUTH_COOKIE, token, {
-      httpOnly: true,
-      sameSite: "Lax",
-      path: "/",
-      maxAge: AUTH_COOKIE_MAX_AGE
-    });
     return c.json({ token });
   });
 
@@ -303,6 +288,10 @@ function readGranularity(value?: string): Granularity {
 function bearerToken(header?: string) {
   const match = /^Bearer\s+(.+)$/i.exec(header ?? "");
   return match ? match[1].trim() : "";
+}
+
+function eventSourceToken(c: Context) {
+  return c.req.path === "/events" ? (c.req.query("token") ?? "") : "";
 }
 
 // Reads an OTLP request body as text (so a debug dump can capture the exact bytes the agent sent —

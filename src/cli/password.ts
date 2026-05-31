@@ -1,4 +1,4 @@
-import { randomInt } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 import { adjectives, animals, colors } from "unique-names-generator";
 
 // Generate a memorable word-password like `blue-happy-otter` for Secure Mode. We draw the words from
@@ -9,4 +9,8 @@ import { adjectives, animals, colors } from "unique-names-generator";
 export function generatePassword(): string {
   const pick = (list: string[]) => list[randomInt(list.length)];
   return [pick(colors), pick(adjectives), pick(animals)].join("-").toLowerCase();
+}
+
+export function generateAuthToken(): string {
+  return randomBytes(32).toString("hex");
 }

@@ -22,9 +22,9 @@ import {
 } from "@heroui/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ChartGPUOptions } from "chartgpu";
-import { Activity, ArrowUpRight, Check, CircleDollarSign, Database, FileText, GitCommit, GitPullRequest, Layers, Minus, Moon, Plus, Radio, RefreshCcw, Settings, Sun, Users, X } from "lucide-react";
+import { Activity, ArrowUpRight, Check, CircleDollarSign, Database, FileText, GitCommit, GitPullRequest, Layers, LogOut, Minus, Moon, Plus, Radio, RefreshCcw, Settings, Sun, Users, X } from "lucide-react";
 import { lazy, Suspense, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
-import { AuthError, getHealth, getMeta, getModels, getModelTimeseries, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo } from "../api";
+import { AuthError, clearAuthToken, getAuthToken, getHealth, getMeta, getModels, getModelTimeseries, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo } from "../api";
 import type { Filters, Granularity, ModelSummary, ModelTimeseriesPoint, PersonSummary, SessionSummary, Summary, TimeseriesPoint } from "../api";
 import { formatCurrency, formatCurrencyCompact, formatExact, formatNumber, formatRelativeTime } from "../format";
 import { UserAvatar, UserCell, userLabel } from "./UserCell";
@@ -135,6 +135,8 @@ export function App() {
   const [state, update] = useUrlState();
   const { tab, range, source, user, model, session, transcript } = state;
   const [clock, setClock] = useState(0);
+  const [authNonce, setAuthNonce] = useState(0);
+  const authToken = useMemo(() => getAuthToken(), [authNonce]);
 
   const meta = useQuery({ queryKey: ["meta"], queryFn: getMeta });
   const health = useQuery({ queryKey: ["health"], queryFn: getHealth, retry: false });
@@ -160,7 +162,8 @@ export function App() {
   );
 
   useEffect(() => {
-    const eventUrl = window.location.port === "5173" ? "http://127.0.0.1:8787/events" : "/events";
+    const baseUrl = window.location.port === "5173" ? "http://127.0.0.1:8787/events" : "/events";
+    const eventUrl = authToken ? `${baseUrl}?token=${encodeURIComponent(authToken)}` : baseUrl;
     const stream = new EventSource(eventUrl);
     stream.onopen = () => setLive(true);
     stream.addEventListener("ready", () => setLive(true));
@@ -169,12 +172,23 @@ export function App() {
     });
     stream.onerror = () => setLive(false);
     return () => stream.close();
+  }, [queryClient, authToken]);
+
+  const logout = useCallback(() => {
+    clearAuthToken();
+    setAuthNonce((value) => value + 1);
+    void queryClient.invalidateQueries();
+  }, [queryClient]);
+
+  const loginSuccess = useCallback(() => {
+    setAuthNonce((value) => value + 1);
+    void queryClient.invalidateQueries();
   }, [queryClient]);
 
   // Secure Mode: any 401 surfaces as an AuthError on the always-running `meta` query. Show the login
-  // screen until a successful login sets the finius_auth cookie, then refetch everything.
+  // screen until a successful login stores a bearer token, then refetch everything.
   if (meta.error instanceof AuthError) {
-    return <LoginScreen onSuccess={() => void queryClient.invalidateQueries()} />;
+    return <LoginScreen onSuccess={loginSuccess} />;
   }
 
   if (transcript) {
@@ -203,6 +217,11 @@ export function App() {
           </Tabs>
         </div>
         <div className="flex items-center gap-3">
+          {health.data?.secure ? (
+            <Button isIconOnly radius="full" variant="bordered" aria-label="Log out" onPress={logout}>
+              <LogOut size={18} />
+            </Button>
+          ) : null}
           <ThemeToggle />
           <Button isIconOnly radius="full" variant="bordered" aria-label="Telemetry setup" onPress={setup.onOpen}>
             <Settings size={18} />
@@ -284,14 +303,38 @@ export function App() {
         <ModalContent>
           <ModalHeader className="flex flex-col gap-1">
             Send Claude Code telemetry here
-            <span className="text-sm font-normal text-default-500">Run this in the shell where you launch Claude Code, then start a session.</span>
+            <span className="text-sm font-normal text-default-500">Point Claude Code at this server, then start a session — the dashboard updates live.</span>
           </ModalHeader>
           <ModalBody className="pb-6">
-            <Snippet hideSymbol variant="bordered" className="w-full" classNames={{ pre: "whitespace-pre-wrap" }}>
-              {setupScript(health.data?.secure ?? false).map((line, index) => (
-                <span key={index}>{line}</span>
-              ))}
-            </Snippet>
+            <Tabs aria-label="Setup method" variant="underlined">
+              <Tab key="cli" title="Quick setup">
+                <div className="flex flex-col gap-3">
+                  <p className="text-sm text-default-600">
+                    Run this once. It saves this server&apos;s URL, exports the OTLP env vars, and installs the
+                    upload hook{health.data?.secure ? ", including the auth token for Secure Mode" : ""}.
+                  </p>
+                  <Snippet hideSymbol variant="bordered" className="w-full" classNames={{ pre: "whitespace-pre-wrap" }}>
+                    {`npx finius setup ${window.location.origin}`}
+                  </Snippet>
+                  <p className="text-sm text-default-500">
+                    Then launch Claude Code as you normally would. Re-run any time to reconfigure, or
+                    <code className="px-1">finius doctor</code> if telemetry isn&apos;t arriving.
+                  </p>
+                </div>
+              </Tab>
+              <Tab key="manual" title="Manual" isDisabled={health.data?.secure ?? false}>
+                <div className="flex flex-col gap-3">
+                  <p className="text-sm text-default-600">
+                    Prefer not to install anything? Export these in the shell where you launch Claude Code, then run <code className="px-1">claude</code>.
+                  </p>
+                  <Snippet hideSymbol variant="bordered" className="w-full" classNames={{ pre: "whitespace-pre-wrap" }}>
+                    {manualScript().map((line, index) => (
+                      <span key={index}>{line}</span>
+                    ))}
+                  </Snippet>
+                </div>
+              </Tab>
+            </Tabs>
           </ModalBody>
         </ModalContent>
       </Modal>
@@ -925,13 +968,9 @@ function pickKey(keys: "all" | Set<React.Key>): string {
   return value && value !== ALL ? value : "";
 }
 
-function setupScript(secure: boolean): string[] {
+function manualScript(): string[] {
   const origin = window.location.origin;
   return [
-    "# Recommended: let the CLI configure server URL, auth, and shell hooks.",
-    "finius setup",
-    "",
-    "# Manual open-mode launch for Claude Code telemetry:",
     "export CLAUDE_CODE_ENABLE_TELEMETRY=1",
     "export OTEL_METRICS_EXPORTER=otlp",
     "export OTEL_LOGS_EXPORTER=otlp",
@@ -941,7 +980,6 @@ function setupScript(secure: boolean): string[] {
     `export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=${origin}/otlp/v1/logs`,
     "export OTEL_METRIC_EXPORT_INTERVAL=5000",
     "export OTEL_LOGS_EXPORT_INTERVAL=2000",
-    ...(secure ? ["", "# Secure Mode requires CLI-managed setup so telemetry gets an auth token."] : []),
     "claude"
   ];
 }

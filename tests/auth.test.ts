@@ -73,7 +73,7 @@ describe("auth — secure mode", () => {
     expect(res.status).toBe(401);
   });
 
-  it("rejects a wrong password and mints a token + cookie for the right one", async () => {
+  it("rejects a wrong password and mints a token for the right one", async () => {
     const app = makeApp(PASSWORD);
 
     const bad = await app.request("/api/auth/login", {
@@ -91,7 +91,7 @@ describe("auth — secure mode", () => {
     expect(good.status).toBe(200);
     const body = await good.json();
     expect(typeof body.token).toBe("string");
-    expect(good.headers.get("set-cookie")).toContain("finius_auth=");
+    expect(good.headers.get("set-cookie")).toBeNull();
 
     // The minted token is recorded (hashed) for the admin GUI to list/revoke.
     const tokens = storage!.listAuthTokens();
@@ -99,15 +99,15 @@ describe("auth — secure mode", () => {
     expect(tokens[0].label).toBe("test-host");
   });
 
-  it("authenticates via the master password, a Bearer token, and the cookie", async () => {
+  it("only accepts minted tokens on protected endpoints", async () => {
     const app = makeApp(PASSWORD);
 
-    // Master password presented directly as a Bearer credential.
+    // The master password is only accepted by /api/auth/login, never as a runtime API credential.
     expect(
       (await app.request("/api/meta", { headers: { authorization: `Bearer ${PASSWORD}` } })).status
-    ).toBe(200);
+    ).toBe(401);
 
-    // Mint a session token, then use it both as a Bearer header and as the cookie.
+    // Mint a session token, then use it as a Bearer header.
     const token = (
       await (
         await app.request("/api/auth/login", {
@@ -119,7 +119,7 @@ describe("auth — secure mode", () => {
     ).token as string;
 
     expect((await app.request("/api/meta", { headers: { authorization: `Bearer ${token}` } })).status).toBe(200);
-    expect((await app.request("/api/meta", { headers: { cookie: `finius_auth=${token}` } })).status).toBe(200);
+    expect((await app.request("/api/meta", { headers: { cookie: `finius_auth=${token}` } })).status).toBe(401);
   });
 
   it("401s a revoked token", async () => {

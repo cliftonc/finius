@@ -1,7 +1,8 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { FINIUS_HOME, loadConfig } from "./config.js";
+import { FINIUS_HOME, loadConfig, saveConfig } from "./config.js";
 import { startServer } from "../server/index.js";
+import { generateAuthToken } from "./password.js";
 
 // `finius serve [--port N]` — start the single-process server (API + built dashboard). Data is kept
 // under ~/.finius by default so an `npx`/globally-installed CLI has a stable home, independent of cwd.
@@ -26,13 +27,20 @@ export async function runServe(argv: string[]): Promise<number> {
 
   // Secure Mode: if `finius setup` saved a master password on this (owner) machine, run the server
   // locked. An explicit env var still wins (handy for one-off overrides).
-  const authSecret = process.env.FINIUS_AUTH_PASSWORD ?? loadConfig()?.authPassword;
+  const config = loadConfig();
+  const authSecret = process.env.FINIUS_AUTH_PASSWORD ?? config?.authPassword;
+  let initialAuthToken = config?.authToken;
+  if (authSecret && config?.authPassword && !initialAuthToken) {
+    initialAuthToken = generateAuthToken();
+    saveConfig({ ...config, authToken: initialAuthToken });
+  }
 
   startServer({
     port,
     dbPath: process.env.FINIUS_DB_PATH ?? join(dataDir, "finius.sqlite"),
     blobDir: process.env.FINIUS_BLOB_DIR ?? join(FINIUS_HOME, "transcripts"),
-    authSecret
+    authSecret,
+    initialAuthToken
   });
 
   // The server runs until the process is signalled. Never resolve, so the CLI entrypoint doesn't

@@ -3,13 +3,15 @@ import { runCodexHook } from "./codex.js";
 import { CONFIG_PATH, configExists, loadConfig } from "./config.js";
 import { runDoctor } from "./doctor.js";
 import { runHook } from "./hook.js";
+import { runImport } from "./import.js";
 import { runServe } from "./serve.js";
 import { runSetup } from "./setup.js";
 import { banner, pc } from "./ui.js";
 
 const COMMANDS: Array<[string, string]> = [
   ["finius", "Run setup if not configured, otherwise show status & help"],
-  ["finius setup", "Configure server URL + Claude Code telemetry env & hook"],
+  ["finius setup [url]", "Configure server URL + Claude Code telemetry env & hook"],
+  ["finius import [claude|codex|all]", "Import historical Claude/Codex sessions only"],
   ["finius serve [--port N]", "Start the Finius server (API + dashboard)"],
   ["finius doctor", "Diagnose telemetry/hook/server config and connectivity"],
   ["finius hook", "Internal: upload the current session transcript (run by Claude Code hooks)"],
@@ -41,11 +43,13 @@ async function main(): Promise<number> {
       process.stdout.write(helpText());
       return 0;
     case "setup":
-      return runSetup();
+      return runSetup(rest);
     case "serve":
       return runServe(rest);
     case "doctor":
       return runDoctor();
+    case "import":
+      return runImport(rest);
     case "hook":
       return runHook();
     case "codex-hook":

@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,7 @@ export type StartServerOptions = {
   rawRetentionDays?: number;
   cronToken?: string;
   authSecret?: string;
+  initialAuthToken?: string;
 };
 
 export type RunningServer = {
@@ -45,8 +47,10 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   const blob = blobDir ? new LocalBlobStore(resolve(blobDir)) : undefined;
   const cronToken = options.cronToken ?? process.env.FINIUS_CRON_TOKEN;
   const authSecret = options.authSecret ?? process.env.FINIUS_AUTH_PASSWORD;
+  const initialAuthToken = options.initialAuthToken;
 
   const storage = new SqliteStorageAdapter(resolve(dbPath), { storeRawPayloads, blob });
+  if (authSecret && initialAuthToken) seedInitialAuthToken(storage, initialAuthToken);
   const events = new EventBus();
   const app = createApp({ storage, events, cronToken, rawRetentionDays, authSecret });
 
@@ -130,6 +134,12 @@ async function syncPricing(storage: SqliteStorageAdapter) {
       /* ignore */
     }
   }
+}
+
+function seedInitialAuthToken(storage: SqliteStorageAdapter, token: string) {
+  const tokenHash = createHash("sha256").update(token).digest("hex");
+  if (storage.findAuthToken(tokenHash)) return;
+  storage.createAuthToken(tokenHash, "owner", Date.now());
 }
 
 // Auto-start when executed directly (`node dist/server/index.js`), but not when this module is
