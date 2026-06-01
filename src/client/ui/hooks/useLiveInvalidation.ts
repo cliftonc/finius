@@ -12,8 +12,10 @@ export function useLiveInvalidation(queryClient: QueryClient, authToken: string)
   const [live, setLive] = useState(false);
 
   useEffect(() => {
-    const baseUrl = window.location.port === "5173" ? "http://127.0.0.1:8787/events" : "/events";
-    const eventUrl = authToken ? baseUrl + "?token=" + encodeURIComponent(authToken) : baseUrl;
+    // Always same-origin: in dev this rides the Vite proxy (`/events` → :8787), so the browser sends
+    // the finius_auth cookie (GitHub login). Password logins have no cookie, so pass the bearer token
+    // as a query param — EventSource can't set an Authorization header.
+    const eventUrl = authToken ? "/events?token=" + encodeURIComponent(authToken) : "/events";
     const stream = new EventSource(eventUrl);
     stream.onopen = () => setLive(true);
     stream.addEventListener("ready", () => setLive(true));

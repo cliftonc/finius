@@ -12,6 +12,7 @@ import { SerialQueue } from "../queue.js";
 import { EFFECTIVE_ROLLUP, GRANULARITY_MS, OTEL_SOURCE, canUseRollup, jsonlWins, pointWhere, rollupWhere } from "./query-helpers.js";
 import type {
   AuthTokenRecord,
+  AuthUser,
   FilterOptions,
   Granularity,
   ImportResult,
@@ -20,6 +21,7 @@ import type {
   ModelPrice,
   ModelSummary,
   ModelTimeseriesPoint,
+  OAuthUserInput,
   PersonSummary,
   SessionSummary,
   StorageAdapter,
@@ -569,6 +571,15 @@ export class SqliteStorageAdapter implements StorageAdapter {
       clauses.push("COALESCE(s.user_email, s.user_account_id, s.user_id, 'unknown') = ?");
       params.push(filters.user);
     }
+    if (filters.userRowId != null) {
+      const ors = ["s.user_row_id = ?"];
+      params.push(filters.userRowId);
+      if (filters.userRowIdEmail) {
+        ors.push("COALESCE(s.user_email, s.user_account_id, s.user_id, 'unknown') = ?");
+        params.push(filters.userRowIdEmail);
+      }
+      clauses.push(`(${ors.join(" OR ")})`);
+    }
     if (filters.model) {
       clauses.push("p.model = ?");
       params.push(filters.model);
@@ -586,7 +597,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
     const rows = this.db
       .prepare(
         `SELECT
-          s.id, s.session_id AS sessionId, s.user_id AS userId, s.user_email AS userEmail,
+          s.id, s.session_id AS sessionId, s.user_id AS userId, s.user_email AS userEmail, s.user_row_id AS userRowId,
           s.user_account_id AS userAccountId, s.first_seen_at AS firstSeenAt, s.last_seen_at AS lastSeenAt,
           s.metric_source AS metricSource, s.has_otel AS hasOtel, s.has_jsonl AS hasJsonl,
           COALESCE(SUM(CASE WHEN p.kind = 'cost' THEN p.value ELSE 0 END), 0) AS totalCost,
@@ -628,6 +639,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
       )
       .all(...joinParams, ...params) as Array<
         Omit<SessionSummary, "models" | "hasTranscript" | "source" | "hasOtel" | "hasJsonl" | "githubLogin" | "displayName"> & {
+          userRowId: number | null;
           metricSource: "otel" | "jsonl";
           models: string | null;
           hasTranscript: number;
@@ -642,7 +654,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
     const directory = this.userDirectory();
     return Promise.resolve(
       rows.map(({ jsonlSource, ...row }) => {
-        const u = directory.get(row.userEmail ?? row.userAccountId ?? row.userId ?? "unknown");
+        const u = (row.userRowId ? this.getUserById(row.userRowId) : null) ?? directory.get(row.userEmail ?? row.userAccountId ?? row.userId ?? "unknown");
         return {
           ...row,
           // The authoritative source string. OTel only comes from Claude today; for a transcript we
@@ -714,7 +726,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
     const map = new Map<string, UserIdentityFields>();
     for (const u of users) {
       const value = { email: u.email, displayName: u.displayName, githubLogin: u.githubLogin };
-      for (const key of [u.email, u.accountId, u.userId]) if (key) map.set(key, value);
+      for (const key of [u.email, u.accountId, u.userId, u.githubLogin]) if (key) map.set(key, value);
     }
     return map;
   }
@@ -876,7 +888,19 @@ export class SqliteStorageAdapter implements StorageAdapter {
         label        TEXT,
         created_at   INTEGER NOT NULL,
         last_used_at INTEGER,
-        revoked      INTEGER NOT NULL DEFAULT 0
+        revoked      INTEGER NOT NULL DEFAULT 0,
+        user_row_id  INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS oauth_accounts (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider         TEXT NOT NULL,
+        provider_user_id TEXT NOT NULL,
+        user_row_id      INTEGER NOT NULL,
+        created_at       INTEGER NOT NULL,
+        updated_at       INTEGER NOT NULL,
+        UNIQUE(provider, provider_user_id),
+        FOREIGN KEY (user_row_id) REFERENCES users(id)
       );
 
       -- One row per captured OTLP log record (Codex telemetry is logs-only). Not aggregated into
@@ -918,6 +942,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
       CREATE INDEX IF NOT EXISTS idx_raw_batches_received_at ON raw_batches(received_at);
       CREATE INDEX IF NOT EXISTS idx_source_files_session ON source_files(session_row_id);
       CREATE INDEX IF NOT EXISTS idx_auth_tokens_hash ON auth_tokens(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_oauth_accounts_user_row ON oauth_accounts(user_row_id);
       CREATE INDEX IF NOT EXISTS idx_log_events_name ON log_events(event_name);
       CREATE INDEX IF NOT EXISTS idx_log_events_batch ON log_events(raw_batch_id);
       CREATE INDEX IF NOT EXISTS idx_metric_points_metric_name ON metric_points(metric_name);
@@ -930,7 +955,11 @@ export class SqliteStorageAdapter implements StorageAdapter {
     // the column exists BEFORE indexing it — the index must not be in the exec block above, or it would
     // fail on an old DB whose sessions table hasn't been ALTERed yet.
     this.ensureColumn("sessions", "user_row_id", "INTEGER");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_user_row ON sessions(user_row_id)");
+    this.ensureColumn("auth_tokens", "user_row_id", "INTEGER");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_sessions_user_row ON sessions(user_row_id);
+      CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_row ON auth_tokens(user_row_id);
+    `);
     // Back-fill the users registry from any identities already on disk (runs once, when users is empty).
     this.migrateUsers();
   }
@@ -978,16 +1007,16 @@ export class SqliteStorageAdapter implements StorageAdapter {
     }
   }
 
-  createAuthToken(tokenHash: string, label: string, now: number): void {
+  createAuthToken(tokenHash: string, label: string, now: number, userRowId: number | null = null): void {
     this.db
-      .prepare("INSERT INTO auth_tokens (token_hash, label, created_at) VALUES (?, ?, ?)")
-      .run(tokenHash, label, now);
+      .prepare("INSERT INTO auth_tokens (token_hash, label, created_at, user_row_id) VALUES (?, ?, ?, ?)")
+      .run(tokenHash, label, now, userRowId);
   }
 
-  findAuthToken(tokenHash: string): { id: number; revoked: number } | null {
+  findAuthToken(tokenHash: string): { id: number; revoked: number; userRowId: number | null } | null {
     const row = this.db
-      .prepare("SELECT id, revoked FROM auth_tokens WHERE token_hash = ?")
-      .get(tokenHash) as { id: number; revoked: number } | undefined;
+      .prepare("SELECT id, revoked, user_row_id AS userRowId FROM auth_tokens WHERE token_hash = ?")
+      .get(tokenHash) as { id: number; revoked: number; userRowId: number | null } | undefined;
     if (!row) return null;
     // Best-effort touch so the admin GUI can show recency; failures here must not block auth.
     try {
@@ -1001,13 +1030,78 @@ export class SqliteStorageAdapter implements StorageAdapter {
   listAuthTokens(): AuthTokenRecord[] {
     return this.db
       .prepare(
-        "SELECT id, label, created_at AS createdAt, last_used_at AS lastUsedAt, revoked FROM auth_tokens ORDER BY created_at DESC"
+        "SELECT id, label, created_at AS createdAt, last_used_at AS lastUsedAt, revoked, user_row_id AS userRowId FROM auth_tokens ORDER BY created_at DESC"
       )
       .all() as AuthTokenRecord[];
   }
 
   revokeAuthToken(id: number): void {
     this.db.prepare("UPDATE auth_tokens SET revoked = 1 WHERE id = ?").run(id);
+  }
+
+  getUserById(id: number): AuthUser | null {
+    const row = this.db
+      .prepare("SELECT id, email, display_name AS displayName, github_login AS githubLogin FROM users WHERE id = ?")
+      .get(id) as AuthUser | undefined;
+    return row ?? null;
+  }
+
+  upsertOAuthUser(input: OAuthUserInput, now: number): AuthUser {
+    const existing = this.db
+      .prepare(
+        `SELECT u.id
+         FROM oauth_accounts oa
+         JOIN users u ON u.id = oa.user_row_id
+         WHERE oa.provider = ? AND oa.provider_user_id = ?`
+      )
+      .get(input.provider, input.providerUserId) as { id: number } | undefined;
+    // Prefer an already-linked account; otherwise try to attach to an existing telemetry user row by
+    // ANY verified email (the GitHub primary often differs from the email seen on sessions). Falling
+    // through to upsertUser dedupes by the primary email / github login or creates a fresh row.
+    const userRowId =
+      existing?.id ??
+      this.findUserByAnyEmail(input.emails ?? []) ??
+      this.upsertUser(
+        {
+          userEmail: input.email ?? null,
+          githubLogin: input.githubLogin ?? null,
+          displayName: input.displayName ?? null
+        },
+        now
+      );
+    if (userRowId == null) throw new Error("OAuth user has no linkable identity");
+
+    this.db.exec("BEGIN");
+    try {
+      this.db
+        .prepare(
+          `UPDATE users SET
+             email = COALESCE(email, ?),
+             github_login = COALESCE(github_login, ?),
+             display_name = COALESCE(display_name, ?),
+             first_seen_at = MIN(first_seen_at, ?),
+             last_seen_at = MAX(last_seen_at, ?)
+           WHERE id = ?`
+        )
+        .run(input.email ?? null, input.githubLogin ?? null, input.displayName ?? null, now, now, userRowId);
+      this.db
+        .prepare(
+          `INSERT INTO oauth_accounts (provider, provider_user_id, user_row_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(provider, provider_user_id) DO UPDATE SET
+             user_row_id = excluded.user_row_id,
+             updated_at = excluded.updated_at`
+        )
+        .run(input.provider, input.providerUserId, userRowId, now, now);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    const user = this.getUserById(userRowId);
+    if (!user) throw new Error("OAuth user link failed");
+    return user;
   }
 
   // Load model_prices into the in-memory index that cost synthesis reads. Called at construction and
@@ -1249,6 +1343,17 @@ export class SqliteStorageAdapter implements StorageAdapter {
   private findUser(column: "email" | "account_id" | "user_id" | "github_login", value: string): number | null {
     const row = this.db.prepare(`SELECT id FROM users WHERE ${column} = ? LIMIT 1`).get(value) as { id: number } | undefined;
     return row ? row.id : null;
+  }
+
+  // First existing user row matching any of the given emails (used to link an OAuth login to the
+  // person's telemetry identity when their provider primary email isn't the one on their sessions).
+  private findUserByAnyEmail(emails: string[]): number | null {
+    for (const email of emails) {
+      if (!email) continue;
+      const id = this.findUser("email", email);
+      if (id != null) return id;
+    }
+    return null;
   }
 
   // Build the users registry once from identities already stored on sessions (existing DBs predate the

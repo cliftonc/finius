@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,8 +55,19 @@ export async function runSetup(args: string[] = []): Promise<number> {
   // Capture a user identity so uploaded transcripts are attributed to a person (and line up with
   // live OTEL metrics). Detected from the local Claude/Codex/GitHub/git state, confirmed by the user.
   const identity = await configureIdentity(current);
+  const oauth = health.reachable ? undefined : await configureOAuth(serverUrl, current);
+  if (health.reachable) log.info("Connected to an existing server — skipping dashboard OAuth configuration.");
 
-  saveConfig({ serverUrl, authPassword: auth.authPassword, authToken: auth.authToken, identity });
+  // GitHub-only Secure Mode has no master password to exchange for a token, but this (owner) machine
+  // still needs one for its own hook/OTEL uploads. Mint it now so the credential below is set; `serve`
+  // seeds the same token into the DB on first run.
+  let resolvedAuth = auth;
+  if (oauth?.github?.enabled && !resolvedAuth.authToken && !resolvedAuth.authPassword) {
+    resolvedAuth = { ...resolvedAuth, authToken: generateAuthToken() };
+    log.info("GitHub-only secure mode — generated an owner token for this machine's uploads.");
+  }
+
+  saveConfig({ serverUrl, authPassword: resolvedAuth.authPassword, authToken: resolvedAuth.authToken, identity, auth: oauth ? { oauth } : undefined });
   log.success(`Saved config ${pc.dim(CONFIG_PATH)}`);
 
   // Install globally so the bare `finius` command works everywhere — including the hook, which then
@@ -78,7 +90,7 @@ export async function runSetup(args: string[] = []): Promise<number> {
   }
 
   // Only offer to configure agents that are actually installed.
-  const credential = resolveAuthToken({ serverUrl, ...auth });
+  const credential = resolveAuthToken({ serverUrl, ...resolvedAuth });
   const haveClaude = isClaudeInstalled();
   const haveCodex = isCodexInstalled();
 
@@ -137,6 +149,11 @@ async function configureAuth(serverUrl: string, health: ServerHealth, current: A
       log.warn("Saved password was rejected by the server login endpoint.");
     }
     log.warn("This Finius server requires authentication.");
+    const browserToken = await browserLogin(serverUrl);
+    if (browserToken) {
+      log.success("Authenticated in the browser — saved a client token for this machine.");
+      return { authToken: browserToken };
+    }
     for (;;) {
       const entered = ask(await passwordPrompt({ message: "Server password" }));
       const trimmed = entered.trim();
@@ -153,6 +170,11 @@ async function configureAuth(serverUrl: string, health: ServerHealth, current: A
       }
       log.error("That password was rejected — try again.");
     }
+  }
+
+  if (health.reachable) {
+    log.info("Server is already running in open mode — skipping server auth configuration.");
+    return current;
   }
 
   if (current.authPassword) {
@@ -180,6 +202,58 @@ async function configureAuth(serverUrl: string, health: ServerHealth, current: A
     "Secure Mode enabled — your Finius password"
   );
   return { authPassword: pw, authToken: token };
+}
+
+async function browserLogin(serverUrl: string): Promise<string | null> {
+  const callback = await startCliAuthCallback();
+  const loginUrl = `${serverUrl}/?cli_return_to=${encodeURIComponent(callback.returnTo)}`;
+  note(
+    `${pc.cyan(loginUrl)}\n\n${pc.dim("Complete login in your browser. This command will continue automatically when the browser redirects back.")}`,
+    "Browser login"
+  );
+  const token = await callback.waitForToken();
+  return token;
+}
+
+async function startCliAuthCallback(): Promise<{ returnTo: string; waitForToken: () => Promise<string | null> }> {
+  let resolveToken: (token: string | null) => void = () => {};
+  const tokenPromise = new Promise<string | null>((resolve) => {
+    resolveToken = resolve;
+  });
+
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+    const token = url.searchParams.get("token");
+    if (url.pathname !== "/callback" || !token) {
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Finius login callback is missing a token.");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end("<!doctype html><title>Finius login complete</title><body><h1>Finius login complete</h1><p>You can return to your terminal.</p></body>");
+    resolveToken(token);
+    server.close();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  const timeout = setTimeout(() => {
+    resolveToken(null);
+    server.close();
+  }, 5 * 60_000);
+
+  return {
+    returnTo: `http://127.0.0.1:${port}/callback`,
+    waitForToken: async () => {
+      const token = await tokenPromise;
+      clearTimeout(timeout);
+      return token;
+    }
+  };
 }
 
 // Detect a user identity from the local agent state and confirm it with the user, so the hook/backfill
@@ -240,6 +314,46 @@ async function configureIdentity(current: FiniusConfig | null): Promise<FiniusCo
   const label = displayName ?? email ?? githubLogin;
   log.success(`Attributing sessions to ${pc.cyan(String(label))}${githubLogin ? pc.dim(` (@${githubLogin})`) : ""}.`);
   return identity;
+}
+
+async function configureOAuth(serverUrl: string, current: FiniusConfig | null): Promise<NonNullable<FiniusConfig["auth"]>["oauth"] | undefined> {
+  const existing = current?.auth?.oauth?.github;
+  const enableGithub = ask(
+    await confirm({
+      message: "Enable GitHub OAuth login for the dashboard?",
+      initialValue: !!existing?.enabled
+    })
+  );
+  if (!enableGithub) return undefined;
+
+  const clientId = ask(
+    await text({
+      message: "GitHub OAuth client ID",
+      placeholder: existing?.clientId || "Ov23li...",
+      defaultValue: existing?.clientId,
+      initialValue: existing?.clientId
+    })
+  ).trim();
+  const clientSecret = ask(
+    await passwordPrompt({
+      message: existing?.clientSecret ? "GitHub OAuth client secret (leave empty to keep existing)" : "GitHub OAuth client secret"
+    })
+  ).trim() || existing?.clientSecret || "";
+  const requiredOrg = ask(
+    await text({
+      message: "Required GitHub organization",
+      placeholder: existing?.requiredOrg || "my-org",
+      defaultValue: existing?.requiredOrg,
+      initialValue: existing?.requiredOrg
+    })
+  ).trim();
+
+  if (!clientId || !clientSecret || !requiredOrg) {
+    log.warn("GitHub OAuth was skipped because the client ID, secret, and organization are all required.");
+    return undefined;
+  }
+  note(`${serverUrl}/api/auth/github/callback`, "GitHub OAuth callback URL");
+  return { github: { enabled: true, clientId, clientSecret, requiredOrg } };
 }
 
 // Exchange the master password for a client session token at the login endpoint. Returns null on a

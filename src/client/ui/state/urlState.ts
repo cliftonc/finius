@@ -12,6 +12,7 @@ export type ViewState = {
   source: string;
   user: string;
   model: string;
+  mine: string;
   session: string;
   transcript: string;
 };
@@ -28,6 +29,7 @@ function readState(): ViewState {
     source: p.get("source") ?? "",
     user: p.get("user") ?? "",
     model: p.get("model") ?? "",
+    mine: p.get("mine") ?? "",
     session: p.get("session") ?? "",
     transcript: p.get("transcript") ?? ""
   };
@@ -42,6 +44,7 @@ function writeState(state: ViewState) {
   if (state.source) p.set("source", state.source);
   if (state.user) p.set("user", state.user);
   if (state.model) p.set("model", state.model);
+  if (state.mine) p.set("mine", state.mine);
   if (state.session) p.set("session", state.session);
   if (state.transcript) p.set("transcript", state.transcript);
   const qs = p.toString();

@@ -26,6 +26,15 @@ export type StartServerOptions = {
   cronToken?: string;
   authSecret?: string;
   initialAuthToken?: string;
+  oauth?: {
+    github?: {
+      enabled?: boolean;
+      clientId?: string;
+      clientSecret?: string;
+      requiredOrg?: string;
+      callbackUrl?: string;
+    };
+  };
 };
 
 export type RunningServer = {
@@ -49,10 +58,15 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   const authSecret = options.authSecret ?? process.env.FINIUS_AUTH_PASSWORD;
   const initialAuthToken = options.initialAuthToken;
 
+  const g = options.oauth?.github;
+  const githubEnabled = !!(g?.enabled && g.clientId && g.clientSecret && g.requiredOrg && g.callbackUrl);
+
   const storage = new SqliteStorageAdapter(resolve(dbPath), { storeRawPayloads, blob });
-  if (authSecret && initialAuthToken) seedInitialAuthToken(storage, initialAuthToken);
+  // Seed the owner token whenever the server is secured by EITHER method, so the local CLI (hook/OTEL)
+  // has a credential even in GitHub-only mode where there's no master password to exchange.
+  if ((authSecret || githubEnabled) && initialAuthToken) seedInitialAuthToken(storage, initialAuthToken);
   const events = new EventBus();
-  const app = createApp({ storage, events, cronToken, rawRetentionDays, authSecret });
+  const app = createApp({ storage, events, cronToken, rawRetentionDays, authSecret, oauth: options.oauth });
 
   // Resolve the built client relative to this module so the UI is served no matter the cwd
   // (e.g. when launched via `npx @cliftonc/finius serve`). Falls back to a cwd-relative path for
@@ -81,7 +95,7 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
         ["Database", pc.dim(resolvedDb)],
         ["Transcripts", pc.dim(transcriptsDir)],
         ["Raw payloads", storeRawPayloads ? `retained, pruned after ${rawRetentionDays}d` : pc.dim("off")],
-        ["Auth", authSecret ? `${pc.green("secure mode")} ${pc.dim("· log in with password:")} ${pc.bold(authSecret)}` : pc.dim("open (no auth)")]
+        ["Auth", authLine(authSecret, githubEnabled, g?.requiredOrg)]
       ])}\n\n`
     );
   });
@@ -134,6 +148,18 @@ async function syncPricing(storage: SqliteStorageAdapter) {
       /* ignore */
     }
   }
+}
+
+// One-line description of how the server is gated, for the startup panel.
+function authLine(authSecret: string | undefined, githubEnabled: boolean, requiredOrg?: string): string {
+  if (authSecret) {
+    const gh = githubEnabled ? ` ${pc.dim(`+ GitHub (${requiredOrg})`)}` : "";
+    return `${pc.green("secure mode")} ${pc.dim("· log in with password:")} ${pc.bold(authSecret)}${gh}`;
+  }
+  if (githubEnabled) {
+    return `${pc.green("secure mode")} ${pc.dim("· GitHub OAuth, org:")} ${pc.bold(requiredOrg ?? "?")}`;
+  }
+  return pc.dim("open (no auth)");
 }
 
 function seedInitialAuthToken(storage: SqliteStorageAdapter, token: string) {

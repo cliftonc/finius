@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { getHealth, getMeta, getModelTimeseries, getModels, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo, type Filters, type Granularity } from "../../api";
+import { getAuthProviders, getHealth, getMe, getMeta, getModelTimeseries, getModels, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo, type Filters, type Granularity } from "../../api";
 import { queryKeys } from "./queryKeys";
 
 export function useMetaQuery() {
@@ -8,6 +8,14 @@ export function useMetaQuery() {
 
 export function useHealthQuery() {
   return useQuery({ queryKey: queryKeys.health(), queryFn: ({ signal }) => getHealth(signal), retry: false });
+}
+
+export function useAuthProvidersQuery() {
+  return useQuery({ queryKey: queryKeys.authProviders(), queryFn: ({ signal }) => getAuthProviders(signal), retry: false });
+}
+
+export function useMeQuery(enabled: boolean) {
+  return useQuery({ queryKey: queryKeys.me(), queryFn: ({ signal }) => getMe(signal), enabled, retry: false });
 }
 
 export function useSummaryQuery(filters: Filters) {

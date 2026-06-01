@@ -61,6 +61,11 @@ export type SummaryFilters = {
   from?: number;
   to?: number;
   user?: string;
+  userRowId?: number;
+  // Companion to userRowId for "mine" filtering: also match this email identity, so sessions that
+  // belong to the current user but didn't merge into their user row (e.g. OTel-only, no GitHub login)
+  // are still included. OR'd with userRowId.
+  userRowIdEmail?: string;
   model?: string;
   source?: string;
   session?: number;
@@ -120,11 +125,26 @@ export type AuthTokenRecord = {
   createdAt: number;
   lastUsedAt: number | null;
   revoked: number;
+  userRowId: number | null;
 };
 
-// Result of authenticating a request in Secure Mode. 'master' = the server password was presented
-// directly; 'token' = a minted session token matched (tokenId names the auth_tokens row).
-export type AuthContext = { kind: "master" | "token"; tokenId?: number };
+export type AuthUser = {
+  id: number;
+  email: string | null;
+  displayName: string | null;
+  githubLogin: string | null;
+};
+
+export type OAuthUserInput = {
+  provider: "github";
+  providerUserId: string;
+  email?: string | null;
+  // All verified provider emails (GitHub can expose several). Used to link this login to an existing
+  // telemetry user row by any of them, not just the primary.
+  emails?: string[];
+  githubLogin?: string | null;
+  displayName?: string | null;
+};
 
 export interface StorageAdapter {
   ingestOtelMetrics(batch: unknown): Promise<{ duplicate: boolean; points: number }>;
@@ -164,9 +184,11 @@ export interface StorageAdapter {
   listModels(filters: SummaryFilters): Promise<ModelSummary[]>;
   getFilterOptions(): Promise<FilterOptions>;
   pruneRawBatches(beforeTimestampMs: number): Promise<{ deleted: number }>;
-  createAuthToken(tokenHash: string, label: string, now: number): void;
-  findAuthToken(tokenHash: string): { id: number; revoked: number } | null;
+  createAuthToken(tokenHash: string, label: string, now: number, userRowId?: number | null): void;
+  findAuthToken(tokenHash: string): { id: number; revoked: number; userRowId: number | null } | null;
   listAuthTokens(): AuthTokenRecord[];
   revokeAuthToken(id: number): void;
+  getUserById(id: number): AuthUser | null;
+  upsertOAuthUser(input: OAuthUserInput, now: number): AuthUser;
   close(): void;
 }

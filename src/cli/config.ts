@@ -33,6 +33,16 @@ export type FiniusConfig = {
     githubLogin?: string;
     displayName?: string;
   };
+  auth?: {
+    oauth?: {
+      github?: {
+        enabled?: boolean;
+        clientId?: string;
+        clientSecret?: string;
+        requiredOrg?: string;
+      };
+    };
+  };
 };
 
 export function configExists(): boolean {

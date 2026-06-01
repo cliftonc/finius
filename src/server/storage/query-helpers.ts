@@ -16,6 +16,7 @@ export const OTEL_SOURCE = "claude-code";
 
 export function canUseRollup(filters: SummaryFilters, granularity?: Granularity) {
   if (filters.session != null) return false;
+  if (filters.userRowId != null) return false;
   // An explicit non-OTel source filter is the comparison view: it must see ALL of that source's
   // (JSONL) points, including ones shadowed by OTel, which the effective rollup omits. Serve those
   // from metric_points instead, where an explicit source filter returns the raw per-source numbers.
@@ -38,6 +39,9 @@ export function rollupWhere(filters: SummaryFilters) {
   if (filters.user) {
     clauses.push("user_identity = ?");
     params.push(filters.user);
+  }
+  if (filters.userRowId != null) {
+    clauses.push("1 = 0");
   }
   if (filters.model) {
     clauses.push("model = ?");
@@ -80,6 +84,15 @@ export function pointWhere(filters: SummaryFilters, opts: { dedupe?: boolean } =
   if (filters.user) {
     clauses.push("COALESCE(user_email, user_account_id, user_id, 'unknown') = ?");
     params.push(filters.user);
+  }
+  if (filters.userRowId != null) {
+    const ors = ["session_row_id IN (SELECT id FROM sessions WHERE user_row_id = ?)"];
+    params.push(filters.userRowId);
+    if (filters.userRowIdEmail) {
+      ors.push("session_row_id IN (SELECT id FROM sessions WHERE COALESCE(user_email, user_account_id, user_id, 'unknown') = ?)");
+      params.push(filters.userRowIdEmail);
+    }
+    clauses.push(`(${ors.join(" OR ")})`);
   }
   if (filters.model) {
     clauses.push("model = ?");

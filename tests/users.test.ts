@@ -72,6 +72,31 @@ describe("users registry", () => {
     expect(people[0]).toMatchObject({ user: "dev@example.com", githubLogin: "devhandle" });
   });
 
+  it("links an OAuth login to an existing user by GitHub login", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    await storage.importJsonl(
+      "claude-code-jsonl",
+      { sessionId: "s1", githubLogin: "devhandle", displayName: "Dev" },
+      jsonlTranscript("s1")
+    );
+
+    const user = storage.upsertOAuthUser(
+      {
+        provider: "github",
+        providerUserId: "123",
+        email: "dev@example.com",
+        githubLogin: "devhandle",
+        displayName: "Dev Handle"
+      },
+      Date.now()
+    );
+
+    expect(user).toMatchObject({ email: "dev@example.com", githubLogin: "devhandle", displayName: "Dev" });
+    const sessions = await storage.listSessions({ userRowId: user.id });
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0]).toMatchObject({ githubLogin: "devhandle", displayName: "Dev" });
+  });
+
   it("surfaces the friendly identity (github login/display name) on sessions and the summary breakdown", async () => {
     storage = new SqliteStorageAdapter(tmpDbPath());
     await storage.importJsonl(

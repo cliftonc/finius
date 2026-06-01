@@ -1,4 +1,4 @@
-import { Button, ButtonGroup, Card, CardBody, Popover, PopoverContent, PopoverTrigger, RangeCalendar, Select, SelectItem } from "@heroui/react";
+import { Button, ButtonGroup, Card, CardBody, Chip, Popover, PopoverContent, PopoverTrigger, RangeCalendar, Select, SelectItem } from "@heroui/react";
 import { CalendarDate, type DateValue } from "@internationalized/date";
 import { CalendarDays } from "lucide-react";
 import { useState } from "react";
@@ -9,13 +9,14 @@ import { SessionFilterChip } from "./sessions/SessionFilterChip";
 
 const ALL = "__all__";
 
-export function FiltersBar({ meta, range, custom, source, user, model, session, onChange }: {
+export function FiltersBar({ meta, range, custom, source, user, model, mine, session, onChange }: {
   meta?: FilterOptions;
   range: RangeKey;
   custom: CustomRange;
   source: string;
   user: string;
   model: string;
+  mine: string;
   session: string;
   onChange: (patch: Partial<ViewState>) => void;
 }) {
@@ -41,6 +42,11 @@ export function FiltersBar({ meta, range, custom, source, user, model, session, 
             <SelectItem key={item.key}>{item.label}</SelectItem>
           ))}
         </Select>
+        {mine === "1" ? (
+          <Chip className="self-end" variant="flat" color="primary" onClose={() => onChange({ mine: "" })}>
+            My sessions
+          </Chip>
+        ) : null}
         {session && <SessionFilterChip id={Number(session)} onClear={() => onChange({ session: "" })} onView={() => onChange({ transcript: session })} />}
       </CardBody>
     </Card>

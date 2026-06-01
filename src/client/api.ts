@@ -27,6 +27,7 @@ export type Filters = {
   to?: number;
   source?: string;
   user?: string;
+  mine?: boolean;
   model?: string;
   session?: number;
 };
@@ -41,6 +42,10 @@ export function clearAuthToken() {
   window.localStorage.removeItem(AUTH_STORAGE_KEY);
 }
 
+export function storeAuthToken(token: string) {
+  window.localStorage.setItem(AUTH_STORAGE_KEY, token);
+}
+
 function authHeaders(): HeadersInit | undefined {
   const token = getAuthToken();
   return token ? { authorization: `Bearer ${token}` } : undefined;
@@ -52,6 +57,7 @@ function withFilters(path: string, filters: Filters = {}, extra: Record<string, 
   if (filters.to !== undefined) params.set("to", String(filters.to));
   if (filters.source) params.set("source", filters.source);
   if (filters.user) params.set("user", filters.user);
+  if (filters.mine) params.set("mine", "1");
   if (filters.model) params.set("model", filters.model);
   if (filters.session !== undefined) params.set("session", String(filters.session));
   const query = params.toString();
@@ -125,6 +131,11 @@ export class AuthError extends Error {
 }
 
 export type Health = { ok: boolean; now: number; secure: boolean };
+export type AuthProviders = {
+  password?: { enabled: boolean };
+  github: { enabled: boolean; requiredOrg?: string; loginUrl?: string };
+};
+export type AuthMe = { user: { id: number; email: string | null; displayName: string | null; githubLogin: string | null } | null };
 
 export async function getHealth(signal?: AbortSignal): Promise<Health> {
   const response = await fetch("/api/health", { signal });
@@ -132,8 +143,18 @@ export async function getHealth(signal?: AbortSignal): Promise<Health> {
   return response.json() as Promise<Health>;
 }
 
-// Exchange the server password for a session token. Returns true on success, false on a bad password.
-export async function login(password: string): Promise<boolean> {
+export async function getAuthProviders(signal?: AbortSignal): Promise<AuthProviders> {
+  const response = await fetch("/api/auth/providers", { signal });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json() as Promise<AuthProviders>;
+}
+
+export async function getMe(signal?: AbortSignal): Promise<AuthMe> {
+  return getJson<AuthMe>("/api/auth/me", signal);
+}
+
+// Exchange the server password for a session token. Returns the token on success, null on failure.
+export async function login(password: string): Promise<string | null> {
   const response = await fetch("/api/auth/login", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -141,9 +162,23 @@ export async function login(password: string): Promise<boolean> {
   });
   if (response.ok) {
     const body = (await response.json()) as { token?: string };
-    if (body.token) window.localStorage.setItem(AUTH_STORAGE_KEY, body.token);
+    if (body.token) {
+      storeAuthToken(body.token);
+      return body.token;
+    }
   }
-  return response.ok;
+  return null;
+}
+
+// Revoke the current session on the server (clears the HttpOnly GitHub cookie + revokes the token)
+// and drop any locally-stored bearer token. Best-effort: the local clear happens regardless.
+export async function logout(): Promise<void> {
+  try {
+    await fetch("/api/auth/logout", { method: "POST", headers: authHeaders() });
+  } catch {
+    /* ignore network errors — we still clear the local token below */
+  }
+  clearAuthToken();
 }
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {

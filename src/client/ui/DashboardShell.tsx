@@ -1,5 +1,5 @@
 import { Button, Chip, Tab, Tabs } from "@heroui/react";
-import { LogOut, Moon, Radio, Settings, Sun } from "lucide-react";
+import { LogOut, Moon, Radio, Settings, Sun, User } from "lucide-react";
 import type { ReactNode } from "react";
 import { FiniusLogo } from "./FiniusLogo";
 import { useTheme } from "../theme";
@@ -21,10 +21,13 @@ function ThemeToggle() {
   );
 }
 
-export function DashboardShell({ tab, live, secure, onTabChange, onLogout, onOpenSetup, children }: {
+export function DashboardShell({ tab, live, secure, me, mine, onToggleMine, onTabChange, onLogout, onOpenSetup, children }: {
   tab: TabKey;
   live: boolean;
   secure?: boolean;
+  me?: { email: string | null; displayName: string | null; githubLogin: string | null } | null;
+  mine: boolean;
+  onToggleMine: () => void;
   onTabChange: (tab: TabKey) => void;
   onLogout: () => void;
   onOpenSetup: () => void;
@@ -46,6 +49,11 @@ export function DashboardShell({ tab, live, secure, onTabChange, onLogout, onOpe
           </Tabs>
         </div>
         <div className="flex items-center gap-3">
+          {me ? (
+            <Button radius="full" variant={mine ? "solid" : "bordered"} color={mine ? "primary" : "default"} startContent={<User size={18} />} onPress={onToggleMine}>
+              My sessions
+            </Button>
+          ) : null}
           {secure ? (
             <Button isIconOnly radius="full" variant="bordered" aria-label="Log out" onPress={onLogout}>
               <LogOut size={18} />

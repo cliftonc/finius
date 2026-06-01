@@ -51,6 +51,7 @@
     "@internationalized/date": "^3.12.0",
     "@tanstack/react-query": "^5.90.12",
     "ansi-to-html": "^0.7.2",
+    "arctic": "^3.7.0",
     "chartgpu": "^0.3.2",
     "clsx": "^2.1.1",
     "dompurify": "^3.4.7",

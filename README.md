@@ -4,11 +4,12 @@
 
 # Finius
 
-**Local-first Claude Code usage & cost tracker.**
+**Local-first usage & cost tracker for Claude Code and Codex.**
 
-A [Hono](https://hono.dev) server ingests OTLP HTTP/JSON metrics & logs (and JSONL transcripts) into
-SQLite; a React + Vite dashboard renders cost, token, session, person, and model breakdowns with live
-SSE updates. Everything runs on your machine — no data leaves your laptop.
+A [Hono](https://hono.dev) server ingests OTLP HTTP/JSON metrics & logs (and JSONL/rollout
+transcripts from Claude Code and Codex) into SQLite; a React + Vite dashboard renders cost, token,
+session, person, and model breakdowns with live SSE updates. Everything runs on your machine — no
+data leaves your laptop.
 
 <img src="public/finius-dashboard.png" alt="Finius dashboard showing local usage and cost analytics" width="900" />
 
@@ -25,7 +26,7 @@ finius serve         # start the server + dashboard at http://localhost:8787
 finius import all    # optional: import old Claude Code + Codex sessions
 ```
 
-Then launch Claude Code in a new terminal and start coding — the dashboard at
+Then launch Claude Code or Codex in a new terminal and start coding — the dashboard at
 **http://localhost:8787** updates live as telemetry arrives.
 
 That's it. Three things just happened:
@@ -33,7 +34,8 @@ That's it. Three things just happened:
 1. **`npx @cliftonc/finius`** installed `finius` globally and ran `finius setup`, which saved
    `~/.finius/config.json` and — with your consent — edited `~/.claude/settings.json` to add the OTLP
    env vars plus a `SessionEnd` + `PreCompact` hook (`finius hook`) that uploads each session
-   transcript.
+   transcript. If Codex is installed, setup likewise offers to add its `Stop` hook and OTEL logging to
+   `~/.codex/config.toml`.
 2. **`finius serve`** started a single process exposing the API **and** the dashboard on one port.
    Its data lives under `~/.finius` (override with `FINIUS_DB_PATH` / `FINIUS_BLOB_DIR`).
 3. Any Claude Code session you run now reports usage to that local server. If you ran
@@ -42,6 +44,10 @@ That's it. Three things just happened:
 
 Re-run `finius setup` any time to reconfigure, or `finius doctor` to diagnose telemetry that isn't
 arriving.
+
+> **Going further?** [`setup/quick-start.md`](setup/quick-start.md) is a step-by-step guide covering the
+> local (no-auth) flow above in more detail, **team deployment** on a shared server (real domain + TLS
+> termination, choosing auth), and setting up **GitHub OAuth** login gated by org membership.
 
 ## Running from source (development)
 

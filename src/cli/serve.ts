@@ -29,10 +29,16 @@ export async function runServe(argv: string[]): Promise<number> {
   // locked. An explicit env var still wins (handy for one-off overrides).
   const config = loadConfig();
   const authSecret = process.env.FINIUS_AUTH_PASSWORD ?? config?.authPassword;
+  const github = config?.auth?.oauth?.github;
+  const githubEnabled = !!(github?.enabled && github.clientId && github.clientSecret && github.requiredOrg);
+  // The server is secured by EITHER a master password or GitHub OAuth. In both cases this (owner)
+  // machine needs a seeded token for its own CLI uploads — in GitHub-only mode there's no password to
+  // exchange for one, so mint it here. A machine that merely joined a server keeps its existing token.
+  const secure = !!authSecret || githubEnabled;
   let initialAuthToken = config?.authToken;
-  if (authSecret && config?.authPassword && !initialAuthToken) {
+  if (secure && !initialAuthToken) {
     initialAuthToken = generateAuthToken();
-    saveConfig({ ...config, authToken: initialAuthToken });
+    if (config) saveConfig({ ...config, authToken: initialAuthToken });
   }
 
   startServer({
@@ -40,7 +46,15 @@ export async function runServe(argv: string[]): Promise<number> {
     dbPath: process.env.FINIUS_DB_PATH ?? join(dataDir, "finius.sqlite"),
     blobDir: process.env.FINIUS_BLOB_DIR ?? join(FINIUS_HOME, "transcripts"),
     authSecret,
-    initialAuthToken
+    initialAuthToken,
+    oauth: {
+      github: config?.auth?.oauth?.github?.enabled
+        ? {
+            ...config.auth.oauth.github,
+            callbackUrl: `${config.serverUrl}/api/auth/github/callback`
+          }
+        : undefined
+    }
   });
 
   // The server runs until the process is signalled. Never resolve, so the CLI entrypoint doesn't
