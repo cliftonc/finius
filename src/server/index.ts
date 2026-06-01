@@ -19,6 +19,9 @@ const DEFAULT_PRICING_URL = "https://raw.githubusercontent.com/BerriAI/litellm/m
 export type StartServerOptions = {
   port?: number;
   hostname?: string;
+  // Human-facing base URL for the startup banner (e.g. http://192.168.178.180:8787) when the bind
+  // host (0.0.0.0) isn't itself something you'd open in a browser. Defaults to http://<hostname>:<port>.
+  displayUrl?: string;
   dbPath?: string;
   blobDir?: string;
   storeRawPayloads?: boolean;
@@ -92,7 +95,7 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   const transcriptsDir = blobDir ? resolve(blobDir) : join(dirname(resolvedDb), "transcripts");
 
   serve({ fetch: app.fetch, hostname, port }, (info) => {
-    const url = `http://${hostname}:${info.port}`;
+    const url = options.displayUrl ?? `http://${hostname}:${info.port}`;
     banner("serve");
     process.stdout.write(`\n  ${pc.green("●")} ${pc.bold("Finius is live")}  ${pc.dim("·")}  ${pc.cyan(url)}\n\n`);
     process.stdout.write(
