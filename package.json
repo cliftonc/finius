@@ -3,6 +3,14 @@
   "version": "0.1.1",
   "description": "Local-first Claude Code usage & cost tracker — OTLP + transcript ingest with a live dashboard.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cliftonc/finius.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cliftonc/finius/issues"
+  },
+  "homepage": "https://github.com/cliftonc/finius#readme",
   "type": "module",
   "bin": {
     "finius": "dist/cli/index.js"
