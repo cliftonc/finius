@@ -1,5 +1,6 @@
 import {
   Button,
+  ButtonGroup,
   Card,
   CardBody,
   Chip,
@@ -7,6 +8,10 @@ import {
   ModalBody,
   ModalContent,
   ModalHeader,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  RangeCalendar,
   Select,
   SelectItem,
   Snippet,
@@ -20,9 +25,10 @@ import {
   Tabs,
   useDisclosure
 } from "@heroui/react";
+import { CalendarDate, type DateValue } from "@internationalized/date";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ChartGPUOptions } from "chartgpu";
-import { Activity, ArrowUpRight, Check, CircleDollarSign, Database, FileText, GitCommit, GitPullRequest, Layers, LogOut, Minus, Moon, Plus, Radio, RefreshCcw, Settings, Sun, Users, X } from "lucide-react";
+import { Activity, ArrowUpRight, CalendarDays, Check, CircleDollarSign, Database, FileText, GitCommit, GitPullRequest, Layers, LogOut, Minus, Moon, Plus, Radio, RefreshCcw, Settings, Sun, Users, X } from "lucide-react";
 import { lazy, Suspense, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { AuthError, clearAuthToken, getAuthToken, getHealth, getMeta, getModels, getModelTimeseries, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo } from "../api";
 import type { Filters, Granularity, ModelSummary, ModelTimeseriesPoint, PersonSummary, SessionSummary, Summary, TimeseriesPoint } from "../api";
@@ -33,7 +39,7 @@ import { GpuChart } from "./GpuChart";
 import { PROVIDER_COLOR, PROVIDER_LABEL, ProviderLogo, providerForSource, type Provider } from "./ProviderLogo";
 import { FiniusLogo } from "./FiniusLogo";
 import { LoginScreen } from "./LoginScreen";
-import { RANGES, RANGE_KEYS, rangeWindow, type RangeKey } from "./state/dateRange";
+import { PRESET_RANGES, RANGE_KEYS, rangeWindow, type CustomRange, type RangeKey } from "./state/dateRange";
 import { densify, modelSeries } from "./charts/chartData";
 import { granularityLabel, lineOptions, multiSeriesLineOptions, seriesLineOptions } from "./charts/chartOptions";
 
@@ -47,6 +53,8 @@ const TranscriptView = lazy(() => import("./TranscriptView").then((module) => ({
 type ViewState = {
   tab: TabKey;
   range: RangeKey;
+  customFrom: string;
+  customTo: string;
   source: string;
   user: string;
   model: string;
@@ -60,7 +68,9 @@ function readState(): ViewState {
   const range = p.get("range");
   return {
     tab: TAB_KEYS.includes(tab as TabKey) ? (tab as TabKey) : "home",
-    range: RANGE_KEYS.includes(range as RangeKey) ? (range as RangeKey) : "now",
+    range: RANGE_KEYS.includes(range as RangeKey) ? (range as RangeKey) : "today",
+    customFrom: p.get("from") ?? "",
+    customTo: p.get("to") ?? "",
     source: p.get("source") ?? "",
     user: p.get("user") ?? "",
     model: p.get("model") ?? "",
@@ -72,7 +82,9 @@ function readState(): ViewState {
 function writeState(state: ViewState) {
   const p = new URLSearchParams();
   if (state.tab !== "home") p.set("tab", state.tab);
-  if (state.range !== "now") p.set("range", state.range);
+  if (state.range !== "today") p.set("range", state.range);
+  if (state.range === "custom" && state.customFrom) p.set("from", state.customFrom);
+  if (state.range === "custom" && state.customTo) p.set("to", state.customTo);
   if (state.source) p.set("source", state.source);
   if (state.user) p.set("user", state.user);
   if (state.model) p.set("model", state.model);
@@ -133,7 +145,11 @@ export function App() {
   const setup = useDisclosure();
   const [live, setLive] = useState(false);
   const [state, update] = useUrlState();
-  const { tab, range, source, user, model, session, transcript } = state;
+  const { tab, range, customFrom, customTo, source, user, model, session, transcript } = state;
+  const custom = useMemo<CustomRange>(
+    () => ({ from: customFrom ? Number(customFrom) : undefined, to: customTo ? Number(customTo) : undefined }),
+    [customFrom, customTo]
+  );
   const [clock, setClock] = useState(0);
   const [authNonce, setAuthNonce] = useState(0);
   const authToken = useMemo(() => getAuthToken(), [authNonce]);
@@ -149,16 +165,21 @@ export function App() {
     return () => window.clearInterval(id);
   }, [range]);
 
+  const window_ = useMemo(
+    () => rangeWindow(range, custom),
+    // clock intentionally re-derives the window edge for live ranges
+    [range, custom, clock]
+  );
   const filters = useMemo<Filters>(
     () => ({
-      from: rangeWindow(range).from,
+      from: window_.from,
+      to: window_.to,
       source: source || undefined,
       user: user || undefined,
       model: model || undefined,
       session: session ? Number(session) : undefined
     }),
-    // clock intentionally re-derives `from` for live ranges
-    [range, source, user, model, session, clock]
+    [window_, source, user, model, session]
   );
 
   useEffect(() => {
@@ -193,7 +214,7 @@ export function App() {
 
   if (transcript) {
     return (
-      <main className="mx-auto w-full max-w-[1440px] p-7 text-foreground">
+      <main className="mx-auto w-full max-w-[1440px] px-3 py-3 text-foreground">
         <Suspense fallback={<EmptyState>Loading transcript...</EmptyState>}>
           <TranscriptView id={Number(transcript)} onBack={() => update({ transcript: "" })} />
         </Suspense>
@@ -202,8 +223,8 @@ export function App() {
   }
 
   return (
-    <main className="mx-auto w-full max-w-[1440px] p-7 text-foreground">
-      <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
+    <main className="mx-auto w-full max-w-[1440px] px-3 py-3 text-foreground">
+      <header className="mb-4 flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-6">
           <div className="flex items-center gap-3">
             <FiniusLogo size={44} />
@@ -232,15 +253,11 @@ export function App() {
         </div>
       </header>
 
-      <Card className="mb-4" shadow="sm">
-        <CardBody className="flex flex-row flex-wrap items-end gap-5">
+      <Card className="mb-3" shadow="sm">
+        <CardBody className="flex flex-row flex-wrap items-end gap-4 p-3">
           <div className="flex flex-col gap-1.5">
-            <span className="text-[0.7rem] font-extrabold uppercase tracking-wide text-default-500">Time range</span>
-            <Tabs aria-label="Time range" size="sm" radius="full" selectedKey={range} onSelectionChange={(key) => update({ range: key as RangeKey })}>
-              {RANGES.map((item) => (
-                <Tab key={item.key} title={item.label} />
-              ))}
-            </Tabs>
+            <span className="text-[0.7rem] font-extrabold uppercase tracking-wide text-default-500">Date range</span>
+            <TimeRangePicker range={range} custom={custom} onChange={update} />
           </div>
           <Select
             label="Source"
@@ -288,7 +305,9 @@ export function App() {
         </CardBody>
       </Card>
 
-      {tab === "home" && <HomeView filters={filters} range={range} onNavigate={(next) => update({ tab: next })} onFilter={update} />}
+      {tab === "home" && (
+        <HomeView filters={filters} range={range} granularity={window_.granularity} onNavigate={(next) => update({ tab: next })} onFilter={update} />
+      )}
       {tab === "sessions" && (
         <SessionsView
           filters={filters}
@@ -342,6 +361,92 @@ export function App() {
   );
 }
 
+function formatRangeDay(ms: number): string {
+  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+function toCalendarDate(ms: number): CalendarDate {
+  const date = new Date(ms);
+  return new CalendarDate(date.getFullYear(), date.getMonth() + 1, date.getDate());
+}
+
+function dayStartMs(value: DateValue): number {
+  return new Date(value.year, value.month - 1, value.day).getTime();
+}
+
+// Header time-range control: inline presets, a custom calendar popover, and the "X to date" dropdown.
+// Each surfaces the active selection and writes back through `onChange` (the URL-backed state setter).
+function TimeRangePicker({
+  range,
+  custom,
+  onChange
+}: {
+  range: RangeKey;
+  custom: CustomRange;
+  onChange: (patch: Partial<ViewState>) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const isCustom = range === "custom" && custom.from !== undefined;
+  // `custom.to` is an exclusive next-midnight bound; the calendar/label want the inclusive last day.
+  const customEndMs = (custom.to ?? Date.now()) - 1;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <ButtonGroup size="sm" radius="full" variant="bordered">
+        {PRESET_RANGES.map((item) => {
+          const active = range === item.key;
+          return (
+            <Button
+              key={item.key}
+              className="min-w-0 px-2.5"
+              color={active ? "primary" : "default"}
+              variant={active ? "solid" : "bordered"}
+              onPress={() => onChange({ range: item.key })}
+            >
+              {item.label}
+            </Button>
+          );
+        })}
+      </ButtonGroup>
+
+      <Popover isOpen={open} onOpenChange={setOpen} placement="bottom">
+        <PopoverTrigger>
+          {isCustom && custom.from !== undefined ? (
+            <Button
+              size="sm"
+              radius="full"
+              color="primary"
+              variant="solid"
+              startContent={<CalendarDays size={15} />}
+            >
+              {`${formatRangeDay(custom.from)} – ${formatRangeDay(customEndMs)}`}
+            </Button>
+          ) : (
+            <Button isIconOnly size="sm" radius="full" variant="bordered" aria-label="Custom date range">
+              <CalendarDays size={15} />
+            </Button>
+          )}
+        </PopoverTrigger>
+        <PopoverContent>
+          <RangeCalendar
+            aria-label="Custom date range"
+            maxValue={toCalendarDate(Date.now())}
+            value={isCustom && custom.from !== undefined ? { start: toCalendarDate(custom.from), end: toCalendarDate(customEndMs) } : null}
+            onChange={(value) => {
+              if (!value) return;
+              const from = dayStartMs(value.start);
+              // Store the exclusive upper bound at the midnight after the selected end day.
+              const to = new Date(value.end.year, value.end.month - 1, value.end.day + 1).getTime();
+              onChange({ range: "custom", customFrom: String(from), customTo: String(to) });
+              setOpen(false);
+            }}
+          />
+        </PopoverContent>
+      </Popover>
+    </div>
+  );
+}
+
 function ThemeToggle() {
   const { theme, toggle } = useTheme();
   const dark = theme === "dark";
@@ -361,20 +466,22 @@ function ThemeToggle() {
 function HomeView({
   filters,
   range,
+  granularity,
   onNavigate,
   onFilter
 }: {
   filters: Filters;
   range: RangeKey;
+  granularity: Granularity;
   onNavigate: (tab: TabKey) => void;
   onFilter: (patch: Partial<ViewState>) => void;
 }) {
-  const { from, granularity } = rangeWindow(range);
+  const from = filters.from;
   const summary = useQuery({ queryKey: ["summary", filters], queryFn: () => getSummary(filters) });
   const timeseries = useQuery({
     queryKey: ["timeseries", filters, granularity],
     queryFn: () => getTimeseries(filters, granularity),
-    refetchInterval: range === "today" ? 30_000 : false
+    refetchInterval: range === "today" || range === "now" ? 30_000 : false
   });
   const modelTimeseries = useQuery({
     queryKey: ["model-timeseries", filters, granularity],
