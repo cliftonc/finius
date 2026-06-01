@@ -26,9 +26,9 @@ import {
   useDisclosure
 } from "@heroui/react";
 import { CalendarDate, type DateValue } from "@internationalized/date";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import type { ChartGPUOptions } from "chartgpu";
-import { Activity, ArrowUpRight, CalendarDays, Check, CircleDollarSign, Database, FileText, GitCommit, GitPullRequest, Layers, LogOut, Minus, Moon, Plus, Radio, RefreshCcw, Settings, Sun, Users, X } from "lucide-react";
+import { Activity, ArrowUpRight, CalendarDays, Check, CircleDollarSign, Database, FileText, GitCommit, GitPullRequest, Layers, LogOut, Minus, Moon, Plus, Radio, RefreshCcw, Settings, Sun, X } from "lucide-react";
 import { lazy, Suspense, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { AuthError, clearAuthToken, getAuthToken, getHealth, getMeta, getModels, getModelTimeseries, getPeople, getSession, getSessions, getSummary, getTimeseries, getTranscriptInfo } from "../api";
 import type { Filters, Granularity, ModelSummary, ModelTimeseriesPoint, PersonSummary, SessionSummary, Summary, TimeseriesPoint } from "../api";
@@ -139,6 +139,23 @@ const PR_SERIES = [{ name: "Pull requests", color: "#a855f7", get: (point: Times
 const COMMIT_SERIES = [{ name: "Commits", color: "#2563eb", get: (point: TimeseriesPoint) => point.commits }] as const;
 
 const PALETTE = ["#2563eb", "#0f766e", "#a855f7", "#f59e0b", "#ef4444", "#14b8a6", "#6366f1", "#ec4899"];
+const DASHBOARD_QUERY_KEYS = [
+  ["meta"],
+  ["summary"],
+  ["timeseries"],
+  ["model-timeseries"],
+  ["sessions"],
+  ["people"],
+  ["models"],
+  ["session"],
+  ["transcript-info"]
+] as const;
+
+function invalidateDashboardQueries(queryClient: QueryClient) {
+  for (const queryKey of DASHBOARD_QUERY_KEYS) {
+    void queryClient.invalidateQueries({ queryKey });
+  }
+}
 
 export function App() {
   const queryClient = useQueryClient();
@@ -154,32 +171,34 @@ export function App() {
   const [authNonce, setAuthNonce] = useState(0);
   const authToken = useMemo(() => getAuthToken(), [authNonce]);
 
-  const meta = useQuery({ queryKey: ["meta"], queryFn: getMeta });
-  const health = useQuery({ queryKey: ["health"], queryFn: getHealth, retry: false });
+  const meta = useQuery({ queryKey: ["meta"], queryFn: ({ signal }) => getMeta(signal) });
+  const health = useQuery({ queryKey: ["health"], queryFn: ({ signal }) => getHealth(signal), retry: false });
 
-  // Advance a clock for the live "Now" range so its rolling 3h window (and query key) moves
-  // forward in real time even when no new telemetry arrives.
+  // Advance a clock for the live "Now" chart window without changing the API query key every tick.
   useEffect(() => {
     if (range !== "now") return;
     const id = window.setInterval(() => setClock((value) => value + 1), 10_000);
     return () => window.clearInterval(id);
   }, [range]);
 
-  const window_ = useMemo(
+  const queryWindow = useMemo(
     () => rangeWindow(range, custom),
-    // clock intentionally re-derives the window edge for live ranges
+    [range, custom]
+  );
+  const chartWindow = useMemo(
+    () => rangeWindow(range, custom),
     [range, custom, clock]
   );
   const filters = useMemo<Filters>(
     () => ({
-      from: window_.from,
-      to: window_.to,
+      from: queryWindow.from,
+      to: queryWindow.to,
       source: source || undefined,
       user: user || undefined,
       model: model || undefined,
       session: session ? Number(session) : undefined
     }),
-    [window_, source, user, model, session]
+    [queryWindow, source, user, model, session]
   );
 
   useEffect(() => {
@@ -189,7 +208,7 @@ export function App() {
     stream.onopen = () => setLive(true);
     stream.addEventListener("ready", () => setLive(true));
     stream.addEventListener("ingest", () => {
-      void queryClient.invalidateQueries();
+      invalidateDashboardQueries(queryClient);
     });
     stream.onerror = () => setLive(false);
     return () => stream.close();
@@ -306,7 +325,14 @@ export function App() {
       </Card>
 
       {tab === "home" && (
-        <HomeView filters={filters} range={range} granularity={window_.granularity} onNavigate={(next) => update({ tab: next })} onFilter={update} />
+        <HomeView
+          filters={filters}
+          range={range}
+          chartFrom={chartWindow.from}
+          granularity={chartWindow.granularity}
+          onNavigate={(next) => update({ tab: next })}
+          onFilter={update}
+        />
       )}
       {tab === "sessions" && (
         <SessionsView
@@ -466,26 +492,27 @@ function ThemeToggle() {
 function HomeView({
   filters,
   range,
+  chartFrom,
   granularity,
   onNavigate,
   onFilter
 }: {
   filters: Filters;
   range: RangeKey;
+  chartFrom?: number;
   granularity: Granularity;
   onNavigate: (tab: TabKey) => void;
   onFilter: (patch: Partial<ViewState>) => void;
 }) {
-  const from = filters.from;
-  const summary = useQuery({ queryKey: ["summary", filters], queryFn: () => getSummary(filters) });
+  const summary = useQuery({ queryKey: ["summary", filters], queryFn: ({ signal }) => getSummary(filters, signal) });
   const timeseries = useQuery({
     queryKey: ["timeseries", filters, granularity],
-    queryFn: () => getTimeseries(filters, granularity),
+    queryFn: ({ signal }) => getTimeseries(filters, granularity, signal),
     refetchInterval: range === "today" || range === "now" ? 30_000 : false
   });
   const modelTimeseries = useQuery({
     queryKey: ["model-timeseries", filters, granularity],
-    queryFn: () => getModelTimeseries(filters, granularity),
+    queryFn: ({ signal }) => getModelTimeseries(filters, granularity, signal),
     refetchInterval: range === "today" ? 30_000 : false
   });
 
@@ -511,7 +538,7 @@ function HomeView({
   return (
     <div className="flex flex-col gap-4">
       <Kpis summary={summary.data} onNavigate={onNavigate} />
-      <UsageCharts points={timeseries.data ?? []} modelPoints={modelTimeseries.data ?? []} from={from} granularity={granularity} />
+      <UsageCharts points={timeseries.data ?? []} modelPoints={modelTimeseries.data ?? []} from={chartFrom} granularity={granularity} />
       <div className="grid gap-4 md:grid-cols-3">
         <BreakdownCard title="Models" rows={breakdowns.models} onSelect={(label) => onFilter({ model: label })} />
         <BreakdownCard title="Users" rows={breakdowns.users} onSelect={(label) => onFilter({ user: label })} />
@@ -530,19 +557,19 @@ function SessionsView({
   onOpen: (id: number) => void;
   onViewTranscript: (id: number) => void;
 }) {
-  const sessions = useQuery({ queryKey: ["sessions", filters], queryFn: () => getSessions(filters) });
+  const sessions = useQuery({ queryKey: ["sessions", filters], queryFn: ({ signal }) => getSessions(filters, signal) });
   if (sessions.isLoading) return <EmptyState>Loading sessions...</EmptyState>;
   return <SessionsTable sessions={sessions.data ?? []} onOpen={onOpen} onViewTranscript={onViewTranscript} />;
 }
 
 function PeopleView({ filters, onOpen }: { filters: Filters; onOpen: (user: string) => void }) {
-  const people = useQuery({ queryKey: ["people", filters], queryFn: () => getPeople(filters) });
+  const people = useQuery({ queryKey: ["people", filters], queryFn: ({ signal }) => getPeople(filters, signal) });
   if (people.isLoading) return <EmptyState>Loading people...</EmptyState>;
   return <PeopleTable people={people.data ?? []} onOpen={onOpen} />;
 }
 
 function ModelsView({ filters, onOpen }: { filters: Filters; onOpen: (model: string) => void }) {
-  const models = useQuery({ queryKey: ["models", filters], queryFn: () => getModels(filters) });
+  const models = useQuery({ queryKey: ["models", filters], queryFn: ({ signal }) => getModels(filters, signal) });
   if (models.isLoading) return <EmptyState>Loading models...</EmptyState>;
   return <ModelsTable models={models.data ?? []} onOpen={onOpen} />;
 }
@@ -1044,8 +1071,8 @@ function ModelsTable({ models, onOpen }: { models: ModelSummary[]; onOpen: (mode
 // Sessions are unbounded, so the active session drill-down is shown as a removable chip rather than a
 // dropdown. Resolves the numeric id to a friendly "shortId · user" label via the session detail route.
 function SessionFilterChip({ id, onClear, onView }: { id: number; onClear: () => void; onView: () => void }) {
-  const session = useQuery({ queryKey: ["session", id], queryFn: () => getSession(id) });
-  const transcript = useQuery({ queryKey: ["transcript-info", id], queryFn: () => getTranscriptInfo(id) });
+  const session = useQuery({ queryKey: ["session", id], queryFn: ({ signal }) => getSession(id, signal) });
+  const transcript = useQuery({ queryKey: ["transcript-info", id], queryFn: ({ signal }) => getTranscriptInfo(id, signal) });
   const data = session.data;
   const label = data
     ? `${compact(data.sessionId)} · ${userLabel({ user: data.userEmail ?? data.userAccountId ?? data.userId, email: data.userEmail, displayName: data.displayName, githubLogin: data.githubLogin })}`

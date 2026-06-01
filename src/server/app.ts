@@ -155,7 +155,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
 
   app.post("/api/import/jsonl", async (c) => {
     const contentType = c.req.header("content-type") ?? "";
-    let content = "";
+    let content: string;
     let source = "manual-jsonl";
     let sessionId: string | undefined;
     let format: TranscriptFormat | undefined;

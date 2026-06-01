@@ -58,36 +58,36 @@ function withFilters(path: string, filters: Filters = {}, extra: Record<string, 
   return query ? `${path}?${query}` : path;
 }
 
-export async function getSummary(filters: Filters = {}) {
-  return getJson<Summary>(withFilters("/api/metrics/summary", filters));
+export async function getSummary(filters: Filters = {}, signal?: AbortSignal) {
+  return getJson<Summary>(withFilters("/api/metrics/summary", filters), signal);
 }
 
-export async function getTimeseries(filters: Filters = {}, granularity: Granularity = "hour") {
-  return getJson<TimeseriesPoint[]>(withFilters("/api/metrics/timeseries", filters, { granularity }));
+export async function getTimeseries(filters: Filters = {}, granularity: Granularity = "hour", signal?: AbortSignal) {
+  return getJson<TimeseriesPoint[]>(withFilters("/api/metrics/timeseries", filters, { granularity }), signal);
 }
 
-export async function getModelTimeseries(filters: Filters = {}, granularity: Granularity = "hour") {
-  return getJson<ModelTimeseriesPoint[]>(withFilters("/api/metrics/timeseries/by-model", filters, { granularity }));
+export async function getModelTimeseries(filters: Filters = {}, granularity: Granularity = "hour", signal?: AbortSignal) {
+  return getJson<ModelTimeseriesPoint[]>(withFilters("/api/metrics/timeseries/by-model", filters, { granularity }), signal);
 }
 
-export async function getSessions(filters: Filters = {}) {
-  return getJson<SessionSummary[]>(withFilters("/api/sessions", filters));
+export async function getSessions(filters: Filters = {}, signal?: AbortSignal) {
+  return getJson<SessionSummary[]>(withFilters("/api/sessions", filters), signal);
 }
 
-export async function getPeople(filters: Filters = {}) {
-  return getJson<PersonSummary[]>(withFilters("/api/people", filters));
+export async function getPeople(filters: Filters = {}, signal?: AbortSignal) {
+  return getJson<PersonSummary[]>(withFilters("/api/people", filters), signal);
 }
 
-export async function getModels(filters: Filters = {}) {
-  return getJson<ModelSummary[]>(withFilters("/api/models", filters));
+export async function getModels(filters: Filters = {}, signal?: AbortSignal) {
+  return getJson<ModelSummary[]>(withFilters("/api/models", filters), signal);
 }
 
-export async function getSession(id: number) {
-  return getJson<SessionSummary>(`/api/sessions/${id}`);
+export async function getSession(id: number, signal?: AbortSignal) {
+  return getJson<SessionSummary>(`/api/sessions/${id}`, signal);
 }
 
-export async function getTranscriptInfo(id: number): Promise<TranscriptInfo | null> {
-  const response = await fetch(transcriptUrl(id, "info"), { headers: authHeaders() });
+export async function getTranscriptInfo(id: number, signal?: AbortSignal): Promise<TranscriptInfo | null> {
+  const response = await fetch(transcriptUrl(id, "info"), { headers: authHeaders(), signal });
   if (response.status === 404) return null;
   if (response.status === 401) {
     clearAuthToken();
@@ -101,8 +101,8 @@ export function transcriptUrl(id: number, kind?: "info") {
   return `/api/sessions/${id}/transcript${kind ? `/${kind}` : ""}`;
 }
 
-export async function getTranscript(id: number): Promise<string | null> {
-  const response = await fetch(transcriptUrl(id), { headers: authHeaders() });
+export async function getTranscript(id: number, signal?: AbortSignal): Promise<string | null> {
+  const response = await fetch(transcriptUrl(id), { headers: authHeaders(), signal });
   if (response.status === 404) return null;
   if (response.status === 401) {
     clearAuthToken();
@@ -112,8 +112,8 @@ export async function getTranscript(id: number): Promise<string | null> {
   return response.text();
 }
 
-export async function getMeta() {
-  return getJson<FilterOptions>("/api/meta");
+export async function getMeta(signal?: AbortSignal) {
+  return getJson<FilterOptions>("/api/meta", signal);
 }
 
 // Thrown on a 401 so the UI can show the login screen instead of a generic error.
@@ -126,8 +126,8 @@ export class AuthError extends Error {
 
 export type Health = { ok: boolean; now: number; secure: boolean };
 
-export async function getHealth(): Promise<Health> {
-  const response = await fetch("/api/health");
+export async function getHealth(signal?: AbortSignal): Promise<Health> {
+  const response = await fetch("/api/health", { signal });
   if (!response.ok) throw new Error(await response.text());
   return response.json() as Promise<Health>;
 }
@@ -146,8 +146,8 @@ export async function login(password: string): Promise<boolean> {
   return response.ok;
 }
 
-async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: authHeaders() });
+async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(url, { headers: authHeaders(), signal });
   if (response.status === 401) {
     clearAuthToken();
     throw new AuthError();

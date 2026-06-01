@@ -1,0 +1,81 @@
+name: Publish to NPM
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  id-token: write  # Required for npm trusted publishing (OIDC) + provenance
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # Don't re-run tests/build here — wait for the CI run that already ran
+      # when this commit landed on main, and publish only if it passed.
+      - name: Wait for CI to pass
+        run: |
+          COMMIT_SHA=${{ github.sha }}
+          echo "Waiting for CI to pass on commit $COMMIT_SHA..."
+
+          MAX_WAIT=600  # 10 minutes
+          INTERVAL=15
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            RUN_JSON=$(gh run list --commit $COMMIT_SHA --workflow ci.yml --json databaseId,status,conclusion --jq '.[0]')
+
+            if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "null" ]; then
+              echo "No CI run found yet for $COMMIT_SHA, waiting... (${ELAPSED}s)"
+              sleep $INTERVAL
+              ELAPSED=$((ELAPSED + INTERVAL))
+              continue
+            fi
+
+            STATUS=$(echo "$RUN_JSON" | jq -r '.status')
+            CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
+            RUN_ID=$(echo "$RUN_JSON" | jq -r '.databaseId')
+
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "CI passed for commit $COMMIT_SHA (run $RUN_ID)"
+                exit 0
+              else
+                echo "CI failed for commit $COMMIT_SHA (conclusion: $CONCLUSION, run $RUN_ID)"
+                exit 1
+              fi
+            fi
+
+            echo "CI still running (status: $STATUS, run $RUN_ID), waiting... (${ELAPSED}s)"
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "Timed out waiting for CI on commit $COMMIT_SHA after ${MAX_WAIT}s"
+          exit 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      # Trusted publishing requires npm 11.5.1+; ensure a recent CLI.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `prepublishOnly` builds dist/ before packing. With id-token: write and
+      # no NODE_AUTH_TOKEN, npm uses OIDC trusted publishing (+ provenance).
+      - name: Publish to NPM
+        run: npm publish --access public

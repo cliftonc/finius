@@ -1,8 +1,8 @@
 import { Button, Card, CardBody, Input } from "@heroui/react";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Download, Search } from "lucide-react";
+import { ArrowLeft, Search } from "lucide-react";
 import { useMemo, useState } from "react";
-import { getSession, getTranscript, getTranscriptInfo, transcriptUrl } from "../api";
+import { getSession, getTranscript, getTranscriptInfo } from "../api";
 import { parseTranscript } from "../timeline/claudeJsonl";
 import { isCodexRollout, parseCodexRollout } from "../timeline/codexRollout";
 import { processMessages } from "../timeline/processor";
@@ -30,9 +30,9 @@ export function TranscriptView({ id, onBack }: { id: number; onBack: () => void 
   const [order, setOrder] = useState<Order>("oldest");
   const [query, setQuery] = useState("");
 
-  const session = useQuery({ queryKey: ["session", id], queryFn: () => getSession(id) });
-  const info = useQuery({ queryKey: ["transcript-info", id], queryFn: () => getTranscriptInfo(id) });
-  const transcript = useQuery({ queryKey: ["transcript", id], queryFn: () => getTranscript(id) });
+  const session = useQuery({ queryKey: ["session", id], queryFn: ({ signal }) => getSession(id, signal) });
+  const info = useQuery({ queryKey: ["transcript-info", id], queryFn: ({ signal }) => getTranscriptInfo(id, signal) });
+  const transcript = useQuery({ queryKey: ["transcript", id], queryFn: ({ signal }) => getTranscript(id, signal) });
 
   const items = useMemo(() => {
     if (!transcript.data) return [];
@@ -86,18 +86,6 @@ export function TranscriptView({ id, onBack }: { id: number; onBack: () => void 
             onPress={() => setOrder((o) => (o === "oldest" ? "newest" : "oldest"))}
           >
             {order === "oldest" ? "Oldest first" : "Newest first"}
-          </Button>
-          <Button
-            as="a"
-            size="sm"
-            radius="full"
-            variant="flat"
-            href={transcriptUrl(id)}
-            target="_blank"
-            rel="noreferrer"
-            startContent={<Download size={14} />}
-          >
-            Raw
           </Button>
         </div>
       </div>
