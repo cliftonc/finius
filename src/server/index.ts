@@ -71,12 +71,19 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   // Resolve the built client relative to this module so the UI is served no matter the cwd
   // (e.g. when launched via `npx @cliftonc/finius serve`). Falls back to a cwd-relative path for
   // repo-root invocations like `npm start`.
-  const moduleDir = dirname(fileURLToPath(import.meta.url));
-  const clientDist = [join(moduleDir, "..", "client"), resolve("dist/client")].find((dir) => existsSync(dir));
+  const modulePath = fileURLToPath(import.meta.url);
+  const moduleDir = dirname(modulePath);
+  const runningFromSource = modulePath.endsWith(join("src", "server", "index.ts"));
+  const clientDist = runningFromSource
+    ? undefined
+    : [join(moduleDir, "..", "client"), resolve("dist/client")].find((dir) => existsSync(join(dir, "index.html")));
 
   if (clientDist) {
     app.use("/*", serveStatic({ root: clientDist }));
     app.get("*", serveStatic({ path: join(clientDist, "index.html") }));
+  } else {
+    const devClientUrl = process.env.FINIUS_DEV_CLIENT_URL ?? "http://localhost:5173";
+    app.get("/", (c) => c.redirect(devClientUrl));
   }
 
   // Effective transcript location: the explicit blob dir, else the adapter's default of

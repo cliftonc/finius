@@ -36,6 +36,7 @@
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
     "build": "tsc -p tsconfig.build.json && vite build",
+    "build-link": "npm run build && npm install -g .",
     "start": "node dist/server/index.js",
     "cli": "tsx src/cli/index.ts",
     "lint": "eslint 'src/**/*.{ts,tsx}' 'tests/**/*.ts'",

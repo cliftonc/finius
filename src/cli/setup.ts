@@ -230,7 +230,7 @@ async function startCliAuthCallback(): Promise<{ returnTo: string; waitForToken:
       return;
     }
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end("<!doctype html><title>Finius login complete</title><body><h1>Finius login complete</h1><p>You can return to your terminal.</p></body>");
+    res.end(cliCallbackPage());
     resolveToken(token);
     server.close();
   });
@@ -254,6 +254,105 @@ async function startCliAuthCallback(): Promise<{ returnTo: string; waitForToken:
       return token;
     }
   };
+}
+
+// The page shown in the browser once the CLI login completes. Self-contained (no external assets
+// beyond the same Google Fonts the dashboard uses): the real Finius mark + wordmark from the
+// dashboard header (logo left of "Finius" in Fraunces), light theme, fully centered.
+export function cliCallbackPage(): string {
+  // The exact artwork from src/client/ui/FiniusLogo.tsx / public/favicon.svg.
+  const logo = `<svg class="logo" viewBox="0 0 72 72" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <g>
+      <rect x="29.1449" y="23.3542" width="18" height="28.5815" transform="matrix(0.7071 -0.7071 0.7071 0.7071 -15.4466 37.9985)" fill="#FFFFFF"/>
+      <path fill="#FFFFFF" stroke="none" stroke-linecap="round" stroke-miterlimit="10" stroke-width="2" d="M13.9792,56.7778 c0.3645,0.3645,0.8533,0.5189,1.325,0.4674c0,0,8.9017,0.0515,13.9615-4.8025C29.33,52.387,29.39,52.327,29.45,52.2669 c1.8352-1.8352,1.8309-4.8068,0-6.6377c-1.831-1.831-4.8025-1.8352-6.6377,0l-8.8331,8.8331 C13.3403,55.1013,13.3403,56.1389,13.9792,56.7778z"/>
+      <ellipse cx="34.4281" cy="24.1507" rx="2.328" ry="2.328" transform="matrix(0.7071 -0.7071 0.7071 0.7071 -6.9934 31.4179)" fill="#5C9E31"/>
+      <ellipse cx="52.0767" cy="41.3611" rx="2.328" ry="2.328" transform="matrix(0.7071 -0.7071 0.7071 0.7071 -13.9938 48.9382)" fill="#5C9E31"/>
+      <ellipse cx="24.3188" cy="34.2599" rx="2.328" ry="2.328" transform="matrix(0.7071 -0.7071 0.7071 0.7071 -17.1026 27.2305)" fill="#5C9E31"/>
+      <ellipse cx="41.5796" cy="51.5206" rx="2.328" ry="2.328" transform="matrix(0.7071 -0.7071 0.7071 0.7071 -24.2522 44.4912)" fill="#5C9E31"/>
+      <rect x="42.8977" y="18.1717" width="1.67" height="27.3291" transform="matrix(-0.7071 0.7071 -0.7071 -0.7071 97.1681 23.4242)" fill="#5C9E31"/>
+      <rect x="31.153" y="29.4453" width="1.67" height="27.3291" transform="matrix(-0.7071 0.7071 -0.7071 -0.7071 85.0901 50.9742)" fill="#5C9E31"/>
+      <rect x="27.9561" y="19.0196" width="1.6895" height="18.295" transform="matrix(0.7071 0.7071 -0.7071 0.7071 28.3527 -12.1153)" fill="#5C9E31"/>
+      <rect x="46.7884" y="37.8519" width="1.6895" height="18.295" transform="matrix(0.7071 0.7071 -0.7071 0.7071 47.185 -19.9159)" fill="#5C9E31"/>
+      <ellipse cx="38.1014" cy="37.4676" rx="5.7418" ry="9.277" transform="matrix(0.7071 -0.7071 0.7071 0.7071 -15.334 37.9158)" fill="#5C9E31"/>
+      <path fill="#FFFFFF" stroke="none" stroke-linecap="round" stroke-linejoin="round" stroke-miterlimit="10" stroke-width="2" d="M47.425,35.1923L35.6923,46.925c-0.0422,0.0422-0.0886,0.0725-0.1392,0.0987c-0.2062,0.1007-0.4716,0.0578-0.6501-0.1206 l-6.2227-6.2227c-0.1785-0.1785-0.2214-0.4439-0.1206-0.6501c0.0262-0.0505,0.0565-0.097,0.0987-0.1392L40.391,28.1583 c0.0422-0.0422,0.0887-0.0725,0.1392-0.0987c0.2062-0.1007,0.4716-0.0578,0.6501,0.1206l6.2227,6.2227 c0.1785,0.1785,0.2214,0.4439,0.1206,0.6501C47.4974,35.1036,47.4672,35.1501,47.425,35.1923z"/>
+      <path fill="#FFFFFF" stroke="none" stroke-linecap="round" stroke-miterlimit="10" stroke-width="2" d="M57.1856,13.5714 c0.3645,0.3645,0.5189,0.8533,0.4674,1.325c0,0,0.0515,8.9017-4.8025,13.9615c-0.0557,0.0643-0.1158,0.1243-0.1758,0.1844 c-1.8352,1.8352-4.8068,1.8309-6.6377,0c-1.831-1.831-1.8352-4.8025,0-6.6377l8.8331-8.8331 C55.5091,12.9325,56.5467,12.9325,57.1856,13.5714z"/>
+    </g>
+    <g>
+      <path fill="none" stroke="#000000" stroke-linecap="round" stroke-miterlimit="10" stroke-width="2" d="M13.9792,56.7778 c0.3645,0.3645,0.8533,0.5189,1.325,0.4674c0,0,8.9017,0.0515,13.9615-4.8025C29.33,52.387,29.39,52.327,29.45,52.2669 c1.8352-1.8352,1.8309-4.8068,0-6.6377c-1.831-1.831-4.8025-1.8352-6.6377,0l-8.8331,8.8331 C13.3403,55.1013,13.3403,56.1389,13.9792,56.7778z"/>
+      <path fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round" stroke-miterlimit="10" stroke-width="2" d="M41.0551,53.3579L22.4424,34.7451c-0.3905-0.3905-0.3905-1.0237,0-1.4142l11.2424-11.2424c0.3905-0.3905,1.0237-0.3905,1.4142,0 l18.6127,18.6127c0.3905,0.3905,0.3905,1.0237,0,1.4142L42.4693,53.3579C42.0788,53.7484,41.4456,53.7484,41.0551,53.3579z"/>
+      <path fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round" stroke-miterlimit="10" stroke-width="2" d="M47.425,35.1923L35.6923,46.925c-0.0422,0.0422-0.0886,0.0725-0.1392,0.0987c-0.2062,0.1007-0.4716,0.0578-0.6501-0.1206 l-6.2227-6.2227c-0.1785-0.1785-0.2214-0.4439-0.1206-0.6501c0.0262-0.0505,0.0565-0.097,0.0987-0.1392L40.391,28.1583 c0.0422-0.0422,0.0887-0.0725,0.1392-0.0987c0.2062-0.1007,0.4716-0.0578,0.6501,0.1206l6.2227,6.2227 c0.1785,0.1785,0.2214,0.4439,0.1206,0.6501C47.4974,35.1036,47.4672,35.1501,47.425,35.1923z"/>
+      <path fill="none" stroke="#000000" stroke-linecap="round" stroke-miterlimit="10" stroke-width="2" d="M57.1856,13.5714 c0.3645,0.3645,0.5189,0.8533,0.4674,1.325c0,0,0.0515,8.9017-4.8025,13.9615c-0.0557,0.0643-0.1158,0.1243-0.1758,0.1844 c-1.8352,1.8352-4.8068,1.8309-6.6377,0c-1.831-1.831-1.8352-4.8025,0-6.6377l8.8331-8.8331 C55.5091,12.9325,56.5467,12.9325,57.1856,13.5714z"/>
+    </g>
+  </svg>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Finius — login complete</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    min-height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: radial-gradient(1100px 560px at 50% -8%, #f1f6ee 0%, #fafafa 55%, #f4f4f5 100%);
+    color: #18181b;
+  }
+  .card {
+    width: 100%;
+    max-width: 440px;
+    background: #ffffff;
+    border: 1px solid #ececec;
+    border-radius: 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 12px 32px rgba(0,0,0,.06);
+    padding: 40px 32px;
+    text-align: center;
+  }
+  .brand { display: flex; align-items: center; justify-content: center; gap: 12px; }
+  .logo { width: 44px; height: 44px; display: block; }
+  .wordmark {
+    font-family: Fraunces, ui-serif, Georgia, "Times New Roman", serif;
+    font-optical-sizing: auto;
+    font-weight: 600;
+    font-size: 44px;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    color: #18181b;
+  }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    margin-top: 22px; padding: 6px 14px;
+    background: #eef7e9; color: #3f7d23;
+    border: 1px solid #d8eccb; border-radius: 999px;
+    font-size: 14px; font-weight: 600;
+  }
+  .badge svg { width: 16px; height: 16px; }
+  p { margin: 18px 0 0; color: #71717a; font-size: 15px; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="brand">
+      ${logo}
+      <span class="wordmark">Finius</span>
+    </div>
+    <div class="badge">
+      <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10.5l4 4 8-9" stroke="#3f7d23" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Login complete
+    </div>
+    <p>You're signed in. Close this tab and return to your terminal — setup will continue automatically.</p>
+  </main>
+</body>
+</html>`;
 }
 
 // Detect a user identity from the local agent state and confirm it with the user, so the hook/backfill
