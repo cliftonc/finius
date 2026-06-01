@@ -139,8 +139,20 @@ type AuthState = { authPassword?: string; authToken?: string };
 async function configureAuth(serverUrl: string, health: ServerHealth, current: AuthState): Promise<AuthState> {
   if (health.secure) {
     if (current.authToken) {
-      log.info("Server requires authentication — keeping the client token already in your config.");
-      return current;
+      // A token is bound to the server that minted it. If the server changed (new password, fresh DB,
+      // a different instance behind the same URL) the token is stale — verify it before trusting it,
+      // and fall through to re-authenticate if it was rejected. A network blip leaves it in place.
+      const status = await verifyToken(serverUrl, current.authToken);
+      if (status === "ok") {
+        log.info("Server requires authentication — your existing client token still works.");
+        return current;
+      }
+      if (status === "unknown") {
+        log.warn("Couldn't verify your client token (the server didn't answer) — keeping it for now.");
+        return current;
+      }
+      log.warn("Your saved client token was rejected by this server — it looks like the server changed. Re-authenticating to mint a fresh one.");
+      current = { ...current, authToken: undefined };
     }
     if (current.authPassword) {
       const token = await login(serverUrl, current.authPassword);
@@ -459,6 +471,24 @@ async function configureOAuth(serverUrl: string, current: FiniusConfig | null): 
   }
   note(`${serverUrl}/api/auth/github/callback`, "GitHub OAuth callback URL");
   return { github: { enabled: true, clientId, clientSecret, requiredOrg } };
+}
+
+// Check whether a client token still authenticates against the server, by hitting a protected
+// endpoint. "ok" = accepted (200); "rejected" = the server refused it (401/403, e.g. it was revoked or
+// the server changed); "unknown" = couldn't tell (network error / unexpected status) so the caller
+// should keep the token rather than lock the user out over a transient failure.
+async function verifyToken(serverUrl: string, token: string): Promise<"ok" | "rejected" | "unknown"> {
+  try {
+    const res = await fetch(`${serverUrl}/api/meta`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5_000)
+    });
+    if (res.ok) return "ok";
+    if (res.status === 401 || res.status === 403) return "rejected";
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 // Exchange the master password for a client session token at the login endpoint. Returns null on a
