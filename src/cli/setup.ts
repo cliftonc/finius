@@ -157,8 +157,9 @@ async function configureAuth(serverUrl: string, health: ServerHealth, current: A
       return { authToken: browserToken };
     }
     for (;;) {
+      // @clack's password prompt yields undefined on an empty submit — coalesce before trimming.
       const entered = ask(await passwordPrompt({ message: "Server password" }));
-      const trimmed = entered.trim();
+      const trimmed = (entered ?? "").trim();
       if (!trimmed) {
         if (ask(await confirm({ message: "No password entered — skip auth setup for now?", initialValue: false }))) {
           return current;
@@ -435,11 +436,14 @@ async function configureOAuth(serverUrl: string, current: FiniusConfig | null): 
       initialValue: existing?.clientId
     })
   ).trim();
-  const clientSecret = ask(
+  // An empty submit yields undefined from @clack's password prompt; coalesce so .trim() is safe and an
+  // empty entry falls through to the existing secret (the "leave empty to keep existing" affordance).
+  const enteredSecret = ask(
     await passwordPrompt({
       message: existing?.clientSecret ? "GitHub OAuth client secret (leave empty to keep existing)" : "GitHub OAuth client secret"
     })
-  ).trim() || existing?.clientSecret || "";
+  );
+  const clientSecret = (enteredSecret ?? "").trim() || existing?.clientSecret || "";
   const requiredOrg = ask(
     await text({
       message: "Required GitHub organization",
