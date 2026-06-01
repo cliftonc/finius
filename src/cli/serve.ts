@@ -21,20 +21,24 @@ export async function runServe(argv: string[]): Promise<number> {
     return 1;
   }
 
-  // Derive the listen target from the configured server URL (set in `finius setup`) so the dashboard
-  // the CLI points users at is the one we actually serve — port AND bind host. A loopback URL stays on
-  // loopback; a real host/IP means "reachable on the network", so we bind all interfaces (0.0.0.0).
-  // Explicit flags/env win: --port, --host, FINIUS_HOST.
-  const target = serveTargetFromConfig();
-  if (port === undefined) port = target.port;
-  const hostname = host ?? process.env.FINIUS_HOST ?? target.hostname;
+  const config = loadConfig();
+
+  // Resolve the bind target. The public `serverUrl` only contributes a *default* — it never overrides
+  // an explicit listen address — because behind a reverse proxy the public origin (https, no port) is
+  // not what this Node process should bind to. Precedence:
+  //   port: --port flag > config.listen.port > explicit port in serverUrl > startServer's 8787 default
+  //   host: --host flag > FINIUS_HOST env > config.listen.host > host derived from serverUrl
+  //         (loopback URL → 127.0.0.1, any other host → 0.0.0.0)
+  // The human-facing banner still shows the public serverUrl, not the bind address.
+  const target = config ? serveTargetFromServerUrl(config.serverUrl) : LOCAL_TARGET;
+  if (port === undefined) port = config?.listen?.port ?? target.port;
+  const hostname = host ?? process.env.FINIUS_HOST ?? config?.listen?.host ?? target.hostname;
 
   const dataDir = join(FINIUS_HOME, "data");
   mkdirSync(dataDir, { recursive: true });
 
   // Secure Mode: if `finius setup` saved a master password on this (owner) machine, run the server
   // locked. An explicit env var still wins (handy for one-off overrides).
-  const config = loadConfig();
   const authSecret = process.env.FINIUS_AUTH_PASSWORD ?? config?.authPassword;
   const github = config?.auth?.oauth?.github;
   const githubEnabled = !!(github?.enabled && github.clientId && github.clientSecret && github.requiredOrg);
@@ -79,22 +83,25 @@ type ServeTarget = { port: number | undefined; hostname: string; displayUrl: str
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
-// Derive port + bind host + a human-facing URL from the saved serverUrl (e.g.
-// http://192.168.178.180:8787 → port 8787, bind 0.0.0.0, display http://192.168.178.180:8787).
-// A loopback URL keeps the safe 127.0.0.1 default; any other host means the server is meant to be
-// reachable on the network, so we bind every interface (0.0.0.0) — robust whether the configured host
-// is an IP or a DNS name that points back at this box.
-function serveTargetFromConfig(): ServeTarget {
-  const config = loadConfig();
-  if (!config) return { port: undefined, hostname: "127.0.0.1", displayUrl: undefined };
+// The bind target when there's no config yet: safe loopback default, no public banner URL.
+const LOCAL_TARGET: ServeTarget = { port: undefined, hostname: "127.0.0.1", displayUrl: undefined };
+
+// Derive a *default* bind port/host + the human-facing banner URL from the saved public serverUrl
+// (e.g. http://192.168.178.180:8787 -> port 8787, bind 0.0.0.0, display http://192.168.178.180:8787).
+// Only an explicit port in the URL contributes a bind port — scheme defaults like https:443 are
+// proxy/public details, not what this Node process should listen on (so a portless URL yields
+// `port: undefined`, leaving config.listen / the 8787 default to decide). A loopback URL keeps the
+// safe 127.0.0.1 default; any other host means "reachable on the network", so we bind every interface
+// (0.0.0.0) — robust whether the configured host is an IP or a DNS name that points back at this box.
+export function serveTargetFromServerUrl(serverUrl: string): ServeTarget {
   try {
-    const url = new URL(config.serverUrl);
-    const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
+    const url = new URL(serverUrl);
+    const port = url.port ? Number(url.port) : undefined;
     const loopback = LOOPBACK_HOSTS.has(url.hostname.toLowerCase());
     return {
       port,
       hostname: loopback ? "127.0.0.1" : "0.0.0.0",
-      displayUrl: loopback ? undefined : config.serverUrl.replace(/\/+$/, "")
+      displayUrl: loopback ? undefined : serverUrl.replace(/\/+$/, "")
     };
   } catch {
     return { port: undefined, hostname: "127.0.0.1", displayUrl: undefined };

@@ -17,7 +17,18 @@ export type StoredIdentity = {
 };
 
 export type FiniusConfig = {
+  // The public, client-facing base URL — what OTEL exporters, the upload hook, OAuth callbacks, the
+  // dashboard banner, and `doctor` reachability checks all point at. Behind a TLS-terminating reverse
+  // proxy this is the external URL (e.g. https://finius.cliftonc.nl), which is NOT the address the
+  // Node process binds to — that's `listen`.
   serverUrl: string;
+  // Optional explicit bind target for `finius serve`, decoupled from the public `serverUrl`. Needed
+  // when the public URL is a proxied origin (https, no port) but the process must listen on a plain
+  // local port. Omitted for the localhost/LAN case, where the bind is derived from `serverUrl`.
+  listen?: {
+    host?: string;
+    port?: number;
+  };
   // The master password — only present on the machine that set up (owns) a Secure Mode server. It's
   // accepted directly as a credential, so the owner needs no minted token.
   authPassword?: string;

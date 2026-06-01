@@ -77,7 +77,8 @@ All optional — set as environment variables before `finius serve`:
 | --- | --- | --- |
 | `FINIUS_DB_PATH` | `~/.finius/data/finius.sqlite` | SQLite location |
 | `FINIUS_BLOB_DIR` | `~/.finius/transcripts` | imported transcript storage |
-| `PORT` / `--port N` | `8787` (from `serverUrl`) | listen port |
+| `--port N` / `PORT` | `8787` (or the explicit port in `serverUrl`) | bind port |
+| `--host H` / `FINIUS_HOST` | derived from `serverUrl` (loopback → `127.0.0.1`, else `0.0.0.0`) | bind host |
 | `FINIUS_RAW_PAYLOADS` | `retain` | set `off` to store only batch hashes |
 | `FINIUS_PRICING_FETCH` | `on` | set `off` to stay fully offline (uses cached prices) |
 
@@ -101,8 +102,10 @@ options:
 
 ### Step 2 — Configure + run on the server
 
-On the server, run setup and point it at the **public URL** you'll serve (this is important — Finius
-derives the telemetry endpoints, the OAuth callback, and cookie `Secure` flag from it):
+On the server, run setup and point it at the **public URL** you'll serve. `serverUrl` is the
+**client-facing** address — Finius derives the telemetry endpoints, the OAuth callback, and the cookie
+`Secure` flag from it. It is *not* the address Finius binds to: behind a TLS-terminating proxy the
+public origin is `https://…` on 443, which the proxy owns, not Finius.
 
 ```bash
 npx @cliftonc/finius setup https://finius.example.com
@@ -112,20 +115,33 @@ npx @cliftonc/finius setup https://finius.example.com
   how teammates and the dashboard log in.
 - The password is stored as `authPassword` in `~/.finius/config.json` on this (owner) machine.
 
-Then start the server, **binding to localhost** and using an explicit local port (the proxy reaches it;
-nothing else should):
+Then start the server, **binding to localhost** on a plain local port (the proxy reaches it; nothing
+else should). Because the public `serverUrl` carries no port, `finius serve` defaults the bind to
+`8787` — set the host so Finius isn't exposed directly:
 
 ```bash
-FINIUS_HOST=127.0.0.1 finius serve --port 8787
+FINIUS_HOST=127.0.0.1 finius serve
 ```
 
-> Pass `--port 8787` explicitly. Without it, `finius serve` infers the port from `serverUrl`, and an
-> `https://` URL with no port resolves to 443 — which you don't want, since the proxy (not Finius)
-> owns 443.
+> The bind is decoupled from the public `serverUrl`. A port-less `https://` URL **no longer** resolves
+> to 443 — `finius serve` defaults to `8787` and the proxy forwards `443 → 8787`. To pin the bind
+> persistently (instead of via flags/env on every launch), add a `listen` block to
+> `~/.finius/config.json`:
+>
+> ```json
+> {
+>   "serverUrl": "https://finius.example.com",
+>   "listen": { "host": "127.0.0.1", "port": 8787 }
+> }
+> ```
+>
+> Bind precedence — port: `--port` > `listen.port` > explicit port in `serverUrl` > `8787`; host:
+> `--host` > `FINIUS_HOST` > `listen.host` > host derived from `serverUrl`.
 
-Run it under a process manager so it survives reboots — e.g. a systemd unit running
-`finius serve --port 8787` with `Environment=FINIUS_HOST=127.0.0.1` (and `FINIUS_AUTH_PASSWORD=…` if
-you prefer to inject the secret via the environment rather than the config file).
+Run it under a process manager so it survives reboots — e.g. a systemd unit running `finius serve`
+with `Environment=FINIUS_HOST=127.0.0.1` (or a `listen` block in the config), plus
+`FINIUS_AUTH_PASSWORD=…` if you prefer to inject the secret via the environment rather than the config
+file.
 
 ### Step 3 — Route a domain + terminate SSL in front
 
@@ -253,8 +269,8 @@ This is stored in `~/.finius/config.json`:
 }
 ```
 
-Start it the same way as section 2 (`FINIUS_HOST=127.0.0.1 finius serve --port 8787`) behind your
-TLS proxy. The startup panel will read:
+Start it the same way as section 2 (`FINIUS_HOST=127.0.0.1 finius serve`, or a `listen` block in the
+config) behind your TLS proxy. The startup panel will read:
 
 ```
 Auth   secure mode · GitHub OAuth, org: my-org

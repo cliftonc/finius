@@ -27,9 +27,17 @@ npx finius doctor   # diagnose: config ↔ settings OTEL endpoints ↔ reachable
 npx finius hook     # internal: invoked by the SessionEnd/PreCompact hooks to upload a transcript
 ```
 
-`serve`'s default port comes from the configured `serverUrl` (set in setup), and `setup` writes the
-OTEL endpoints from that same URL — so the served port and the telemetry endpoints stay in lock-step.
-`doctor` flags it if they ever drift (the usual reason telemetry "doesn't arrive").
+`serverUrl` is the **public, client-facing** base URL: `setup` writes the OTEL endpoints, upload hook,
+and OAuth callback from it, `doctor` checks reachability against it, and `serve` shows it in the
+banner. For a localhost/LAN setup `serve` also *derives its bind* from it (an explicit port in the URL
+→ that port; loopback host → bind `127.0.0.1`, any other host → `0.0.0.0`) — so the served port and
+the telemetry endpoints stay in lock-step, and `doctor` flags any drift (the usual reason telemetry
+"doesn't arrive"). Behind a TLS-terminating reverse proxy the public origin (e.g.
+`https://finius.cliftonc.nl`, no port) is **not** what the process should bind to, so the optional
+`listen: { host?, port? }` config field sets the bind explicitly. `serve` bind precedence — port:
+`--port` > `listen.port` > explicit port in `serverUrl` > `8787`; host: `--host` > `FINIUS_HOST` >
+`listen.host` > host derived from `serverUrl`. A portless public URL contributes no bind port, so it
+falls through to `listen.port` or the `8787` default (proxy forwards `443 → 8787`).
 
 Build emits via `tsconfig.build.json` (`rootDir: src`, excludes `src/client`) so the server lands at
 `dist/server/index.js` and the CLI at `dist/cli/index.js` (the `bin`). The plain `tsconfig.json`
