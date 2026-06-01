@@ -14,7 +14,7 @@ import { backfill, findClaudeTranscripts } from "./backfill.js";
 import { applyCodexConfig, CODEX_CONFIG_PATH, CODEX_SOURCE, findCodexRollouts, isCodexInstalled } from "./codex.js";
 import { type FiniusConfig, CONFIG_PATH, DEFAULT_SERVER_URL, loadConfig, normalizeUrl, resolveAuthToken, saveConfig } from "./config.js";
 import { readClaudeAccount, readCodexAccount, readGithub, readGitIdentity } from "./identity.js";
-import { installGlobally, isFiniusOnPath } from "./install.js";
+import { installGlobally, isFiniusGloballyInstalled, isFiniusOnPath } from "./install.js";
 import { generateAuthToken, generatePassword } from "./password.js";
 import { ask, banner, pc } from "./ui.js";
 
@@ -71,8 +71,10 @@ export async function runSetup(args: string[] = []): Promise<number> {
   log.success(`Saved config ${pc.dim(CONFIG_PATH)}`);
 
   // Install globally so the bare `finius` command works everywhere — including the hook, which then
-  // needs only `finius hook` rather than an absolute path tied to this npx cache.
-  let onPath = isFiniusOnPath();
+  // needs only `finius hook` rather than an absolute path tied to this npx cache. Note: under `npx`
+  // the npx shim sits on PATH (and shadows any global install), so `isFiniusOnPath()` alone would
+  // wrongly skip this — check the durable global install too, or the prompt never appears.
+  let onPath = isFiniusOnPath() || isFiniusGloballyInstalled();
   if (!onPath) {
     const wantGlobal = ask(
       await confirm({ message: "Install finius globally so the `finius` command works everywhere?" })
