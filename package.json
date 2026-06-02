@@ -1,6 +1,6 @@
 {
   "name": "@cliftonc/finius",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Local-first Claude Code usage & cost tracker — OTLP + transcript ingest with a live dashboard.",
   "license": "MIT",
   "repository": {
