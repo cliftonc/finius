@@ -12,6 +12,9 @@ Chat) into SQLite; a React + Vite dashboard renders cost, token, session, person
 breakdowns with live SSE updates. Everything runs on your machine — no data leaves your laptop
 (unless you choose to deploy it on a server for your team!).
 
+[**How Finius compares**](docs/comparison.md) to ccusage, ccflare, the Grafana/OpenObserve OTEL
+route, and other Claude Code / Codex / Copilot usage trackers.
+
 <img src="public/finius-dashboard.png" alt="Finius dashboard showing local usage and cost analytics" width="900" />
 
 </div>
