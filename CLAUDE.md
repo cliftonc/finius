@@ -23,9 +23,19 @@ npm run typecheck  # tsc --noEmit (strict; type-checks src + tests + vite.config
 npx finius          # setup if unconfigured, else status + help
 npx finius setup    # configure server URL + Claude Code OTEL env & upload hook (edits ~/.claude/settings.json)
 npx finius serve    # single-process server: API + built dashboard on one port (default 8787)
+npx finius service  # install|start|stop|remove a Linux systemd unit wrapping `finius serve`
 npx finius doctor   # diagnose: config ↔ settings OTEL endpoints ↔ reachable server + hook/PATH
 npx finius hook     # internal: invoked by the SessionEnd/PreCompact hooks to upload a transcript
 ```
+
+`service` (`src/cli/service.ts`) is **Linux/systemd-only** (refuses elsewhere) and wraps `finius serve`
+in a unit. `renderServiceUnit` is the pure, unit-tested generator; the action runners do the IO +
+`systemctl` calls. Default scope is system (`/etc/systemd/system/finius.service`, needs root — it
+instructs `sudo` rather than escalating); `--user` writes `~/.config/systemd/user` and needs no root.
+`ExecStart` uses the durable global-bin path (`resolveFiniusBin`, never the npx cache) and pins
+`FINIUS_HOME` + a `PATH` that includes this CLI's node dir (so an nvm `env node` shebang resolves under
+systemd's minimal env). `--port`/`--host` bake into `ExecStart`; otherwise the bind is taken from
+config as usual.
 
 `serverUrl` is the **public, client-facing** base URL: `setup` writes the OTEL endpoints, upload hook,
 and OAuth callback from it, `doctor` checks reachability against it, and `serve` shows it in the

@@ -5,6 +5,7 @@ import { runDoctor } from "./doctor.js";
 import { runHook } from "./hook.js";
 import { runImport } from "./import.js";
 import { runServe } from "./serve.js";
+import { runService } from "./service.js";
 import { runSetup } from "./setup.js";
 import { banner, pc } from "./ui.js";
 
@@ -13,6 +14,7 @@ const COMMANDS: Array<[string, string]> = [
   ["finius setup [url]", "Configure server URL + Claude Code telemetry env & hook"],
   ["finius import [claude|codex|all]", "Import historical Claude/Codex sessions only"],
   ["finius serve [--port N]", "Start the Finius server (API + dashboard)"],
+  ["finius service <install|start|stop|remove>", "Manage Finius as a Linux systemd service"],
   ["finius doctor", "Diagnose telemetry/hook/server config and connectivity"],
   ["finius hook", "Internal: upload the current session transcript (run by Claude Code hooks)"],
   ["finius codex-hook", "Internal: upload the current Codex rollout (run by the Codex Stop hook)"],
@@ -46,6 +48,8 @@ async function main(): Promise<number> {
       return runSetup(rest);
     case "serve":
       return runServe(rest);
+    case "service":
+      return runService(rest);
     case "doctor":
       return runDoctor();
     case "import":

@@ -138,10 +138,24 @@ FINIUS_HOST=127.0.0.1 finius serve
 > Bind precedence — port: `--port` > `listen.port` > explicit port in `serverUrl` > `8787`; host:
 > `--host` > `FINIUS_HOST` > `listen.host` > host derived from `serverUrl`.
 
-Run it under a process manager so it survives reboots — e.g. a systemd unit running `finius serve`
-with `Environment=FINIUS_HOST=127.0.0.1` (or a `listen` block in the config), plus
-`FINIUS_AUTH_PASSWORD=…` if you prefer to inject the secret via the environment rather than the config
-file.
+To survive reboots, run it under systemd. Finius ships a helper that writes, enables, and starts the
+unit for you (Linux only):
+
+```bash
+finius service install        # system unit at /etc/systemd/system (needs root; use sudo)
+# or, no root needed:
+finius service install --user # ~/.config/systemd/user (then `loginctl enable-linger <you>`)
+```
+
+`install` enables + starts it immediately; `finius service start|stop|remove` manage it afterward. The
+unit runs `finius serve` (bind taken from your `listen`/`serverUrl` config — keep `FINIUS_HOST` at
+`127.0.0.1`, or pass `--port`/`--host` to `install` to bake them in), pins `FINIUS_HOME`, and fixes up
+`PATH` so an nvm-installed node resolves. Check it with `systemctl status finius` /
+`journalctl -u finius -f`.
+
+> Prefer to hand-write the unit (or inject `FINIUS_AUTH_PASSWORD` via the environment rather than the
+> config file)? A minimal `[Service]` is just `ExecStart=/usr/local/bin/finius serve`,
+> `Environment=FINIUS_HOST=127.0.0.1`, `User=<you>`, `Restart=on-failure`.
 
 ### Step 3 — Route a domain + terminate SSL in front
 

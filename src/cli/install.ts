@@ -25,6 +25,13 @@ export function isFiniusOnPath(): boolean {
   return resolved != null && !NPX_CACHE.test(resolved);
 }
 
+// The absolute path to a *durable* `finius` binary, or null if only the ephemeral npx shim is on PATH
+// (or nothing is). A persistent systemd unit needs a stable path — the npx cache is unusable for that.
+export function resolveFiniusBin(): string | null {
+  const resolved = resolveFinius();
+  return resolved && !NPX_CACHE.test(resolved) ? resolved : null;
+}
+
 // The npm global bin directory (where `npm i -g` drops the `finius` symlink/shim).
 function globalBinDir(): string | null {
   try {
