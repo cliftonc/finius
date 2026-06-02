@@ -14,7 +14,7 @@ const COMMANDS: Array<[string, string]> = [
   ["finius setup [url]", "Configure server URL + Claude Code telemetry env & hook"],
   ["finius import [claude|codex|all]", "Import historical Claude/Codex sessions only"],
   ["finius serve [--port N]", "Start the Finius server (API + dashboard)"],
-  ["finius service <install|start|stop|remove>", "Manage Finius as a Linux systemd service"],
+  ["finius service <install|start|stop|status|logs|remove>", "Manage Finius as a Linux systemd service"],
   ["finius doctor", "Diagnose telemetry/hook/server config and connectivity"],
   ["finius hook", "Internal: upload the current session transcript (run by Claude Code hooks)"],
   ["finius codex-hook", "Internal: upload the current Codex rollout (run by the Codex Stop hook)"],

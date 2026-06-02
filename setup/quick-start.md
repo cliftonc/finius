@@ -150,8 +150,8 @@ finius service install --user # ~/.config/systemd/user (then `loginctl enable-li
 `install` enables + starts it immediately; `finius service start|stop|remove` manage it afterward. The
 unit runs `finius serve` (bind taken from your `listen`/`serverUrl` config — keep `FINIUS_HOST` at
 `127.0.0.1`, or pass `--port`/`--host` to `install` to bake them in), pins `FINIUS_HOME`, and fixes up
-`PATH` so an nvm-installed node resolves. Check it with `systemctl status finius` /
-`journalctl -u finius -f`.
+`PATH` so an nvm-installed node resolves. Check it with `finius service status` /
+`finius service logs -f`.
 
 > Prefer to hand-write the unit (or inject `FINIUS_AUTH_PASSWORD` via the environment rather than the
 > config file)? A minimal `[Service]` is just `ExecStart=/usr/local/bin/finius serve`,

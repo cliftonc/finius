@@ -66,7 +66,7 @@ export function renderServiceUnit(o: RenderUnitOptions): string {
   return lines.join("\n");
 }
 
-type Flags = { scope?: Scope; port?: number; host?: string };
+type Flags = { scope?: Scope; port?: number; host?: string; follow?: boolean; lines?: number };
 
 function parseFlags(argv: string[]): Flags {
   const flags: Flags = {};
@@ -78,6 +78,9 @@ function parseFlags(argv: string[]): Flags {
     else if (arg.startsWith("--port=")) flags.port = Number(arg.slice("--port=".length));
     else if (arg === "--host" && argv[i + 1]) flags.host = argv[++i];
     else if (arg.startsWith("--host=")) flags.host = arg.slice("--host=".length);
+    else if (arg === "--follow" || arg === "-f") flags.follow = true;
+    else if ((arg === "--lines" || arg === "-n") && argv[i + 1]) flags.lines = Number(argv[++i]);
+    else if (arg.startsWith("--lines=")) flags.lines = Number(arg.slice("--lines=".length));
   }
   return flags;
 }
@@ -101,11 +104,33 @@ function isRoot(): boolean {
 
 // True once `systemctl` is callable — guards against a non-systemd Linux (e.g. Alpine/OpenRC).
 function hasSystemctl(): boolean {
+  return canRun("systemctl");
+}
+
+// journalctl ships with systemd but check independently — `logs` needs it specifically.
+function hasJournalctl(): boolean {
+  return canRun("journalctl");
+}
+
+function canRun(cmd: string): boolean {
   try {
-    execFileSync("systemctl", ["--version"], { stdio: "ignore" });
+    execFileSync(cmd, ["--version"], { stdio: "ignore" });
     return true;
   } catch {
     return false;
+  }
+}
+
+// Run a command inheriting stdio and return its real exit code (not our ok/fail wrapper). Used for the
+// read-only passthroughs (`status`, `logs`) where the child's own exit code is meaningful — e.g.
+// `systemctl status` exits 3 when the unit is inactive, which is information, not an error to mask.
+function runPassthrough(cmd: string, args: string[]): number {
+  try {
+    execFileSync(cmd, args, { stdio: "inherit" });
+    return 0;
+  } catch (err) {
+    const code = (err as { status?: number }).status;
+    return typeof code === "number" ? code : 1;
   }
 }
 
@@ -143,6 +168,8 @@ function serviceHelp(): string {
     ["finius service install", "Write + enable the systemd unit, then start it"],
     ["finius service start", "Start the service"],
     ["finius service stop", "Stop the service"],
+    ["finius service status", "Show the unit's current state (systemctl status)"],
+    ["finius service logs", "Show recent logs; -f to follow (journalctl)"],
     ["finius service remove", "Stop, disable, and delete the unit"]
   ];
   const width = Math.max(...rows.map(([c]) => c.length));
@@ -151,9 +178,11 @@ function serviceHelp(): string {
     `${pc.bold("finius service")} ${pc.dim("— manage Finius as a Linux systemd service")}\n\n` +
     `${body}\n\n` +
     `${pc.dim("Flags:")}\n` +
-    `  ${pc.cyan("--user".padEnd(14))}  ${pc.dim("Per-user service (~/.config/systemd/user, no sudo). Default: system-wide (/etc, needs root).")}\n` +
-    `  ${pc.cyan("--port N".padEnd(14))}  ${pc.dim("Bind port baked into ExecStart (install only; else taken from config)")}\n` +
-    `  ${pc.cyan("--host H".padEnd(14))}  ${pc.dim("Bind host baked into ExecStart (install only; else taken from config)")}\n`
+    `  ${pc.cyan("--user".padEnd(16))}  ${pc.dim("Per-user service (~/.config/systemd/user, no sudo). Default: system-wide (/etc, needs root).")}\n` +
+    `  ${pc.cyan("--port N".padEnd(16))}  ${pc.dim("Bind port baked into ExecStart (install only; else taken from config)")}\n` +
+    `  ${pc.cyan("--host H".padEnd(16))}  ${pc.dim("Bind host baked into ExecStart (install only; else taken from config)")}\n` +
+    `  ${pc.cyan("-f, --follow".padEnd(16))}  ${pc.dim("Stream logs live (logs only)")}\n` +
+    `  ${pc.cyan("-n, --lines N".padEnd(16))}  ${pc.dim("Number of log lines to show (logs only; default 200)")}\n`
   );
 }
 
@@ -261,12 +290,35 @@ function runRemove(flags: Flags): number {
   return 0;
 }
 
+// Read-only: show the unit's current state. No privilege gate — systemctl shows what the caller may
+// see. `--no-pager` so it never blocks on a pager in a non-tty (e.g. CI, ssh -T).
+function runStatus(flags: Flags): number {
+  const scope = detectScope(flags);
+  if (!hasSystemctl()) return noSystemctl();
+  const args = [...(scope === "user" ? ["--user"] : []), "--no-pager", "status", SERVICE_NAME];
+  return runPassthrough("systemctl", args);
+}
+
+// Read-only: tail the journal. Defaults to the last N lines (`--no-pager`); `-f`/`--follow` streams
+// until Ctrl-C. Reading a *system* unit's journal may need membership in `systemd-journal`/`adm` (or
+// root) — journalctl prints its own notice if the caller can't see everything, so we don't gate it.
+function runLogs(flags: Flags): number {
+  const scope = detectScope(flags);
+  if (!hasJournalctl()) {
+    process.stderr.write(`${pc.red("journalctl not found")} — this host doesn't appear to run systemd.\n`);
+    return 1;
+  }
+  const base = [...(scope === "user" ? ["--user"] : []), "-u", SERVICE_NAME];
+  const tail = flags.follow ? ["-f"] : ["-n", String(flags.lines ?? 200), "--no-pager"];
+  return runPassthrough("journalctl", [...base, ...tail]);
+}
+
 function printStatusHints(scope: Scope): void {
-  const u = scope === "user" ? "--user " : "";
+  const u = scope === "user" ? " --user" : "";
   process.stdout.write(
     `${pc.dim("Check it:")}\n` +
-      `  ${pc.cyan(`systemctl ${u}status ${SERVICE_NAME}`)}\n` +
-      `  ${pc.cyan(`journalctl ${u}-u ${SERVICE_NAME} -f`)}\n\n`
+      `  ${pc.cyan(`finius service status${u}`)}\n` +
+      `  ${pc.cyan(`finius service logs -f${u}`)}\n\n`
   );
 }
 
@@ -301,6 +353,10 @@ export async function runService(argv: string[]): Promise<number> {
       return runStart(flags);
     case "stop":
       return runStop(flags);
+    case "status":
+      return runStatus(flags);
+    case "logs":
+      return runLogs(flags);
     case "remove":
     case "uninstall":
       return runRemove(flags);

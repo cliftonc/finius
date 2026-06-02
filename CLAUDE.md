@@ -23,7 +23,7 @@ npm run typecheck  # tsc --noEmit (strict; type-checks src + tests + vite.config
 npx finius          # setup if unconfigured, else status + help
 npx finius setup    # configure server URL + Claude Code OTEL env & upload hook (edits ~/.claude/settings.json)
 npx finius serve    # single-process server: API + built dashboard on one port (default 8787)
-npx finius service  # install|start|stop|remove a Linux systemd unit wrapping `finius serve`
+npx finius service  # install|start|stop|status|logs|remove a Linux systemd unit wrapping `finius serve`
 npx finius doctor   # diagnose: config ↔ settings OTEL endpoints ↔ reachable server + hook/PATH
 npx finius hook     # internal: invoked by the SessionEnd/PreCompact hooks to upload a transcript
 ```
@@ -35,7 +35,9 @@ instructs `sudo` rather than escalating); `--user` writes `~/.config/systemd/use
 `ExecStart` uses the durable global-bin path (`resolveFiniusBin`, never the npx cache) and pins
 `FINIUS_HOME` + a `PATH` that includes this CLI's node dir (so an nvm `env node` shebang resolves under
 systemd's minimal env). `--port`/`--host` bake into `ExecStart`; otherwise the bind is taken from
-config as usual.
+config as usual. `status`/`logs` are read-only passthroughs (`systemctl status` / `journalctl -u
+finius`, the latter with `-f`/`-n`) — no privilege gate, since they only show what the caller may
+already see.
 
 `serverUrl` is the **public, client-facing** base URL: `setup` writes the OTEL endpoints, upload hook,
 and OAuth callback from it, `doctor` checks reachability against it, and `serve` shows it in the
