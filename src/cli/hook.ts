@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { uploadHeaders } from "./client.js";
 import { loadConfig, resolveAuthToken, resolveServerUrl } from "./config.js";
 import { resolveIdentity } from "./identity.js";
 
@@ -41,10 +42,8 @@ export async function runHook(): Promise<number> {
   if (!content.trim()) return 0;
 
   const endpoint = `${resolveServerUrl()}/api/import/claude-hook`;
-  const headers: Record<string, string> = { "content-type": "application/json" };
   const config = loadConfig();
-  const authToken = resolveAuthToken(config);
-  if (authToken) headers.authorization = `Bearer ${authToken}`;
+  const headers = uploadHeaders(resolveAuthToken(config));
 
   // Attribute the upload to a user (config-confirmed → live Claude account → git), so a hook-imported
   // transcript lands under the same identity as that session's live OTEL metrics.

@@ -33,16 +33,16 @@ describe("withTelemetryEnv", () => {
     expect(settings.env?.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT).toBe("http://example.com:9999/otlp/v1/metrics");
   });
 
-  it("adds the Authorization header env when a token is given", () => {
+  it("always tags traffic with X-Finius-Client and appends the Authorization header in Secure Mode", () => {
     const settings: ClaudeSettings = {};
     withTelemetryEnv(settings, "http://localhost:8787", "abc123");
-    expect(settings.env?.OTEL_EXPORTER_OTLP_HEADERS).toBe("Authorization=Bearer abc123");
+    expect(settings.env?.OTEL_EXPORTER_OTLP_HEADERS).toBe("X-Finius-Client=claude-code,Authorization=Bearer abc123");
   });
 
-  it("omits the header (and strips a stale one) when no token is given", () => {
+  it("keeps the X-Finius-Client marker (and clears a stale token) when no token is given", () => {
     const settings: ClaudeSettings = { env: { OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer old" } };
     withTelemetryEnv(settings, "http://localhost:8787");
-    expect(settings.env?.OTEL_EXPORTER_OTLP_HEADERS).toBeUndefined();
+    expect(settings.env?.OTEL_EXPORTER_OTLP_HEADERS).toBe("X-Finius-Client=claude-code");
   });
 });
 

@@ -63,6 +63,15 @@ Requires Node with the built-in `node:sqlite` module (Node 22.5+; developed on v
 Run `./scripts/run-claude.sh` to launch Claude Code with all OTLP env vars pointed at the local
 server. See that script for the canonical env-var set, or the README for the manual export commands.
 
+**Identifying finius traffic.** Every request finius configures or sends carries an `X-Finius-Client`
+header (sent **always**, even in open mode, so it's filterable at a reverse proxy or in the server):
+`claude-code` on Claude's OTLP exports (in `OTEL_EXPORTER_OTLP_HEADERS`), `codex` on Codex's OTLP
+(the exporter `headers` table), and `hook` on the transcript-upload POSTs (`/api/import/{claude-hook,
+jsonl}`), which additionally send `User-Agent: finius-hook/<version>`. The upload header is built once
+in `src/cli/client.ts` (`uploadHeaders`); the OTLP markers are written at `finius setup` time by
+`claude-settings.ts` / `codex-config.ts`. The bearer auth token, when present, rides alongside the
+marker rather than replacing it.
+
 ## Architecture
 
 - `src/server/index.ts` — exports `startServer(options)` which wires `SqliteStorageAdapter` +

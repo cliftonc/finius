@@ -28,21 +28,21 @@ describe("withFiniusCodexBlock", () => {
     expect(hasFiniusCodexBlock(toml)).toBe(true);
   });
 
-  it("adds an Authorization header to the exporter when an auth token is given (Secure Mode)", () => {
+  it("adds the X-Finius-Client marker plus an Authorization header when an auth token is given (Secure Mode)", () => {
     const { toml } = withFiniusCodexBlock(EXISTING, {
       otlpLogsEndpoint: "http://localhost:8787/otlp/v1/logs",
       authToken: "deadbeef-token"
     });
-    expect(toml).toContain('headers = { Authorization = "Bearer deadbeef-token" }');
+    expect(toml).toContain('headers = { X-Finius-Client = "codex", Authorization = "Bearer deadbeef-token" }');
     expect(toml).toContain('endpoint = "http://localhost:8787/otlp/v1/logs"');
   });
 
-  it("omits the headers table entirely when no auth token is given (open mode)", () => {
+  it("still tags traffic with X-Finius-Client (marker-only headers table) in open mode", () => {
     const { toml } = withFiniusCodexBlock(EXISTING, {
       otlpLogsEndpoint: "http://localhost:8787/otlp/v1/logs"
     });
-    expect(toml).not.toContain("headers");
-    expect(toml).toContain('protocol = "json" } }');
+    expect(toml).toContain('headers = { X-Finius-Client = "codex" }');
+    expect(toml).not.toContain("Authorization");
   });
 
   it("is idempotent — re-applying replaces the block rather than duplicating it", () => {

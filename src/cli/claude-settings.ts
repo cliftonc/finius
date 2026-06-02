@@ -20,10 +20,12 @@ export const HOOK_TIMEOUT_SECONDS = 60;
 const FINIUS_MARKER = "finius";
 
 // Point Claude Code's OTLP exporters at the given Finius server. Preserves any existing env vars.
-// When `authToken` is set (Secure Mode), also send it on every OTLP export via the standard
-// Authorization header; when absent, strip any header we previously wrote so toggling auth off cleans
-// up. Tokens are URL-safe hex, so the single space in "Bearer " is the only special char and the OTel
-// JS header parser (comma/equals-delimited key=value) preserves it.
+// `OTEL_EXPORTER_OTLP_HEADERS` is always set: it carries `X-Finius-Client=claude-code` so finius's
+// telemetry is identifiable on the wire (proxy/server), plus `Authorization=Bearer <token>` in Secure
+// Mode. The OTel JS header parser is comma-separated `key=value`; tokens are URL-safe hex, so the lone
+// space in "Bearer " is the only special char and parses fine. We always overwrite this var (rather
+// than deleting when auth is off) so toggling auth off still leaves the client marker and clears any
+// stale token.
 export function withTelemetryEnv(settings: ClaudeSettings, serverUrl: string, authToken?: string): ClaudeSettings {
   settings.env = {
     ...settings.env,
@@ -41,11 +43,9 @@ export function withTelemetryEnv(settings: ClaudeSettings, serverUrl: string, au
     OTEL_METRIC_EXPORT_INTERVAL: "10000",
     OTEL_LOGS_EXPORT_INTERVAL: "5000"
   };
-  if (authToken) {
-    settings.env.OTEL_EXPORTER_OTLP_HEADERS = `Authorization=Bearer ${authToken}`;
-  } else {
-    delete settings.env.OTEL_EXPORTER_OTLP_HEADERS;
-  }
+  const headerPairs = ["X-Finius-Client=claude-code"];
+  if (authToken) headerPairs.push(`Authorization=Bearer ${authToken}`);
+  settings.env.OTEL_EXPORTER_OTLP_HEADERS = headerPairs.join(",");
   return settings;
 }
 

@@ -51,9 +51,11 @@ export function withFiniusCodexBlock(toml: string, opts: CodexBlockOptions): Cod
     );
   }
   if (addedOtel) {
-    const headers = opts.authToken
-      ? `, headers = { Authorization = ${tomlString(`Bearer ${opts.authToken}`)} }`
-      : "";
+    // Always carry X-Finius-Client=codex so finius's OTLP traffic is identifiable on the wire; add the
+    // bearer token only in Secure Mode. (X-Finius-Client is a valid TOML bare key — letters + dashes.)
+    const headerEntries = [`X-Finius-Client = ${tomlString("codex")}`];
+    if (opts.authToken) headerEntries.push(`Authorization = ${tomlString(`Bearer ${opts.authToken}`)}`);
+    const headers = `, headers = { ${headerEntries.join(", ")} }`;
     parts.push(
       "[otel]",
       `environment = "finius"`,

@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log, spinner } from "@clack/prompts";
+import { uploadHeaders } from "./client.js";
 import { loadConfig, resolveAuthToken, resolveServerUrl } from "./config.js";
 import { type Identity, resolveIdentity } from "./identity.js";
 import { pc } from "./ui.js";
@@ -60,9 +61,7 @@ export async function uploadTranscript(
 
   const config = loadConfig();
   const endpoint = `${resolveServerUrl()}/api/import/jsonl`;
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const token = resolveAuthToken(config);
-  if (token) headers.authorization = `Bearer ${token}`;
+  const headers = uploadHeaders(resolveAuthToken(config));
   const identity = opts.identity ?? resolveIdentity(opts.format === "codex" ? "codex" : "claude", config, opts.cwd);
   try {
     const res = await fetch(endpoint, {
