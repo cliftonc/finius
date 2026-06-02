@@ -8,6 +8,7 @@ import { isFiniusOnPath } from "./install.js";
 import { banner, pc } from "./ui.js";
 
 const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
+const VSCODE_SETTINGS_PATH = join(homedir(), "Library", "Application Support", "Code", "User", "settings.json");
 
 // `finius doctor` — checks that the three things that must agree actually do: the configured server
 // URL, the OTEL endpoints in Claude Code's settings, and a reachable healthy server. Prints a
@@ -62,8 +63,8 @@ export async function runDoctor(): Promise<number> {
     }
 
     const protocol = env.OTEL_EXPORTER_OTLP_PROTOCOL ?? env.OTEL_EXPORTER_OTLP_METRICS_PROTOCOL;
-    if (protocol === "http/json") ok("protocol = http/json");
-    else warn(`protocol = ${protocol ?? "(unset → defaults to http/protobuf)"}`, "Finius expects http/json");
+    if (protocol === "http/json" || protocol === "http/protobuf") ok(`protocol = ${protocol}`);
+    else warn(`protocol = ${protocol ?? "(unset → defaults to http/protobuf)"}`, "Finius accepts http/json and http/protobuf");
 
     // Hook
     const eventsWithHook = TELEMETRY_HOOK_EVENTS.filter((e) =>
@@ -72,6 +73,25 @@ export async function runDoctor(): Promise<number> {
     if (eventsWithHook.length === TELEMETRY_HOOK_EVENTS.length) ok(`hook installed for ${eventsWithHook.join(" + ")}`);
     else if (eventsWithHook.length > 0) warn(`hook only on ${eventsWithHook.join(", ")}`, "re-run `finius setup`");
     else bad("transcript-upload hook not installed", "run `finius setup`");
+  }
+
+  // --- GitHub Copilot telemetry ----------------------------------------------
+  section("GitHub Copilot telemetry", VSCODE_SETTINGS_PATH);
+  const vsCodeSettings = readJson(VSCODE_SETTINGS_PATH);
+  if (!vsCodeSettings) {
+    warn("VS Code settings.json missing or invalid", "run `finius setup` after installing VS Code Copilot");
+  } else if (vsCodeSettings["github.copilot.chat.otel.enabled"] === true) {
+    ok("github.copilot.chat.otel.enabled = true");
+    const endpoint = typeof vsCodeSettings["github.copilot.chat.otel.otlpEndpoint"] === "string"
+      ? vsCodeSettings["github.copilot.chat.otel.otlpEndpoint"]
+      : "";
+    endpoint ? ok(`VS Code OTLP endpoint → ${endpoint}`) : bad("github.copilot.chat.otel.otlpEndpoint not set");
+    const epOrigin = originOf(endpoint);
+    if (serverOrigin && epOrigin && epOrigin !== serverOrigin) {
+      bad(`VS Code Copilot endpoint ${epOrigin} does not match serverUrl ${serverOrigin}`, "re-run `finius setup`");
+    }
+  } else {
+    warn("VS Code Copilot OTel not enabled", "run `finius setup` to enable live Copilot traces");
   }
 
   // --- CLI --------------------------------------------------------------------
@@ -124,9 +144,13 @@ export async function runDoctor(): Promise<number> {
 }
 
 function readSettings(): ClaudeSettings | null {
-  if (!existsSync(CLAUDE_SETTINGS_PATH)) return null;
+  return readJson(CLAUDE_SETTINGS_PATH) as ClaudeSettings | null;
+}
+
+function readJson(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
   try {
-    return JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf8")) as ClaudeSettings;
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
   } catch {
     return null;
   }

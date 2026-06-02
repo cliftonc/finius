@@ -5,8 +5,8 @@ export function SetupModal({ isOpen, onOpenChange, secure }: { isOpen: boolean; 
     <Modal isOpen={isOpen} onOpenChange={onOpenChange} size="2xl">
       <ModalContent>
         <ModalHeader className="flex flex-col gap-1">
-          Send Claude Code telemetry here
-          <span className="text-sm font-normal text-default-500">Point Claude Code at this server, then start a session — the dashboard updates live.</span>
+          Send agent telemetry here
+          <span className="text-sm font-normal text-default-500">Point Claude Code, Codex, or Copilot at this server, then start a session — the dashboard updates live.</span>
         </ModalHeader>
         <ModalBody className="pb-6">
           <Tabs aria-label="Setup method" variant="underlined">
@@ -23,7 +23,7 @@ export function SetupModal({ isOpen, onOpenChange, secure }: { isOpen: boolean; 
                 </p>
               </div>
             </Tab>
-            <Tab key="manual" title="Manual" isDisabled={secure ?? false}>
+            <Tab key="claude" title="Claude manual" isDisabled={secure ?? false}>
               <div className="flex flex-col gap-3">
                 <p className="text-sm text-default-600">
                   Prefer not to install anything? Export these in the shell where you launch Claude Code, then run <code className="px-1">claude</code>.
@@ -35,11 +35,36 @@ export function SetupModal({ isOpen, onOpenChange, secure }: { isOpen: boolean; 
                 </Snippet>
               </div>
             </Tab>
+            <Tab key="copilot" title="Copilot CLI">
+              <div className="flex flex-col gap-3">
+                <p className="text-sm text-default-600">
+                  Export these in the shell where you launch GitHub Copilot CLI, then run <code className="px-1">copilot</code>
+                  {secure ? ". Secure Mode also needs an auth header; run quick setup to print the shell-profile line with your token." : "."}
+                </p>
+                <Snippet hideSymbol variant="bordered" className="w-full" classNames={{ pre: "whitespace-pre-wrap" }}>
+                  {copilotScript().map((line, index) => (
+                    <span key={index}>{line}</span>
+                  ))}
+                </Snippet>
+              </div>
+            </Tab>
           </Tabs>
         </ModalBody>
       </ModalContent>
     </Modal>
   );
+}
+
+function copilotScript(): string[] {
+  const origin = window.location.origin;
+  return [
+    "export COPILOT_OTEL_ENABLED=true",
+    `export OTEL_EXPORTER_OTLP_ENDPOINT=${origin}/otlp`,
+    "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
+    "export OTEL_SERVICE_NAME=github-copilot",
+    "export COPILOT_OTEL_CAPTURE_CONTENT=false",
+    "copilot"
+  ];
 }
 
 function manualScript(): string[] {

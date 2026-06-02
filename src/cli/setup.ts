@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
@@ -12,6 +12,7 @@ import {
 } from "./claude-settings.js";
 import { backfill, findClaudeTranscripts } from "./backfill.js";
 import { applyCodexConfig, CODEX_CONFIG_PATH, CODEX_SOURCE, findCodexRollouts, isCodexInstalled } from "./codex.js";
+import { COPILOT_VSCODE_SOURCE, copilotSessionIdFromPath, findCopilotVsCodeTranscripts } from "./copilot.js";
 import { type FiniusConfig, CONFIG_PATH, DEFAULT_SERVER_URL, loadConfig, normalizeUrl, resolveAuthToken, saveConfig } from "./config.js";
 import { readClaudeAccount, readCodexAccount, readGithub, readGitIdentity } from "./identity.js";
 import { installGlobally, isFiniusGloballyInstalled, isFiniusOnPath } from "./install.js";
@@ -19,6 +20,10 @@ import { generateAuthToken, generatePassword } from "./password.js";
 import { ask, banner, pc } from "./ui.js";
 
 const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
+const VSCODE_SETTINGS_PATH = join(homedir(), "Library", "Application Support", "Code", "User", "settings.json");
+const VSCODE_COPILOT_GLOBAL_STORAGE = join(homedir(), "Library", "Application Support", "Code", "User", "globalStorage", "github.copilot-chat");
+const COPILOT_ENV_BEGIN = "# >>> finius copilot otel >>>";
+const COPILOT_ENV_END = "# <<< finius copilot otel <<<";
 
 export async function runSetup(args: string[] = []): Promise<number> {
   banner("setup");
@@ -95,12 +100,14 @@ export async function runSetup(args: string[] = []): Promise<number> {
   const credential = resolveAuthToken({ serverUrl, ...resolvedAuth });
   const haveClaude = isClaudeInstalled();
   const haveCodex = isCodexInstalled();
+  const haveCopilot = isCopilotInstalled();
 
   if (haveClaude) await configureClaude(serverUrl, credential, onPath, health.reachable);
   if (haveCodex) await configureCodex(serverUrl, credential, onPath, health.reachable);
-  if (!haveClaude && !haveCodex) {
+  if (haveCopilot) await configureCopilot(serverUrl, credential, identity);
+  if (!haveClaude && !haveCodex && !haveCopilot) {
     log.warn(
-      "No Claude Code or Codex install detected — skipping agent configuration.\n" +
+      "No Claude Code, Codex, or Copilot install detected — skipping agent configuration.\n" +
         "Re-run `finius setup` after installing one, or import transcripts manually."
     );
   }
@@ -536,6 +543,10 @@ function isClaudeInstalled(): boolean {
   return existsSync(join(homedir(), ".claude"));
 }
 
+function isCopilotInstalled(): boolean {
+  return existsSync(join(homedir(), ".copilot")) || existsSync(VSCODE_COPILOT_GLOBAL_STORAGE);
+}
+
 // Configure Claude Code: OTEL env vars + the transcript-upload hook, both opt-in.
 async function configureClaude(serverUrl: string, credential: string | undefined, onPath: boolean, canImport: boolean): Promise<void> {
   log.step(pc.bold("Claude Code") + pc.dim(` — edits ${CLAUDE_SETTINGS_PATH}`));
@@ -557,7 +568,7 @@ async function configureClaude(serverUrl: string, credential: string | undefined
 
   // The hook only catches future sessions; offer to import what's already on disk (one at a time),
   // but only when the server is reachable. Otherwise the uploads would fail immediately.
-  if (canImport && ask(await confirm({ message: "Import your existing Claude sessions now?" }))) {
+  if (canImport && ask(await confirm({ message: "Import your existing Claude sessions now?", initialValue: false }))) {
     await backfill(findClaudeTranscripts(), { source: "claude-code-jsonl", format: "claude", label: "Claude sessions" });
   }
 }
@@ -592,11 +603,135 @@ async function configureCodex(serverUrl: string, credential: string | undefined,
 
   // The hook only catches future sessions; offer to import what's already on disk (one at a time),
   // but only when the server is reachable. Otherwise the uploads would fail immediately.
-  if (canImport && ask(await confirm({ message: "Import your existing Codex sessions now?" }))) {
+  if (canImport && ask(await confirm({ message: "Import your existing Codex sessions now?", initialValue: false }))) {
     await backfill(findCodexRollouts(), { source: CODEX_SOURCE, format: "codex", label: "Codex sessions" });
+  }
+}
+
+async function configureCopilot(serverUrl: string, credential: string | undefined, identity: FiniusConfig["identity"]): Promise<void> {
+  log.step(pc.bold("GitHub Copilot") + pc.dim(" — live OTLP traces + metrics"));
+  const wantVsCode = existsSync(dirname(VSCODE_SETTINGS_PATH))
+    ? ask(await confirm({ message: "Configure VS Code Copilot Chat OpenTelemetry settings?", initialValue: true }))
+    : false;
+
+  if (wantVsCode) {
+    const settings = readJsonFile(VSCODE_SETTINGS_PATH);
+    settings["github.copilot.chat.otel.enabled"] = true;
+    settings["github.copilot.chat.otel.exporterType"] = "otlp-http";
+    settings["github.copilot.chat.otel.otlpEndpoint"] = `${serverUrl}/otlp`;
+    settings["github.copilot.chat.otel.captureContent"] = false;
+    mkdirSync(dirname(VSCODE_SETTINGS_PATH), { recursive: true });
+    writeFileSync(VSCODE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+    log.success(`Updated ${pc.dim(VSCODE_SETTINGS_PATH)}\n${pc.green("•")} Copilot Chat OTLP exporter → ${serverUrl}/otlp`);
+  }
+
+  const profile = detectShellProfile();
+  const block = copilotEnvBlock(serverUrl, credential, identity);
+  const wantProfile = ask(
+    await confirm({
+      message: `Add GitHub Copilot OTel environment variables to ${profile.label}?`,
+      initialValue: true
+    })
+  );
+  if (wantProfile) {
+    upsertManagedBlock(profile.path, block);
+    log.success(`Updated ${pc.dim(profile.label)}\n${pc.green("•")} Copilot CLI OTLP env vars installed`);
+    log.info(`Restart your shell, then launch ${pc.cyan("copilot")} from that terminal.`);
+    if (wantVsCode) {
+      log.warn("VS Code launched from the Dock/Finder may not inherit shell profile variables; launching `code` from a configured terminal is the reliable path for Secure Mode headers.");
+    }
+  } else {
+    note(
+      [`cat >> ${profile.label} <<'EOF'`, block, "EOF", "", "# Then restart your shell and run:", "copilot"].join("\n"),
+      "Copilot CLI terminal telemetry"
+    );
+  }
+
+  if (ask(await confirm({ message: "Import existing VS Code Copilot chat transcripts now?", initialValue: false }))) {
+    await backfill(findCopilotVsCodeTranscripts(), {
+      source: COPILOT_VSCODE_SOURCE,
+      format: "copilot",
+      label: "VS Code Copilot sessions",
+      sessionIdFromPath: copilotSessionIdFromPath
+    });
   }
 }
 
 function quote(value: string): string {
   return /[\s"']/.test(value) ? `"${value.replace(/(["\\])/g, "\\$1")}"` : value;
+}
+
+function readJsonFile(path: string): Record<string, unknown> {
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function copilotEnv(serverUrl: string, credential: string | undefined, identity?: FiniusConfig["identity"]): string[] {
+  const lines = [
+    "export COPILOT_OTEL_ENABLED=true",
+    `export OTEL_EXPORTER_OTLP_ENDPOINT=${serverUrl}/otlp`,
+    "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
+    "export OTEL_SERVICE_NAME=github-copilot",
+    "export COPILOT_OTEL_CAPTURE_CONTENT=false"
+  ];
+  const headers = copilotOtelHeaders(credential, identity);
+  if (headers.length) lines.push(`export OTEL_EXPORTER_OTLP_HEADERS=${quote(headers.join(","))}`);
+  lines.push("copilot");
+  return lines;
+}
+
+function copilotEnvBlock(serverUrl: string, credential: string | undefined, identity?: FiniusConfig["identity"]): string {
+  return [COPILOT_ENV_BEGIN, ...copilotEnv(serverUrl, credential, identity).slice(0, -1), COPILOT_ENV_END].join("\n");
+}
+
+function copilotOtelHeaders(credential: string | undefined, identity?: FiniusConfig["identity"]): string[] {
+  const headers: string[] = [];
+  if (credential) headers.push(`Authorization=Bearer ${credential}`);
+  const email = identity?.claude?.email ?? identity?.codex?.email;
+  if (email) headers.push(`X-Finius-User-Email=${encodeURIComponent(email)}`);
+  if (identity?.githubLogin) headers.push(`X-Finius-Github-Login=${encodeURIComponent(identity.githubLogin)}`);
+  if (identity?.displayName) headers.push(`X-Finius-Display-Name=${encodeURIComponent(identity.displayName)}`);
+  return headers;
+}
+
+function upsertManagedBlock(path: string, block: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const begin = current.indexOf(COPILOT_ENV_BEGIN);
+  const end = begin === -1 ? -1 : current.indexOf(COPILOT_ENV_END, begin);
+  if (begin !== -1 && end !== -1) {
+    const next = `${current.slice(0, begin).replace(/\s*$/, "")}\n\n${block}\n${current.slice(end + COPILOT_ENV_END.length).replace(/^\s*\n?/, "")}`;
+    writeFileSync(path, next.endsWith("\n") ? next : `${next}\n`, "utf8");
+    return;
+  }
+  appendFileSync(path, `${current.endsWith("\n") || current.length === 0 ? "" : "\n"}\n${block}\n`, "utf8");
+}
+
+function detectShellProfile(): { path: string; label: string } {
+  const home = homedir();
+  const candidates = [
+    join(home, ".zshrc"),
+    join(home, ".zprofile"),
+    join(home, ".bashrc"),
+    join(home, ".bash_profile"),
+    join(home, ".profile")
+  ];
+  const existingWithOtel = candidates.find((p) => {
+    if (!existsSync(p)) return false;
+    const content = readFileSync(p, "utf8");
+    return /COPILOT_OTEL|OTEL_EXPORTER_OTLP|finius copilot otel/i.test(content);
+  });
+  const path = existingWithOtel ?? defaultShellProfilePath();
+  return { path, label: `~/${path.slice(home.length + 1)}` };
+}
+
+function defaultShellProfilePath(): string {
+  const home = homedir();
+  const shell = process.env.SHELL ?? "";
+  if (shell.endsWith("/zsh")) return join(home, ".zshrc");
+  if (shell.endsWith("/bash")) return join(home, process.platform === "darwin" ? ".bash_profile" : ".bashrc");
+  return join(home, ".profile");
 }

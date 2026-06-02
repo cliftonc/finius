@@ -21,6 +21,10 @@ const SESSION_METRIC = "claude_code.session.count";
 const PR_METRIC = "claude_code.pull_request.count";
 const COMMIT_METRIC = "claude_code.commit.count";
 
+export const CLAUDE_OTEL_SOURCE = "claude-code";
+export const COPILOT_CLI_SOURCE = "github-copilot";
+export const COPILOT_CHAT_SOURCE = "copilot-chat";
+
 // Maps an OTLP metric to our (kind, sub-type) for the metric_points table. Returns null for
 // metrics we don't aggregate (those data points are dropped).
 function classifyMetric(metricName: string, attributes: Record<string, unknown>): { kind: MetricKind; tokenType: string | null } | null {
@@ -71,12 +75,13 @@ export function decodeAttributeValue(value?: AttributeValue): unknown {
   return null;
 }
 
-export function parseOtelMetricPoints(batch: unknown, source = "claude-code"): MetricPointInput[] {
+export function parseOtelMetricPoints(batch: unknown, source?: string): MetricPointInput[] {
   const points: MetricPointInput[] = [];
   const resourceMetrics = asArray((batch as { resourceMetrics?: unknown[] })?.resourceMetrics);
 
   for (const resourceMetric of resourceMetrics) {
     const resourceAttrs = attributesToObject((resourceMetric as { resource?: { attributes?: Attribute[] } }).resource?.attributes);
+    const pointSource = source ?? sourceFromAttributes(resourceAttrs);
     const scopeMetrics = asArray((resourceMetric as { scopeMetrics?: unknown[] }).scopeMetrics);
 
     for (const scopeMetric of scopeMetrics) {
@@ -102,7 +107,7 @@ export function parseOtelMetricPoints(batch: unknown, source = "claude-code"): M
           if (!Number.isFinite(value)) continue;
 
           points.push({
-            source,
+            source: pointSource,
             signal: "otlp_metrics",
             sessionId,
             userId: stringAttr(attributes, "user.id") ?? stringAttr(attributes, "enduser.id"),
@@ -192,6 +197,145 @@ export function parseOtelMetricRecords(batch: unknown, source = "claude-code"): 
   return records;
 }
 
+export type OtelSpanRecord = {
+  source: string;
+  traceId: string | null;
+  spanId: string | null;
+  parentSpanId: string | null;
+  name: string;
+  timestamp: number;
+  durationMs: number | null;
+  attributes: Record<string, unknown>;
+};
+
+export type OtelTraceSessionDiagnostic = {
+  source: string;
+  spanName: string;
+  traceId: string | null;
+  spanId: string | null;
+  selectedSessionId: string;
+  serviceName: string | null;
+  serviceVersion: string | null;
+  operationName: string | null;
+  agentName: string | null;
+  model: string | null;
+  sessionId: string | null;
+  sessionUnderscoreId: string | null;
+  conversationId: string | null;
+  genAiConversationId: string | null;
+  copilotChatSessionId: string | null;
+  copilotChatChatSessionId: string | null;
+  tokenTypes: string[];
+  tokenTotal: number;
+  attributeKeys: string[];
+};
+
+export function parseOtelTraceRecords(batch: unknown): OtelSpanRecord[] {
+  const records: OtelSpanRecord[] = [];
+  const resourceSpans = asArray((batch as { resourceSpans?: unknown[] })?.resourceSpans);
+
+  for (const resourceSpan of resourceSpans) {
+    const resourceAttrs = attributesToObject((resourceSpan as { resource?: { attributes?: Attribute[] } }).resource?.attributes);
+    const source = sourceFromAttributes(resourceAttrs);
+    for (const scopeSpan of asArray((resourceSpan as { scopeSpans?: unknown[] }).scopeSpans)) {
+      for (const span of asArray((scopeSpan as { spans?: unknown[] }).spans)) {
+        const s = span as {
+          traceId?: string;
+          spanId?: string;
+          parentSpanId?: string;
+          name?: string;
+          startTimeUnixNano?: string | number;
+          endTimeUnixNano?: string | number;
+          attributes?: Attribute[];
+        };
+        const start = unixNanoToMs(s.startTimeUnixNano);
+        const end = unixNanoToMs(s.endTimeUnixNano);
+        records.push({
+          source,
+          traceId: s.traceId ?? null,
+          spanId: s.spanId ?? null,
+          parentSpanId: s.parentSpanId ?? null,
+          name: s.name ?? "",
+          timestamp: Number(end ?? start ?? Date.now()),
+          durationMs: start != null && end != null ? Math.max(0, end - start) : null,
+          attributes: { ...resourceAttrs, ...attributesToObject(s.attributes) }
+        });
+      }
+    }
+  }
+
+  return records;
+}
+
+export function parseOtelTracePoints(batch: unknown): MetricPointInput[] {
+  const selected = selectedTokenSpans(parseOtelTraceRecords(batch));
+  const points: MetricPointInput[] = [];
+
+  for (const span of selected) {
+    const attrs = span.attributes;
+    const sessionId = traceSessionId(span);
+    const model =
+      stringAttr(attrs, "gen_ai.response.model") ??
+      stringAttr(attrs, "gen_ai.request.model") ??
+      stringAttr(attrs, "model");
+    const base = {
+      source: span.source,
+      signal: "otlp_metrics" as const,
+      sessionId,
+      userId:
+        stringAttr(attrs, "user.id") ??
+        stringAttr(attrs, "enduser.id") ??
+        stringAttr(attrs, "github.copilot.user") ??
+        stringAttr(attrs, "github.user"),
+      userEmail: stringAttr(attrs, "user.email"),
+      userAccountId: stringAttr(attrs, "user.account_id") ?? stringAttr(attrs, "user.account_uuid"),
+      model,
+      timestamp: span.timestamp,
+      attributes: attrs
+    };
+    for (const [tokenType, value] of tokenEntries(attrs)) {
+      points.push({
+        ...base,
+        metricName: "gen_ai.span.token.usage",
+        kind: "tokens",
+        tokenType,
+        value,
+        unit: "tokens"
+      });
+    }
+  }
+
+  return points;
+}
+
+export function otelTraceSessionDiagnostics(batch: unknown): OtelTraceSessionDiagnostic[] {
+  return selectedTokenSpans(parseOtelTraceRecords(batch)).map((span) => {
+    const attrs = span.attributes;
+    const tokens = tokenEntries(attrs);
+    return {
+      source: span.source,
+      spanName: span.name,
+      traceId: span.traceId,
+      spanId: span.spanId,
+      selectedSessionId: traceSessionId(span),
+      serviceName: stringAttr(attrs, "service.name") ?? null,
+      serviceVersion: stringAttr(attrs, "service.version") ?? null,
+      operationName: stringAttr(attrs, "gen_ai.operation.name") ?? null,
+      agentName: stringAttr(attrs, "gen_ai.agent.name") ?? null,
+      model: stringAttr(attrs, "gen_ai.response.model") ?? stringAttr(attrs, "gen_ai.request.model") ?? stringAttr(attrs, "model") ?? null,
+      sessionId: stringAttr(attrs, "session.id") ?? null,
+      sessionUnderscoreId: stringAttr(attrs, "session_id") ?? null,
+      conversationId: stringAttr(attrs, "conversation.id") ?? null,
+      genAiConversationId: stringAttr(attrs, "gen_ai.conversation.id") ?? null,
+      copilotChatSessionId: stringAttr(attrs, "copilot_chat.session_id") ?? null,
+      copilotChatChatSessionId: stringAttr(attrs, "copilot_chat.chat_session_id") ?? null,
+      tokenTypes: tokens.map(([tokenType]) => tokenType),
+      tokenTotal: tokens.reduce((sum, [, value]) => sum + value, 0),
+      attributeKeys: Object.keys(attrs).sort()
+    };
+  });
+}
+
 // Flattens an OTLP/JSON logs batch into structured records, merging resource + record attributes and
 // decoding the body. Codex's native telemetry is logs-only, so this is the seam through which we
 // capture (and, later, parse) what it sends. Pure / side-effect-free.
@@ -261,10 +405,11 @@ function getMetricDataPoints(metric: unknown): unknown[] {
 }
 
 function numericValue(dataPoint: unknown): number {
-  const point = dataPoint as { asDouble?: number; asInt?: number | string; value?: number };
+  const point = dataPoint as { asDouble?: number; asInt?: number | string; value?: number; sum?: number };
   if (point.asDouble !== undefined) return Number(point.asDouble);
   if (point.asInt !== undefined) return Number(point.asInt);
   if (point.value !== undefined) return Number(point.value);
+  if (point.sum !== undefined) return Number(point.sum);
   return NaN;
 }
 
@@ -293,4 +438,62 @@ function normalizeTokenType(type?: string | null) {
 
 function asArray<T>(value: T[] | undefined | null): T[] {
   return Array.isArray(value) ? value : [];
+}
+
+function sourceFromAttributes(attributes: Record<string, unknown>): string {
+  const service = stringAttr(attributes, "service.name");
+  if (service === "github-copilot" || service === "github.copilot") return COPILOT_CLI_SOURCE;
+  if (service === "copilot-chat" || service === "github.copilot-chat") return COPILOT_CHAT_SOURCE;
+  return CLAUDE_OTEL_SOURCE;
+}
+
+function selectedTokenSpans(spans: OtelSpanRecord[]): OtelSpanRecord[] {
+  const withTokens = spans.filter((span) => tokenEntries(span.attributes).length > 0);
+  const roots = withTokens.filter((span) => stringAttr(span.attributes, "gen_ai.operation.name") === "invoke_agent" || span.name.startsWith("invoke_agent"));
+  return roots.length ? roots : withTokens;
+}
+
+function traceSessionId(span: OtelSpanRecord): string {
+  const attrs = span.attributes;
+  if (isVsCodeCopilotSpan(span)) {
+    return (
+      stringAttr(attrs, "session.id") ??
+      stringAttr(attrs, "copilot_chat.chat_session_id") ??
+      stringAttr(attrs, "copilot_chat.session_id") ??
+      stringAttr(attrs, "gen_ai.conversation.id") ??
+      span.traceId ??
+      "unknown-session"
+    );
+  }
+  return (
+    stringAttr(attrs, "gen_ai.conversation.id") ??
+    stringAttr(attrs, "session.id") ??
+    stringAttr(attrs, "conversation.id") ??
+    span.traceId ??
+    "unknown-session"
+  );
+}
+
+function isVsCodeCopilotSpan(span: OtelSpanRecord): boolean {
+  if (span.source !== COPILOT_CLI_SOURCE && span.source !== COPILOT_CHAT_SOURCE) return false;
+  const attrs = span.attributes;
+  return (
+    stringAttr(attrs, "gen_ai.agent.name") === "GitHub Copilot Chat" ||
+    stringAttr(attrs, "copilot_chat.session_id") !== undefined ||
+    stringAttr(attrs, "copilot_chat.chat_session_id") !== undefined
+  );
+}
+
+function tokenEntries(attributes: Record<string, unknown>): Array<[string, number]> {
+  const pairs: Array<[string, number]> = [];
+  for (const [attr, tokenType] of [
+    ["gen_ai.usage.input_tokens", "input"],
+    ["gen_ai.usage.output_tokens", "output"],
+    ["gen_ai.usage.cache_read.input_tokens", "cache_read"],
+    ["gen_ai.usage.cache_creation.input_tokens", "cache_creation"]
+  ] as const) {
+    const value = Number(attributes[attr]);
+    if (Number.isFinite(value) && value > 0) pairs.push([tokenType, value]);
+  }
+  return pairs;
 }

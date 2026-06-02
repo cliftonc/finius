@@ -34,7 +34,7 @@ export type MetricKind =
 
 // Which coding agent wrote a transcript. Selects the matching parser (see server/transcripts.ts).
 // Add a new agent by extending this union and the parser dispatch.
-export type TranscriptFormat = "claude" | "codex";
+export type TranscriptFormat = "claude" | "codex" | "copilot";
 
 export type MetricPointInput = {
   source: string;
@@ -56,6 +56,8 @@ export type MetricPointInput = {
   timestamp: number;
   attributes?: Record<string, unknown>;
 };
+
+export type TelemetryIdentity = Pick<MetricPointInput, "userEmail" | "userId" | "userAccountId" | "githubLogin" | "displayName">;
 
 export type SummaryFilters = {
   from?: number;
@@ -147,8 +149,9 @@ export type OAuthUserInput = {
 };
 
 export interface StorageAdapter {
-  ingestOtelMetrics(batch: unknown): Promise<{ duplicate: boolean; points: number }>;
+  ingestOtelMetrics(batch: unknown, identity?: TelemetryIdentity): Promise<{ duplicate: boolean; points: number }>;
   ingestOtelLogs(batch: unknown): Promise<{ duplicate: boolean; events: number }>;
+  ingestOtelTraces(batch: unknown, identity?: TelemetryIdentity): Promise<{ duplicate: boolean; spans: number; points: number }>;
   getLogEventSummary(): Promise<LogEventSummary[]>;
   // Per-model pricing used to synthesize cost. `importPricing` inserts dated rows and reloads the
   // in-memory lookup; `recomputeComputedCost` rebuilds the synthesized `finius.cost.computed` points

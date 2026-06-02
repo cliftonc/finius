@@ -3,8 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import { getSession, getTranscript, getTranscriptInfo } from "../api";
-import { parseTranscript } from "../timeline/claudeJsonl";
-import { isCodexRollout, parseCodexRollout } from "../timeline/codexRollout";
+import { parseTranscriptToMessages } from "../timeline/adapters";
 import { processMessages } from "../timeline/processor";
 import { isToolPair, type TimelineItem as TimelineItemT } from "../timeline/types";
 import { TimelineItem } from "./timeline/TimelineItem";
@@ -36,9 +35,8 @@ export function TranscriptView({ id, onBack }: { id: number; onBack: () => void 
 
   const items = useMemo(() => {
     if (!transcript.data) return [];
-    // Pick the adapter by transcript shape so Claude and Codex both render in the same timeline.
-    const messages = isCodexRollout(transcript.data) ? parseCodexRollout(transcript.data) : parseTranscript(transcript.data);
-    return processMessages(messages);
+    // The registry sniffs the transcript shape and parses Claude/Codex/Copilot/VS Code into one model.
+    return processMessages(parseTranscriptToMessages(transcript.data));
   }, [transcript.data]);
 
   const visible = useMemo(() => {

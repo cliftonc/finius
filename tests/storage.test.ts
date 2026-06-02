@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SqliteStorageAdapter } from "../src/server/storage/sqlite";
-import { jsonlTranscript, otlpLogBatch, otlpMetricBatch } from "./fixtures";
+import { copilotTraceBatch, copilotVsCodeTraceBatch, copilotVsCodeTranscript, jsonlTranscript, otlpLogBatch, otlpMetricBatch } from "./fixtures";
 
 function tmpDbPath() {
   return join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite");
@@ -86,6 +86,22 @@ describe("SQLite storage adapter", () => {
     const summary = await storage.getSummary({});
     expect(summary.totalTokens).toBe(0);
     expect(summary.totalCost).toBe(0);
+  });
+
+  it("ingests Copilot OTLP traces as source-specific token metrics", async () => {
+    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+
+    expect(await storage.ingestOtelTraces(copilotTraceBatch())).toMatchObject({ duplicate: false, spans: 2 });
+    expect(await storage.ingestOtelTraces(copilotTraceBatch())).toEqual({ duplicate: true, spans: 0, points: 0 });
+
+    const summary = await storage.getSummary({ source: "github-copilot" });
+    expect(summary.inputTokens).toBe(1000);
+    expect(summary.outputTokens).toBe(250);
+    expect(summary.cacheReadTokens).toBe(100);
+    expect(summary.sessionCount).toBe(1);
+
+    const sessions = await storage.listSessions({});
+    expect(sessions[0]).toMatchObject({ source: "github-copilot", sessionId: "copilot-session-1", totalTokens: 1350 });
   });
 
   it("serves filtered summaries and breakdowns from the rollup", async () => {
@@ -291,6 +307,21 @@ describe("SQLite storage adapter", () => {
 
     const options = await storage.getFilterOptions();
     expect(options.sources).toEqual(expect.arrayContaining(["claude-code", "claude-code-jsonl"]));
+  });
+
+  it("links a VS Code Copilot transcript to the stable OTLP session id", async () => {
+    storage = new SqliteStorageAdapter(tmpDbPath());
+    await storage.ingestOtelTraces(copilotVsCodeTraceBatch("stable-vscode-session"));
+
+    const content = copilotVsCodeTranscript("1e41a2d2-f8eb-4905-8434-111858d19287");
+    await storage.importJsonl("copilot-vscode-jsonl", { sessionId: "1e41a2d2-f8eb-4905-8434-111858d19287" }, content, "copilot");
+
+    const sessions = await storage.listSessions({});
+    const stable = sessions.find((s) => s.sessionId === "stable-vscode-session");
+    expect(stable).toBeDefined();
+    expect(stable).toMatchObject({ source: "github-copilot", hasTranscript: true });
+    expect(sessions.find((s) => s.sessionId === "1e41a2d2-f8eb-4905-8434-111858d19287")).toBeUndefined();
+    expect((await storage.getSessionTranscript(stable!.id))?.content).toBe(content);
   });
 
   it("falls back to transcript-derived metrics for sessions with no OTel", async () => {

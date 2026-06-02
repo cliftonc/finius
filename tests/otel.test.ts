@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { parseOtelLogRecords, parseOtelMetricPoints, parseOtelMetricRecords, preferredIdentity } from "../src/server/otel";
-import { codexLogBatch, otlpMetricBatch } from "./fixtures";
+import {
+  otelTraceSessionDiagnostics,
+  parseOtelLogRecords,
+  parseOtelMetricPoints,
+  parseOtelMetricRecords,
+  parseOtelTracePoints,
+  parseOtelTraceRecords,
+  preferredIdentity
+} from "../src/server/otel";
+import { parseTranscript, detectTranscriptFormat } from "../src/server/transcripts";
+import { copilotTraceBatch, copilotVsCodeTraceBatch, copilotVsCodeTranscript, codexLogBatch, otlpMetricBatch } from "./fixtures";
 
 describe("OTLP parser", () => {
   it("extracts Claude Code token and cost metrics", () => {
@@ -86,6 +95,54 @@ describe("OTLP parser", () => {
     const records = parseOtelLogRecords(codexLogBatch());
     expect(records.map((r) => r.eventName)).toEqual(["codex.sse_event", "codex.api_request", "codex.sse_event"]);
     expect(records[0].sessionId).toBe("codex-session-1");
+  });
+
+  it("extracts Copilot token usage from invoke_agent trace spans without double-counting child chat spans", () => {
+    const records = parseOtelTraceRecords(copilotTraceBatch());
+    expect(records).toHaveLength(2);
+    expect(records[0]).toMatchObject({ source: "github-copilot", name: "invoke_agent copilotcli" });
+
+    const points = parseOtelTracePoints(copilotTraceBatch());
+    expect(points.map((p) => [p.source, p.sessionId, p.model, p.tokenType, p.value])).toEqual([
+      ["github-copilot", "copilot-session-1", "gpt-5-mini", "input", 1000],
+      ["github-copilot", "copilot-session-1", "gpt-5-mini", "output", 250],
+      ["github-copilot", "copilot-session-1", "gpt-5-mini", "cache_read", 100]
+    ]);
+  });
+
+  it("groups VS Code Copilot spans by the stable resource session id", () => {
+    const points = parseOtelTracePoints(copilotVsCodeTraceBatch());
+
+    expect(new Set(points.map((p) => p.sessionId))).toEqual(new Set(["vscode-window-session"]));
+    expect(points.map((p) => [p.model, p.tokenType, p.value])).toEqual([
+      ["oswe-vscode-prime", "input", 30000],
+      ["oswe-vscode-prime", "output", 4800],
+      ["gpt-4o-mini-2024-07-18", "input", 260],
+      ["gpt-4o-mini-2024-07-18", "output", 66]
+    ]);
+
+    expect(otelTraceSessionDiagnostics(copilotVsCodeTraceBatch()).map((span) => [span.selectedSessionId, span.sessionId, span.genAiConversationId])).toEqual([
+      ["vscode-window-session", "vscode-window-session", "1e41a2d2-f8eb-4905-8434-111858d19287"],
+      ["vscode-window-session", "vscode-window-session", "10ec3be6-89f1-4bb1-90ff-01234591ed3c"]
+    ]);
+  });
+
+  it("parses VS Code Copilot transcripts as a session marker without token metrics", () => {
+    const lines = copilotVsCodeTranscript("copilot-chat-session").split(/\n/);
+    expect(detectTranscriptFormat(lines)).toBe("copilot");
+
+    const parsed = parseTranscript("copilot", "copilot-vscode-jsonl", { sessionId: "stable-vscode-session" }, lines);
+    expect(parsed.result).toMatchObject({ importedLines: 3, malformedLines: 0, metricPoints: 1, rawEvents: 3 });
+    expect(parsed.points).toEqual([
+      expect.objectContaining({
+        source: "copilot-vscode-jsonl",
+        sessionId: "stable-vscode-session",
+        metricName: "copilot.chat.session",
+        kind: "session",
+        tokenType: "transcript",
+        value: 1
+      })
+    ]);
   });
 
   it("prefers email, account id, then user id for identity", () => {

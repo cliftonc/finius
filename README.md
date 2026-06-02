@@ -4,12 +4,13 @@
 
 # Finius
 
-**Local-first usage & cost tracker for Claude Code and Codex.**
+**Local-first usage & cost tracker for Claude Code, Codex, and GitHub Copilot.**
 
 A [Hono](https://hono.dev) server ingests OTLP HTTP/JSON metrics & logs (and JSONL/rollout
-transcripts from Claude Code and Codex) into SQLite; a React + Vite dashboard renders cost, token,
-session, person, and model breakdowns with live SSE updates. Everything runs on your machine — no
-data leaves your laptop (unless you choose to deploy it on a server for your team!).
+transcripts from Claude Code, Codex, and GitHub Copilot — both the `copilot` CLI and VS Code Copilot
+Chat) into SQLite; a React + Vite dashboard renders cost, token, session, person, and model
+breakdowns with live SSE updates. Everything runs on your machine — no data leaves your laptop
+(unless you choose to deploy it on a server for your team!).
 
 <img src="public/finius-dashboard.png" alt="Finius dashboard showing local usage and cost analytics" width="900" />
 
@@ -23,11 +24,11 @@ built-in `node:sqlite` module; developed on Node 24).
 ```bash
 npx @cliftonc/finius # first run: installs finius globally, then walks you through setup
 finius serve         # start the server + dashboard at http://localhost:8787
-finius import all    # optional: import old Claude Code + Codex sessions
+finius import all    # optional: import old Claude Code + Codex + Copilot sessions
 ```
 
-Then launch Claude Code or Codex in a new terminal and start coding — the dashboard at
-**http://localhost:8787** updates live as telemetry arrives.
+Then launch Claude Code, Codex, or GitHub Copilot in a new terminal and start coding — the dashboard
+at **http://localhost:8787** updates live as telemetry arrives.
 
 That's it. Three things just happened:
 
@@ -35,12 +36,18 @@ That's it. Three things just happened:
    `~/.finius/config.json` and — with your consent — edited `~/.claude/settings.json` to add the OTLP
    env vars plus a `SessionEnd` + `PreCompact` hook (`finius hook`) that uploads each session
    transcript. If Codex is installed, setup likewise offers to add its `Stop` hook and OTEL logging to
-   `~/.codex/config.toml`.
+   `~/.codex/config.toml`. If GitHub Copilot is installed, setup offers to enable VS Code Copilot
+   Chat's OpenTelemetry exporter (in VS Code's `settings.json`) and to add the `copilot` CLI's OTLP
+   env vars to your shell profile. Copilot reports usage **live over OTLP**, not via a session-end
+   hook — unlike Claude Code/Codex there's no transcript-upload hook (Copilot exposes no `SessionEnd`
+   equivalent), so token/cost arrive from the live OTLP stream and chat transcripts are picked up only
+   when you run `finius import copilot`.
 2. **`finius serve`** started a single process exposing the API **and** the dashboard on one port.
    Its data lives under `~/.finius` (override with `FINIUS_DB_PATH` / `FINIUS_BLOB_DIR`).
 3. Any Claude Code session you run now reports usage to that local server. If you ran
-   `finius import all`, Finius also backfilled historical Claude Code and Codex transcripts already on
-   disk. Use `finius import claude` or `finius import codex` to import only one agent.
+   `finius import all`, Finius also backfilled historical Claude Code, Codex, and VS Code Copilot Chat
+   transcripts already on disk. Use `finius import claude`, `finius import codex`, or
+   `finius import copilot` to import only one agent.
 
 Re-run `finius setup` any time to reconfigure, or `finius doctor` to diagnose telemetry that isn't
 arriving.

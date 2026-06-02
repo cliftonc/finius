@@ -12,7 +12,7 @@ import { banner, pc } from "./ui.js";
 const COMMANDS: Array<[string, string]> = [
   ["finius", "Run setup if not configured, otherwise show status & help"],
   ["finius setup [url]", "Configure server URL + Claude Code telemetry env & hook"],
-  ["finius import [claude|codex|all]", "Import historical Claude/Codex sessions only"],
+  ["finius import [claude|codex|copilot|all]", "Import historical Claude/Codex/Copilot sessions"],
   ["finius serve [--port N]", "Start the Finius server (API + dashboard)"],
   ["finius service <install|start|stop|status|logs|remove>", "Manage Finius as a Linux systemd service"],
   ["finius doctor", "Diagnose telemetry/hook/server config and connectivity"],

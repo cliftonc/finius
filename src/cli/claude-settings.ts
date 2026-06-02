@@ -30,6 +30,10 @@ export function withTelemetryEnv(settings: ClaudeSettings, serverUrl: string, au
   settings.env = {
     ...settings.env,
     CLAUDE_CODE_ENABLE_TELEMETRY: "1",
+    // Pin the service name so finius labels this traffic as claude-code. Claude Code doesn't set it
+    // itself, so without this it inherits whatever OTEL_SERVICE_NAME is exported in the shell — e.g.
+    // the `github-copilot` value finius's Copilot setup writes to the profile — and gets mislabeled.
+    OTEL_SERVICE_NAME: "claude-code",
     OTEL_METRICS_EXPORTER: "otlp",
     OTEL_LOGS_EXPORTER: "otlp",
     // Finius ingests OTLP/JSON. Set both the generic and per-signal protocol keys — some OTel SDK

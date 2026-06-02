@@ -1,7 +1,8 @@
 # Finius quick-start
 
-Finius is a local-first Claude Code / Codex usage tracker: a single process ingests OpenTelemetry
-metrics + JSONL transcripts into SQLite and serves a dashboard. This guide walks three setups:
+Finius is a local-first Claude Code / Codex / GitHub Copilot usage tracker: a single process ingests
+OpenTelemetry metrics + JSONL transcripts into SQLite and serves a dashboard. This guide walks three
+setups:
 
 1. [Local, single machine](#1-local-single-machine-no-auth) — no auth, fastest path.
 2. [Team deployment](#2-team-deployment-on-a-server) — a shared server behind a real domain + TLS.
@@ -29,10 +30,24 @@ The first run installs `finius` globally and walks you through setup. Answer the
 | **Require authentication to view/ingest?** | **No** (local-only; nothing else can reach `127.0.0.1`) |
 | **Your email for attribution** | Accept the detected email (so sessions are attributed to you) |
 | **Add OpenTelemetry env vars / install the hook?** | **Yes** to both — this is what makes Claude Code report usage |
+| **Configure Codex / GitHub Copilot?** | Shown only for the agents you have installed — see below |
 | **Import your existing sessions now?** | Optional — backfills past transcripts |
 
 Setup writes config to `~/.finius/config.json` and adds the OTEL env vars + the upload hook to
-`~/.claude/settings.json`.
+`~/.claude/settings.json`. It also detects Codex and GitHub Copilot and offers to wire each up:
+
+- **Codex** → adds a `Stop` hook + OTEL logging to `~/.codex/config.toml`.
+- **GitHub Copilot** → enables VS Code Copilot Chat's OpenTelemetry exporter in VS Code's
+  `settings.json`, and (for the `copilot` CLI) adds OTLP env vars to your shell profile inside a
+  managed `# >>> finius copilot otel >>>` block. Restart your shell, then launch `copilot` from that
+  terminal. Note: VS Code launched from the Dock/Finder may not inherit shell-profile variables —
+  launching `code` from a configured terminal is the reliable path when the server runs in Secure Mode.
+
+  Unlike Claude Code and Codex, **Copilot gets no transcript-upload hook** — it exposes no
+  `SessionEnd`-style event to attach to. Token/cost data therefore arrives **live over OTLP** (the
+  exporter + env vars above), and Copilot chat transcripts are imported only on demand by re-running
+  `finius import copilot`. Run that periodically if you want the in-dashboard transcript viewer to
+  stay current.
 
 ### Step 2 — Start the server
 
@@ -49,10 +64,11 @@ This serves the API **and** the dashboard on one port:
 
 Open **http://localhost:8787** in your browser.
 
-### Step 3 — Run a Claude Code session
+### Step 3 — Run a session
 
-**Restart any open Claude Code sessions** (env vars are read at launch), then just use Claude Code
-normally. Usage streams to the dashboard live (it updates over SSE — no refresh needed).
+**Restart any open Claude Code / Codex sessions and reload VS Code** (env vars are read at launch),
+then just use your agent normally. Usage streams to the dashboard live (it updates over SSE — no
+refresh needed).
 
 > Already had Claude Code open, or want a one-off without editing your settings? Use the bundled
 > launcher, which exports the telemetry env vars for a single run:
@@ -63,7 +79,7 @@ normally. Usage streams to the dashboard live (it updates over SSE — no refres
 ### Verify
 
 ```bash
-finius doctor   # checks config ↔ settings ↔ server reachability + the hook/PATH
+finius doctor   # checks config ↔ Claude/Copilot settings ↔ server reachability + the hook/PATH
 ```
 
 If usage isn't showing up, `doctor` is the first stop — the usual cause is the served port and the

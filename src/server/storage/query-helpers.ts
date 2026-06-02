@@ -10,8 +10,7 @@ export const GRANULARITY_MS: Record<Granularity, number> = {
   week: 604_800_000
 };
 
-// The source OTel metrics ingest under (see parseOtelMetricPoints). JSONL transcripts ingest under a
-// different source ('claude-code-jsonl'), so this is also the authoritative side of precedence.
+// Claude Code's OTel source. Other OTel-native agents (e.g. Copilot) carry their own source strings.
 export const OTEL_SOURCE = "claude-code";
 
 export function canUseRollup(filters: SummaryFilters, granularity?: Granularity) {

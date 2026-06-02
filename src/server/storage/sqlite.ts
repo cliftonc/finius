@@ -1,10 +1,19 @@
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { type BlobStore, LocalBlobStore } from "./blob.js";
 import { detectTranscriptFormat, parseTranscript, shouldReplaceBySession } from "../transcripts.js";
-import { parseOtelLogRecords, parseOtelMetricPoints, parseOtelMetricRecords, preferredIdentity, stableHash } from "../otel.js";
+import {
+  otelTraceSessionDiagnostics,
+  parseOtelLogRecords,
+  parseOtelMetricPoints,
+  parseOtelMetricRecords,
+  parseOtelTracePoints,
+  parseOtelTraceRecords,
+  preferredIdentity,
+  stableHash
+} from "../otel.js";
 import type { OtelMetricRecord } from "../otel.js";
 import { COMPUTED_COST_METRIC, computeCostPoints, indexPrices, type PriceIndex } from "../pricing.js";
 import type { SnapshotFetcher } from "../pricing-backfill.js";
@@ -22,11 +31,13 @@ import type {
   ModelSummary,
   ModelTimeseriesPoint,
   OAuthUserInput,
+  OtelLogRecord,
   PersonSummary,
   SessionSummary,
   StorageAdapter,
   Summary,
   SummaryFilters,
+  TelemetryIdentity,
   TranscriptFormat,
   TimeseriesPoint,
   TranscriptInfo
@@ -79,14 +90,15 @@ export class SqliteStorageAdapter implements StorageAdapter {
     this.loadPricing();
   }
 
-  async ingestOtelMetrics(batch: unknown) {
+  async ingestOtelMetrics(batch: unknown, identity?: TelemetryIdentity) {
     const hash = stableHash("otlp_metrics", batch);
     const rawBatchId = this.insertRawBatch("otlp_metrics", hash, batch);
     if (rawBatchId === null) return { duplicate: true, points: 0 };
 
-    const points = parseOtelMetricPoints(batch);
+    const points = parseOtelMetricPoints(batch).map((point) => withTelemetryIdentity(point, identity));
     // Still parsed (not persisted) so we can warn once if a backend sends CUMULATIVE temporality.
     warnIfCumulative(parseOtelMetricRecords(batch));
+    debugOtelSignal("metrics", () => metricDebugEvents(points));
 
     this.db.exec("BEGIN");
     try {
@@ -103,6 +115,34 @@ export class SqliteStorageAdapter implements StorageAdapter {
     return { duplicate: false, points: points.length };
   }
 
+  async ingestOtelTraces(batch: unknown, identity?: TelemetryIdentity) {
+    const hash = stableHash("otlp_traces", batch);
+    const rawBatchId = this.insertRawBatch("otlp_traces", hash, batch);
+    if (rawBatchId === null) return { duplicate: true, spans: 0, points: 0 };
+
+    const spans = parseOtelTraceRecords(batch);
+    const tokenPoints = parseOtelTracePoints(batch).map((point) => withTelemetryIdentity(point, identity));
+    debugOtelSignal("traces", () => traceDebugEvents(batch));
+    const points = [...tokenPoints, ...computeCostPoints(tokenPoints, this.priceIndex)];
+
+    this.db.exec("BEGIN");
+    try {
+      for (const point of points) {
+        this.insertMetricPoint(point, rawBatchId);
+        this.upsertRollup(point);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    void this.backfillHistoricalPricing(tokenPoints).catch((err) =>
+      console.warn(`[finius] historical pricing backfill for OTLP traces failed: ${(err as Error).message}`)
+    );
+    return { duplicate: false, spans: spans.length, points: points.length };
+  }
+
   async ingestOtelLogs(batch: unknown) {
     const hash = stableHash("otlp_logs", batch);
     const rawBatchId = this.insertRawBatch("otlp_logs", hash, batch);
@@ -114,6 +154,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
     // cost-less subset of the rollout, so counting it here would undercount and drop cost — we keep it
     // visible as log_events only. raw_batches still holds the verbatim payload for replay.
     const records = parseOtelLogRecords(batch);
+    debugOtelSignal("logs", () => logDebugEvents(records));
     const insert = this.db.prepare(
       `INSERT INTO log_events (event_name, severity, session_id, timestamp, attributes_json, body_json, raw_batch_id)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -241,7 +282,9 @@ export class SqliteStorageAdapter implements StorageAdapter {
     const lines = content.split(/\r?\n/);
     // Pluggable per-agent parser: explicit format wins, else sniff (Claude vs Codex).
     const resolvedFormat = format ?? detectTranscriptFormat(lines);
-    const parsed = parseTranscript(resolvedFormat, source, sessionHint, lines);
+    const effectiveSessionHint =
+      resolvedFormat === "copilot" ? { ...sessionHint, sessionId: this.resolveCopilotTranscriptSession(sessionHint.sessionId) ?? sessionHint.sessionId } : sessionHint;
+    const parsed = parseTranscript(resolvedFormat, source, effectiveSessionHint, lines);
 
     // If this transcript has usage on days we hold no price for, fetch the historical pricing now
     // (serial, deduped) so the cost we synthesize below uses the rate in effect at the time.
@@ -275,7 +318,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
       }
       // Link the file to the single session row for its UUID (inserting the points above already
       // upserted it, recording has_jsonl). "View transcript" then surfaces on that one session.
-      const sessionId = sessionHint.sessionId ?? parsed.points[0]?.sessionId ?? null;
+      const sessionId = effectiveSessionHint.sessionId ?? parsed.points[0]?.sessionId ?? null;
       const sessionRow = sessionId
         ? (this.db.prepare("SELECT id FROM sessions WHERE session_id = ?").get(sessionId) as { id: number } | undefined)
         : undefined;
@@ -292,6 +335,26 @@ export class SqliteStorageAdapter implements StorageAdapter {
     }
 
     return parsed.result;
+  }
+
+  private resolveCopilotTranscriptSession(chatSessionId: string | null | undefined): string | undefined {
+    if (!chatSessionId) return undefined;
+    const row = this.db
+      .prepare(
+        `SELECT session_id AS sessionId
+         FROM metric_points
+         WHERE source = 'github-copilot'
+           AND signal = 'otlp_metrics'
+           AND (
+             json_extract(attributes_json, '$."copilot_chat.chat_session_id"') = ?
+             OR json_extract(attributes_json, '$."copilot_chat.session_id"') = ?
+             OR json_extract(attributes_json, '$."gen_ai.conversation.id"') = ?
+           )
+         ORDER BY timestamp DESC
+         LIMIT 1`
+      )
+      .get(chatSessionId, chatSessionId, chatSessionId) as { sessionId: string } | undefined;
+    return row?.sessionId;
   }
 
   // For each token-usage day earlier than the earliest price we hold, fetch that day's historical
@@ -625,8 +688,10 @@ export class SqliteStorageAdapter implements StorageAdapter {
              WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'cost') AS otelTotalCost,
           (SELECT COALESCE(SUM(mp.value), 0) FROM metric_points mp
              WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' AND mp.kind = 'cost') AS jsonlTotalCost,
-          -- The actual transcript source for this session (e.g. 'claude-code-jsonl' vs 'codex-cli-jsonl'),
+          -- The actual source for each signal on this session (e.g. 'copilot-chat' vs 'codex-cli-jsonl'),
           -- so the UI can tell which agent produced it. Independent of the authoritative join/filters.
+          (SELECT mp.source FROM metric_points mp
+             WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' LIMIT 1) AS otelSource,
           (SELECT mp.source FROM metric_points mp
              WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' LIMIT 1) AS jsonlSource,
           GROUP_CONCAT(DISTINCT p.model) AS models,
@@ -645,6 +710,7 @@ export class SqliteStorageAdapter implements StorageAdapter {
           hasTranscript: number;
           hasOtel: number;
           hasJsonl: number;
+          otelSource: string | null;
           jsonlSource: string | null;
         }
       >;
@@ -653,13 +719,11 @@ export class SqliteStorageAdapter implements StorageAdapter {
     // keyed by the session's canonical identity string, so the sessions list can prefer it over email.
     const directory = this.userDirectory();
     return Promise.resolve(
-      rows.map(({ jsonlSource, ...row }) => {
+      rows.map(({ otelSource, jsonlSource, ...row }) => {
         const u = (row.userRowId ? this.getUserById(row.userRowId) : null) ?? directory.get(row.userEmail ?? row.userAccountId ?? row.userId ?? "unknown");
         return {
           ...row,
-          // The authoritative source string. OTel only comes from Claude today; for a transcript we
-          // surface its real source (e.g. 'codex-cli-jsonl') so the UI can identify the agent.
-          source: row.metricSource === "otel" ? OTEL_SOURCE : jsonlSource ?? "claude-code-jsonl",
+          source: row.metricSource === "otel" ? otelSource ?? OTEL_SOURCE : jsonlSource ?? "claude-code-jsonl",
           metricSource: row.metricSource,
           hasOtel: row.hasOtel === 1,
           hasJsonl: row.hasJsonl === 1,
@@ -1452,6 +1516,97 @@ export class SqliteStorageAdapter implements StorageAdapter {
       .all(...params) as Array<{ grp: string | null; sessions: number }>;
     return new Map(rows.map((r) => [String(r.grp || "unknown"), r.sessions]));
   }
+}
+
+function withTelemetryIdentity(point: MetricPointInput, identity?: TelemetryIdentity): MetricPointInput {
+  if (!identity) return point;
+  return {
+    ...point,
+    userEmail: point.userEmail ?? identity.userEmail,
+    userId: point.userId ?? identity.userId,
+    userAccountId: point.userAccountId ?? identity.userAccountId,
+    githubLogin: point.githubLogin ?? identity.githubLogin,
+    displayName: point.displayName ?? identity.displayName
+  };
+}
+
+// FINIUS_DEBUG_OTEL_SESSIONS — when set, surface every OTLP event we ingest across ALL three signals
+// (metrics, logs, traces) so you can see which session each one lands on. "1"/"true"/"stderr" prints a
+// readable, indented summary to stderr; any other value is treated as a file path that receives one
+// structured NDJSON line per batch (machine-readable, for grepping). The `build` thunk is only invoked
+// when the var is set, so parsing/formatting is free when debugging is off.
+type OtelDebugEvent = { line: string; data: Record<string, unknown> };
+
+function debugOtelSignal(signal: "metrics" | "logs" | "traces", build: () => OtelDebugEvent[]): void {
+  const target = process.env.FINIUS_DEBUG_OTEL_SESSIONS;
+  if (!target) return;
+
+  const events = build();
+  if (events.length === 0) return;
+
+  const toStderr = target === "1" || target.toLowerCase() === "true" || target.toLowerCase() === "stderr";
+  if (!toStderr) {
+    const line = JSON.stringify({ at: Date.now(), signal, count: events.length, events: events.map((e) => e.data) });
+    try {
+      appendFileSync(target, `${line}\n`, "utf8");
+    } catch (error) {
+      console.error(`[finius] OTLP ${signal} session diagnostics failed: ${(error as Error).message}`);
+    }
+    return;
+  }
+
+  const noun = events.length === 1 ? "event" : "events";
+  const header = `[finius] OTLP ${signal} ▸ ${events.length} ${noun}`;
+  const body = events.map((e) => `    · ${e.line}`).join("\n");
+  console.error(`${header}\n${body}`);
+}
+
+// Compact a long session/conversation UUID so it stays scannable in the console (otherwise the id
+// dominates every line).
+function debugShortId(id: string | null | undefined): string {
+  if (!id) return "—";
+  return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+
+function debugCompactNum(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function metricDebugEvents(points: MetricPointInput[]): OtelDebugEvent[] {
+  return points.map((p) => {
+    const label = p.kind === "cost" ? `cost=$${p.value}` : `${p.kind}${p.tokenType ? `/${p.tokenType}` : ""}=${debugCompactNum(p.value)}`;
+    const identity = preferredIdentity(p);
+    return {
+      line: `${debugShortId(p.sessionId)}  ${label}  model=${p.model ?? "—"}  by=${identity}  src=${p.source}`,
+      data: {
+        source: p.source,
+        sessionId: p.sessionId,
+        model: p.model ?? null,
+        kind: p.kind,
+        tokenType: p.tokenType ?? null,
+        value: p.value,
+        unit: p.unit ?? null,
+        identity
+      }
+    };
+  });
+}
+
+function logDebugEvents(records: OtelLogRecord[]): OtelDebugEvent[] {
+  return records.map((r) => ({
+    line: `${debugShortId(r.sessionId)}  ${r.eventName ?? "(unnamed)"}${r.severityText ? `  [${r.severityText}]` : ""}`,
+    data: { eventName: r.eventName, severity: r.severityText, sessionId: r.sessionId, timestamp: r.timestamp }
+  }));
+}
+
+function traceDebugEvents(batch: unknown): OtelDebugEvent[] {
+  return otelTraceSessionDiagnostics(batch).map((d) => ({
+    line: `${debugShortId(d.selectedSessionId)}  ${d.spanName}  model=${d.model ?? "—"}  tokens=${debugCompactNum(d.tokenTotal)}  src=${d.source}`,
+    data: d as unknown as Record<string, unknown>
+  }));
 }
 
 function safeParse(json: string | null): unknown {

@@ -16,6 +16,8 @@ describe("withTelemetryEnv", () => {
 
     expect(settings.env?.EXISTING).toBe("keep");
     expect(settings.env?.CLAUDE_CODE_ENABLE_TELEMETRY).toBe("1");
+    // Pinned so an inherited OTEL_SERVICE_NAME (e.g. the Copilot setup's github-copilot) can't mislabel it.
+    expect(settings.env?.OTEL_SERVICE_NAME).toBe("claude-code");
     expect(settings.env?.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT).toBe("http://localhost:8787/otlp/v1/metrics");
     expect(settings.env?.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT).toBe("http://localhost:8787/otlp/v1/logs");
     // Generic protocol + fast flush intervals so usage shows up quickly and SDKs that ignore the

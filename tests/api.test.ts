@@ -1,11 +1,18 @@
 import { mkdtempSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/server/app";
 import { EventBus } from "../src/server/events";
 import { SqliteStorageAdapter } from "../src/server/storage/sqlite";
-import { otlpMetricBatch } from "./fixtures";
+import { copilotTraceBatch, otlpMetricBatch } from "./fixtures";
+
+const require = createRequire(import.meta.url);
+const { ServiceClientType, getExportRequestProto } = require("@opentelemetry/otlp-proto-exporter-base") as {
+  ServiceClientType: { SPANS: number };
+  getExportRequestProto: (type: number) => { encode: (value: unknown) => { finish: () => Uint8Array } };
+};
 
 let storage: SqliteStorageAdapter | null = null;
 
@@ -34,6 +41,48 @@ describe("API", () => {
 
     const sessions = await app.request("/api/sessions");
     expect(await sessions.json()).toHaveLength(1);
+  });
+
+  it("accepts OTLP/protobuf trace requests", async () => {
+    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    const app = createApp({ storage, events: new EventBus() });
+    const proto = getExportRequestProto(ServiceClientType.SPANS);
+    const body = Buffer.from(proto.encode(copilotTraceBatch()).finish());
+
+    const response = await app.request("/otlp/v1/traces", {
+      method: "POST",
+      headers: { "content-type": "application/x-protobuf" },
+      body
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ duplicate: false, spans: 2 });
+    const summary = await (await app.request("/api/metrics/summary?source=github-copilot")).json();
+    expect(summary).toMatchObject({ inputTokens: 1000, outputTokens: 250, cacheReadTokens: 100 });
+  });
+
+  it("uses Finius identity headers when Copilot traces omit user identity", async () => {
+    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    const app = createApp({ storage, events: new EventBus() });
+
+    const response = await app.request("/otlp/v1/traces", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-finius-user-email": encodeURIComponent("dev@example.com"),
+        "x-finius-github-login": "devhandle",
+        "x-finius-display-name": encodeURIComponent("Dev User")
+      },
+      body: JSON.stringify(copilotTraceBatch("header-user-session"))
+    });
+
+    expect(response.status).toBe(200);
+    const sessions = (await (await app.request("/api/sessions")).json()) as Array<{ userEmail: string | null; githubLogin: string | null; displayName: string | null }>;
+    expect(sessions[0]).toMatchObject({
+      userEmail: "dev@example.com",
+      githubLogin: "devhandle",
+      displayName: "Dev User"
+    });
   });
 
   it("returns stable empty dashboard responses", async () => {

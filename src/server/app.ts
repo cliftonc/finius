@@ -7,7 +7,8 @@ import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "./events.js";
-import type { Granularity, MetricPointInput, StorageAdapter, SummaryFilters, TranscriptFormat } from "./types.js";
+import { OtlpDecodeError, decodeOtlpBody, type OtlpSignal } from "./otlp-decode.js";
+import type { Granularity, MetricPointInput, StorageAdapter, SummaryFilters, TelemetryIdentity, TranscriptFormat } from "./types.js";
 
 const GRANULARITIES: Granularity[] = ["minute", "five_minute", "quarter_hour", "hour", "day", "week"];
 
@@ -211,17 +212,25 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
 
   app.post("/otlp/v1/metrics", async (c) => {
     const body = await readOtlpBody(c, "metrics");
-    if (body === null) return c.json({ error: "expected an OTLP/JSON body" }, 415);
-    const result = await storage.ingestOtelMetrics(body);
+    if (body instanceof OtlpDecodeError) return c.json({ error: body.message }, body.status as 400 | 415);
+    const result = await storage.ingestOtelMetrics(body, telemetryIdentity(c, storage));
     if (!result.duplicate) events.publish("ingest", { signal: "metrics", ...result });
     return c.json(result);
   });
 
   app.post("/otlp/v1/logs", async (c) => {
     const body = await readOtlpBody(c, "logs");
-    if (body === null) return c.json({ error: "expected an OTLP/JSON body" }, 415);
+    if (body instanceof OtlpDecodeError) return c.json({ error: body.message }, body.status as 400 | 415);
     const result = await storage.ingestOtelLogs(body);
     if (!result.duplicate) events.publish("ingest", { signal: "logs", ...result });
+    return c.json(result);
+  });
+
+  app.post("/otlp/v1/traces", async (c) => {
+    const body = await readOtlpBody(c, "traces");
+    if (body instanceof OtlpDecodeError) return c.json({ error: body.message }, body.status as 400 | 415);
+    const result = await storage.ingestOtelTraces(body, telemetryIdentity(c, storage));
+    if (!result.duplicate) events.publish("ingest", { signal: "traces", ...result });
     return c.json(result);
   });
 
@@ -445,6 +454,36 @@ function currentAuth(c: Context, storage: StorageAdapter): { tokenId: number; us
   return row && row.revoked === 0 ? { tokenId: row.id, userRowId: row.userRowId } : null;
 }
 
+function telemetryIdentity(c: Context, storage: StorageAdapter): TelemetryIdentity | undefined {
+  const fromHeaders: TelemetryIdentity = {
+    userEmail: decodedHeader(c, "x-finius-user-email"),
+    userId: decodedHeader(c, "x-finius-user-id"),
+    userAccountId: decodedHeader(c, "x-finius-user-account-id"),
+    githubLogin: decodedHeader(c, "x-finius-github-login"),
+    displayName: decodedHeader(c, "x-finius-display-name")
+  };
+  if (Object.values(fromHeaders).some(Boolean)) return fromHeaders;
+
+  const auth = currentAuth(c, storage);
+  const user = auth?.userRowId ? storage.getUserById(auth.userRowId) : null;
+  if (!user) return undefined;
+  return {
+    userEmail: user.email,
+    githubLogin: user.githubLogin,
+    displayName: user.displayName
+  };
+}
+
+function decodedHeader(c: Context, name: string): string | undefined {
+  const value = c.req.header(name);
+  if (!value) return undefined;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function oauthStateCookie(state: string, callbackUrl: string) {
   const secure = callbackUrl.startsWith("https://") ? "; Secure" : "";
   return `finius_oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600${secure}`;
@@ -584,16 +623,13 @@ function githubHeaders(token: string): HeadersInit {
   };
 }
 
-// Reads an OTLP request body as text (so a debug dump can capture the exact bytes the agent sent —
-// even non-JSON), optionally captures it, then parses JSON. Returns null when the body isn't valid
-// OTLP/JSON (e.g. an agent that sends protobuf). Set FINIUS_DEBUG_OTEL to a file path to append every
-// batch as `{kind, at, contentType, raw}` NDJSON — used to discover what a new agent (e.g. Codex)
-// actually emits before writing a parser for it.
-async function readOtlpBody(c: Context, kind: "metrics" | "logs"): Promise<unknown> {
-  const raw = await c.req.text();
+// Reads an OTLP request body as bytes, optionally captures a base64 debug dump, then decodes JSON or
+// protobuf OTLP. Set FINIUS_DEBUG_OTEL to append `{kind, at, contentType, rawBase64}` NDJSON.
+async function readOtlpBody(c: Context, kind: OtlpSignal): Promise<unknown | OtlpDecodeError> {
+  const raw = Buffer.from(await c.req.arrayBuffer());
   const debugPath = process.env.FINIUS_DEBUG_OTEL;
   if (debugPath) {
-    const line = JSON.stringify({ kind, at: Date.now(), contentType: c.req.header("content-type") ?? null, raw });
+    const line = JSON.stringify({ kind, at: Date.now(), contentType: c.req.header("content-type") ?? null, rawBase64: raw.toString("base64") });
     try {
       appendFileSync(debugPath, `${line}\n`);
       console.log(`[finius] OTLP ${kind} batch captured -> ${debugPath} (${raw.length} bytes)`);
@@ -602,9 +638,10 @@ async function readOtlpBody(c: Context, kind: "metrics" | "logs"): Promise<unkno
     }
   }
   try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
+    return decodeOtlpBody(raw, kind, c.req.header("content-type"), c.req.header("content-encoding"));
+  } catch (error) {
+    if (error instanceof OtlpDecodeError) return error;
+    return new OtlpDecodeError((error as Error).message, 400);
   }
 }
 

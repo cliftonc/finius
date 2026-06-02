@@ -144,6 +144,132 @@ export function codexLogBatch() {
   };
 }
 
+export function copilotTraceBatch(sessionId = "copilot-session-1") {
+  return {
+    resourceSpans: [
+      {
+        resource: {
+          attributes: [
+            { key: "service.name", value: { stringValue: "github-copilot" } },
+            { key: "service.version", value: { stringValue: "1.0.57" } }
+          ]
+        },
+        scopeSpans: [
+          {
+            spans: [
+              {
+                traceId: "AAAAAAAAAAAAAAAAAAAAAA==",
+                spanId: "AAAAAAAAAAA=",
+                name: "invoke_agent copilotcli",
+                startTimeUnixNano: "1760000000000000000",
+                endTimeUnixNano: "1760000002000000000",
+                attributes: [
+                  { key: "gen_ai.operation.name", value: { stringValue: "invoke_agent" } },
+                  { key: "gen_ai.agent.name", value: { stringValue: "copilotcli" } },
+                  { key: "gen_ai.conversation.id", value: { stringValue: sessionId } },
+                  { key: "gen_ai.response.model", value: { stringValue: "gpt-5-mini" } },
+                  { key: "gen_ai.usage.input_tokens", value: { intValue: 1000 } },
+                  { key: "gen_ai.usage.output_tokens", value: { intValue: 250 } },
+                  { key: "gen_ai.usage.cache_read.input_tokens", value: { intValue: 100 } },
+                  { key: "github.copilot.user", value: { stringValue: "octo" } }
+                ]
+              },
+              {
+                traceId: "AAAAAAAAAAAAAAAAAAAAAA==",
+                spanId: "AAAAAAAAAAE=",
+                parentSpanId: "AAAAAAAAAAA=",
+                name: "chat gpt-5-mini",
+                startTimeUnixNano: "1760000000500000000",
+                endTimeUnixNano: "1760000001500000000",
+                attributes: [
+                  { key: "gen_ai.operation.name", value: { stringValue: "chat" } },
+                  { key: "gen_ai.conversation.id", value: { stringValue: sessionId } },
+                  { key: "gen_ai.response.model", value: { stringValue: "gpt-5-mini" } },
+                  { key: "gen_ai.usage.input_tokens", value: { intValue: 9999 } }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  };
+}
+
+export function copilotVsCodeTraceBatch(sessionId = "vscode-window-session") {
+  const tokenSpan = (conversationId: string, model: string, inputTokens: number, outputTokens: number) => ({
+    traceId: `${conversationId.replace(/-/g, "").slice(0, 16)}AAAAAAAA`,
+    spanId: conversationId.replace(/-/g, "").slice(0, 16),
+    name: "invoke_agent GitHub Copilot Chat",
+    startTimeUnixNano: "1760000000000000000",
+    endTimeUnixNano: "1760000002000000000",
+    attributes: [
+      { key: "gen_ai.operation.name", value: { stringValue: "invoke_agent" } },
+      { key: "gen_ai.agent.name", value: { stringValue: "GitHub Copilot Chat" } },
+      { key: "gen_ai.conversation.id", value: { stringValue: conversationId } },
+      { key: "copilot_chat.session_id", value: { stringValue: conversationId } },
+      { key: "copilot_chat.chat_session_id", value: { stringValue: conversationId } },
+      { key: "gen_ai.response.model", value: { stringValue: model } },
+      { key: "gen_ai.usage.input_tokens", value: { intValue: inputTokens } },
+      { key: "gen_ai.usage.output_tokens", value: { intValue: outputTokens } }
+    ]
+  });
+  return {
+    resourceSpans: [
+      {
+        resource: {
+          attributes: [
+            { key: "service.name", value: { stringValue: "github-copilot" } },
+            { key: "service.version", value: { stringValue: "0.50.1" } },
+            { key: "session.id", value: { stringValue: sessionId } }
+          ]
+        },
+        scopeSpans: [
+          {
+            spans: [
+              tokenSpan("1e41a2d2-f8eb-4905-8434-111858d19287", "oswe-vscode-prime", 30000, 4800),
+              tokenSpan("10ec3be6-89f1-4bb1-90ff-01234591ed3c", "gpt-4o-mini-2024-07-18", 260, 66)
+            ]
+          }
+        ]
+      }
+    ]
+  };
+}
+
+export function copilotVsCodeTranscript(sessionId = "1e41a2d2-f8eb-4905-8434-111858d19287") {
+  return [
+    JSON.stringify({
+      type: "session.start",
+      data: {
+        sessionId,
+        version: 1,
+        producer: "copilot-agent",
+        copilotVersion: "0.50.1",
+        vscodeVersion: "1.122.1",
+        startTime: "2026-06-02T04:13:18.237Z"
+      },
+      id: "start",
+      timestamp: "2026-06-02T04:13:18.237Z",
+      parentId: null
+    }),
+    JSON.stringify({
+      type: "user.message",
+      data: { content: "Can you run the tests?", attachments: [] },
+      id: "user-1",
+      timestamp: "2026-06-02T04:17:08.318Z",
+      parentId: "start"
+    }),
+    JSON.stringify({
+      type: "assistant.message",
+      data: { messageId: "assistant-1", content: "Checking the test scripts.", toolRequests: [] },
+      id: "assistant-1",
+      timestamp: "2026-06-02T04:17:12.303Z",
+      parentId: "user-1"
+    })
+  ].join("\n");
+}
+
 // A minimal Codex rollout transcript (the JSONL the codex-hook uploads): session meta, model, and a
 // single cumulative token_count event. Carries NO cost (Codex never reports it).
 export function codexRollout(sessionId = "codex-session-1", model = "gpt-5.1-codex") {

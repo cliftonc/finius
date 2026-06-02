@@ -1,6 +1,7 @@
 import type { ImportResult, MetricPointInput, TranscriptFormat } from "./types.js";
 import { parseClaudeTranscript } from "./claude.js";
 import { parseCodexTranscript } from "./codex.js";
+import { parseCopilotTranscript } from "./copilot.js";
 
 // Shared result shape for every transcript parser (Claude `claude.ts`, Codex `codex.ts`, ...).
 export type ParsedTranscript = {
@@ -18,6 +19,8 @@ export function parseTranscript(
   lines: string[]
 ): ParsedTranscript {
   switch (format) {
+    case "copilot":
+      return parseCopilotTranscript(source, sessionHint, lines);
     case "codex":
       return parseCodexTranscript(source, sessionHint, lines);
     case "claude":
@@ -31,6 +34,7 @@ export function parseTranscript(
 // types. Anything else falls back to Claude (the original transcript format).
 export function detectTranscriptFormat(lines: string[]): TranscriptFormat {
   const CODEX_TYPES = new Set(["session_meta", "event_msg", "response_item", "turn_context"]);
+  const COPILOT_TYPES = new Set(["session.start", "user.message", "assistant.message", "assistant.turn_start", "assistant.turn_end"]);
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -42,6 +46,8 @@ export function detectTranscriptFormat(lines: string[]): TranscriptFormat {
     }
     if (!event || typeof event !== "object") continue;
     const obj = event as Record<string, unknown>;
+    if (typeof obj.type === "string" && COPILOT_TYPES.has(obj.type)) return "copilot";
+    if (obj.kind === 0 && obj.v && typeof obj.v === "object" && typeof (obj.v as Record<string, unknown>).sessionId === "string") return "copilot";
     if (typeof obj.type === "string" && obj.payload && typeof obj.payload === "object" && CODEX_TYPES.has(obj.type)) {
       return "codex";
     }
@@ -54,5 +60,5 @@ export function detectTranscriptFormat(lines: string[]): TranscriptFormat {
 // hook fires per-turn, so re-importing the (now longer) file must REPLACE the session's prior points,
 // not add to them. Claude uploads are point-in-time snapshots and stay append-only.
 export function shouldReplaceBySession(format: TranscriptFormat): boolean {
-  return format === "codex";
+  return format === "codex" || format === "copilot";
 }

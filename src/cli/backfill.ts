@@ -96,7 +96,7 @@ export async function uploadTranscript(
 // large bodies — rendering a live spinner with progress. Returns tallied outcomes.
 export async function backfill(
   files: string[],
-  opts: { source: string; format: TranscriptFormat; label: string }
+  opts: { source: string; format: TranscriptFormat; label: string; sessionIdFromPath?: (path: string) => string | undefined }
 ): Promise<BackfillResult> {
   const result: BackfillResult = { uploaded: 0, duplicate: 0, failed: 0, total: files.length };
   if (files.length === 0) {
@@ -109,7 +109,7 @@ export async function backfill(
   s.start(`Importing ${opts.label}`);
   let done = 0;
   for (const file of files) {
-    const outcome = await uploadTranscript(file, { source: opts.source, format: opts.format });
+    const outcome = await uploadTranscript(file, { source: opts.source, format: opts.format, sessionId: opts.sessionIdFromPath?.(file) });
     if (outcome === "ok") result.uploaded++;
     else if (outcome === "duplicate") result.duplicate++;
     else result.failed++;
