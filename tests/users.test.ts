@@ -2,14 +2,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteStorageAdapter } from "../src/server/storage/sqlite";
+import { DrizzleStorageAdapter } from "../src/server/storage/adapter";
 import { jsonlTranscript, otlpMetricBatch } from "./fixtures";
 
 function tmpDbPath() {
   return join(mkdtempSync(join(tmpdir(), "finius-users-")), "test.sqlite");
 }
 
-let storage: SqliteStorageAdapter | null = null;
+let storage: DrizzleStorageAdapter | null = null;
 
 afterEach(() => {
   storage?.close();
@@ -18,7 +18,7 @@ afterEach(() => {
 
 describe("users registry", () => {
   it("attributes a JSONL import to a user and surfaces friendly fields in listPeople", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.importJsonl("claude-code-jsonl", {
       sessionId: "s1",
       userEmail: "alice@example.com",
@@ -37,7 +37,7 @@ describe("users registry", () => {
   });
 
   it("dedupes by email across sessions (same email ⇒ one user)", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.importJsonl("claude-code-jsonl", { sessionId: "s1", userEmail: "bob@example.com", displayName: "Bob" }, jsonlTranscript("s1"));
     // A later session for the same person, this time without a display name — must enrich, not duplicate.
     await storage.importJsonl("claude-code-jsonl", { sessionId: "s2", userEmail: "bob@example.com" }, jsonlTranscript("s2"));
@@ -48,7 +48,7 @@ describe("users registry", () => {
   });
 
   it("links an account-id-only identity to the email-bearing user (secondary key)", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     // First seen with only an account id (e.g. an early point lacking email)…
     await storage.importJsonl("claude-code-jsonl", { sessionId: "s1", userAccountId: "acct-9" }, jsonlTranscript("s1"));
     // …then a point that carries BOTH email and the same account id should merge into one user.
@@ -61,7 +61,7 @@ describe("users registry", () => {
   });
 
   it("shares one user row between an OTel session and a JSONL session with the same email", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     // otlpMetricBatch carries user.email = dev@example.com on session-a.
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
     await storage.importJsonl("claude-code-jsonl", { sessionId: "s-jsonl", userEmail: "dev@example.com", githubLogin: "devhandle" }, jsonlTranscript("s-jsonl"));
@@ -73,7 +73,7 @@ describe("users registry", () => {
   });
 
   it("links an OAuth login to an existing user by GitHub login", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.importJsonl(
       "claude-code-jsonl",
       { sessionId: "s1", githubLogin: "devhandle", displayName: "Dev" },
@@ -98,7 +98,7 @@ describe("users registry", () => {
   });
 
   it("surfaces the friendly identity (github login/display name) on sessions and the summary breakdown", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.importJsonl(
       "claude-code-jsonl",
       { sessionId: "s1", userEmail: "alice@example.com", githubLogin: "alice", displayName: "Alice A" },
@@ -120,7 +120,7 @@ describe("users registry", () => {
   });
 
   it("leaves people without any identity as 'unknown' (no user row forced)", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.importJsonl("manual-jsonl", { sessionId: "s1" }, jsonlTranscript("s1"));
 
     const people = await storage.listPeople({});

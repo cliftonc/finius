@@ -1,7 +1,7 @@
 import type { ImportResult, MetricPointInput, TranscriptFormat } from "./types.js";
-import { parseClaudeTranscript } from "./claude.js";
-import { parseCodexTranscript } from "./codex.js";
-import { parseCopilotTranscript } from "./copilot.js";
+import { parseClaudeTranscript } from "./providers/claude.js";
+import { parseCodexTranscript } from "./providers/codex.js";
+import { parseCopilotTranscript } from "./providers/copilot.js";
 
 // Shared result shape for every transcript parser (Claude `claude.ts`, Codex `codex.ts`, ...).
 export type ParsedTranscript = {

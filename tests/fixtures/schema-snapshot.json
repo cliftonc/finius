@@ -1,0 +1,976 @@
+{
+  "tables": [
+    "auth_tokens",
+    "log_events",
+    "metric_points",
+    "metric_rollup",
+    "model_prices",
+    "oauth_accounts",
+    "raw_batches",
+    "sessions",
+    "source_files",
+    "users"
+  ],
+  "byTable": {
+    "auth_tokens": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "token_hash",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "label",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "last_used_at",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "revoked",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "user_row_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_auth_tokens_hash",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "token_hash"
+          ]
+        },
+        {
+          "name": "idx_auth_tokens_user_row",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "user_row_id"
+          ]
+        },
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "u",
+          "columns": [
+            "token_hash"
+          ]
+        }
+      ],
+      "fks": [],
+      "withoutRowid": false
+    },
+    "log_events": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "event_name",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "severity",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "session_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "timestamp",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "attributes_json",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "body_json",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "raw_batch_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_log_events_batch",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "raw_batch_id"
+          ]
+        },
+        {
+          "name": "idx_log_events_name",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "event_name"
+          ]
+        }
+      ],
+      "fks": [
+        {
+          "table": "raw_batches",
+          "from": "raw_batch_id",
+          "to": "id",
+          "onUpdate": "NO ACTION",
+          "onDelete": "NO ACTION"
+        }
+      ],
+      "withoutRowid": false
+    },
+    "metric_points": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "source",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "signal",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "session_row_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "session_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_email",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_account_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "model",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "metric_name",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "token_type",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "value",
+          "type": "REAL",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "unit",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "timestamp",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "attributes_json",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "raw_batch_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "is_primary",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": "1",
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_metric_points_metric_name",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "metric_name"
+          ]
+        },
+        {
+          "name": "idx_metric_points_model",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "model"
+          ]
+        },
+        {
+          "name": "idx_metric_points_primary",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "is_primary"
+          ]
+        },
+        {
+          "name": "idx_metric_points_session",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "session_row_id"
+          ]
+        },
+        {
+          "name": "idx_metric_points_signal_session",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "signal",
+            "session_id"
+          ]
+        },
+        {
+          "name": "idx_metric_points_timestamp",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "timestamp"
+          ]
+        }
+      ],
+      "fks": [
+        {
+          "table": "raw_batches",
+          "from": "raw_batch_id",
+          "to": "id",
+          "onUpdate": "NO ACTION",
+          "onDelete": "NO ACTION"
+        },
+        {
+          "table": "sessions",
+          "from": "session_row_id",
+          "to": "id",
+          "onUpdate": "NO ACTION",
+          "onDelete": "NO ACTION"
+        }
+      ],
+      "withoutRowid": false
+    },
+    "metric_rollup": {
+      "cols": [
+        {
+          "name": "bucket",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "source",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 2
+        },
+        {
+          "name": "user_identity",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 3
+        },
+        {
+          "name": "model",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 4
+        },
+        {
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 5
+        },
+        {
+          "name": "token_type",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 6
+        },
+        {
+          "name": "sum_value",
+          "type": "REAL",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "cnt",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_rollup_bucket",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "bucket"
+          ]
+        },
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "pk",
+          "columns": [
+            "bucket",
+            "source",
+            "user_identity",
+            "model",
+            "kind",
+            "token_type"
+          ]
+        }
+      ],
+      "fks": [],
+      "withoutRowid": true
+    },
+    "model_prices": {
+      "cols": [
+        {
+          "name": "model",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "provider",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "input_per_token",
+          "type": "REAL",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "output_per_token",
+          "type": "REAL",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "cache_read_per_token",
+          "type": "REAL",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "cache_creation_per_token",
+          "type": "REAL",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "effective_date",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 2
+        }
+      ],
+      "indexes": [
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "pk",
+          "columns": [
+            "model",
+            "effective_date"
+          ]
+        }
+      ],
+      "fks": [],
+      "withoutRowid": true
+    },
+    "oauth_accounts": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "provider",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "provider_user_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_row_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_oauth_accounts_user_row",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "user_row_id"
+          ]
+        },
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "u",
+          "columns": [
+            "provider",
+            "provider_user_id"
+          ]
+        }
+      ],
+      "fks": [
+        {
+          "table": "users",
+          "from": "user_row_id",
+          "to": "id",
+          "onUpdate": "NO ACTION",
+          "onDelete": "NO ACTION"
+        }
+      ],
+      "withoutRowid": false
+    },
+    "raw_batches": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "signal",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "hash",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "payload_json",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "received_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_raw_batches_received_at",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "received_at"
+          ]
+        },
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "u",
+          "columns": [
+            "hash"
+          ]
+        }
+      ],
+      "fks": [],
+      "withoutRowid": false
+    },
+    "sessions": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "session_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_email",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_account_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_row_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "has_otel",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "has_jsonl",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": "0",
+          "pk": 0
+        },
+        {
+          "name": "metric_source",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": "jsonl",
+          "pk": 0
+        },
+        {
+          "name": "first_seen_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "last_seen_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_sessions_seen",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "last_seen_at"
+          ]
+        },
+        {
+          "name": "idx_sessions_user_row",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "user_row_id"
+          ]
+        },
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "u",
+          "columns": [
+            "session_id"
+          ]
+        }
+      ],
+      "fks": [
+        {
+          "table": "users",
+          "from": "user_row_id",
+          "to": "id",
+          "onUpdate": "NO ACTION",
+          "onDelete": "NO ACTION"
+        }
+      ],
+      "withoutRowid": false
+    },
+    "source_files": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "source",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "session_row_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "session_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "hash",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "blob_key",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "byte_size",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "line_count",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "imported_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_source_files_session",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "session_row_id"
+          ]
+        },
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "u",
+          "columns": [
+            "hash"
+          ]
+        }
+      ],
+      "fks": [
+        {
+          "table": "sessions",
+          "from": "session_row_id",
+          "to": "id",
+          "onUpdate": "NO ACTION",
+          "onDelete": "NO ACTION"
+        }
+      ],
+      "withoutRowid": false
+    },
+    "users": {
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 1
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "account_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "user_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "github_login",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "display_name",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "first_seen_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        },
+        {
+          "name": "last_seen_at",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_users_account_id",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "account_id"
+          ]
+        },
+        {
+          "name": "idx_users_github_login",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "github_login"
+          ]
+        },
+        {
+          "name": "idx_users_user_id",
+          "unique": 0,
+          "origin": "c",
+          "columns": [
+            "user_id"
+          ]
+        },
+        {
+          "name": null,
+          "unique": 1,
+          "origin": "u",
+          "columns": [
+            "email"
+          ]
+        }
+      ],
+      "fks": [],
+      "withoutRowid": false
+    }
+  }
+}

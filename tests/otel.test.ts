@@ -1,13 +1,7 @@
 import { describe, expect, it } from "vitest";
-import {
-  otelTraceSessionDiagnostics,
-  parseOtelLogRecords,
-  parseOtelMetricPoints,
-  parseOtelMetricRecords,
-  parseOtelTracePoints,
-  parseOtelTraceRecords,
-  preferredIdentity
-} from "../src/server/otel";
+import { parseOtelLogRecords, parseOtelMetricRecords, parseOtelTraceRecords, preferredIdentity } from "../src/server/otel";
+import { parseOtelMetricPoints } from "../src/server/providers/claude";
+import { otelTraceSessionDiagnostics, parseOtelTracePoints } from "../src/server/providers/copilot";
 import { parseTranscript, detectTranscriptFormat } from "../src/server/transcripts";
 import { copilotTraceBatch, copilotVsCodeTraceBatch, copilotVsCodeTranscript, codexLogBatch, otlpMetricBatch } from "./fixtures";
 

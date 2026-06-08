@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import type { MetricKind, MetricPointInput, OtelLogRecord } from "./types.js";
+import { sourceFromServiceName } from "../shared/sources.js";
+import type { MetricPointInput, OtelLogRecord } from "./types.js";
 
-type AttributeValue = {
+export type AttributeValue = {
   stringValue?: string;
   intValue?: number | string;
   doubleValue?: number;
@@ -10,45 +11,7 @@ type AttributeValue = {
   kvlistValue?: { values?: Array<{ key: string; value?: AttributeValue }> };
 };
 
-type Attribute = { key: string; value?: AttributeValue };
-
-const TOKEN_METRIC = "claude_code.token.usage";
-const COST_METRIC = "claude_code.cost.usage";
-const LINES_METRIC = "claude_code.lines_of_code.count";
-const DECISION_METRIC = "claude_code.code_edit_tool.decision";
-const ACTIVE_TIME_METRIC = "claude_code.active_time.total";
-const SESSION_METRIC = "claude_code.session.count";
-const PR_METRIC = "claude_code.pull_request.count";
-const COMMIT_METRIC = "claude_code.commit.count";
-
-export const CLAUDE_OTEL_SOURCE = "claude-code";
-export const COPILOT_CLI_SOURCE = "github-copilot";
-export const COPILOT_CHAT_SOURCE = "copilot-chat";
-
-// Maps an OTLP metric to our (kind, sub-type) for the metric_points table. Returns null for
-// metrics we don't aggregate (those data points are dropped).
-function classifyMetric(metricName: string, attributes: Record<string, unknown>): { kind: MetricKind; tokenType: string | null } | null {
-  switch (metricName) {
-    case TOKEN_METRIC:
-      return { kind: "tokens", tokenType: normalizeTokenType(stringAttr(attributes, "type")) };
-    case COST_METRIC:
-      return { kind: "cost", tokenType: null };
-    case LINES_METRIC:
-      return { kind: "lines", tokenType: stringAttr(attributes, "type") ?? null };
-    case DECISION_METRIC:
-      return { kind: "decision", tokenType: stringAttr(attributes, "decision") ?? null };
-    case ACTIVE_TIME_METRIC:
-      return { kind: "active_time", tokenType: stringAttr(attributes, "type") ?? null };
-    case SESSION_METRIC:
-      return { kind: "session", tokenType: stringAttr(attributes, "start_type") ?? null };
-    case PR_METRIC:
-      return { kind: "pull_request", tokenType: null };
-    case COMMIT_METRIC:
-      return { kind: "commit", tokenType: null };
-    default:
-      return null;
-  }
-}
+export type Attribute = { key: string; value?: AttributeValue };
 
 export function stableHash(signal: string, batch: unknown) {
   return createHash("sha256").update(signal).update(JSON.stringify(batch)).digest("hex");
@@ -73,61 +36,6 @@ export function decodeAttributeValue(value?: AttributeValue): unknown {
     return attributesToObject(value.kvlistValue?.values as Attribute[] | undefined);
   }
   return null;
-}
-
-export function parseOtelMetricPoints(batch: unknown, source?: string): MetricPointInput[] {
-  const points: MetricPointInput[] = [];
-  const resourceMetrics = asArray((batch as { resourceMetrics?: unknown[] })?.resourceMetrics);
-
-  for (const resourceMetric of resourceMetrics) {
-    const resourceAttrs = attributesToObject((resourceMetric as { resource?: { attributes?: Attribute[] } }).resource?.attributes);
-    const pointSource = source ?? sourceFromAttributes(resourceAttrs);
-    const scopeMetrics = asArray((resourceMetric as { scopeMetrics?: unknown[] }).scopeMetrics);
-
-    for (const scopeMetric of scopeMetrics) {
-      const metrics = asArray((scopeMetric as { metrics?: unknown[] }).metrics);
-      for (const metric of metrics) {
-        const metricName = String((metric as { name?: string }).name ?? "");
-
-        const dataPoints = getMetricDataPoints(metric);
-        for (const dataPoint of dataPoints) {
-          const dataPointAttrs = attributesToObject((dataPoint as { attributes?: Attribute[] }).attributes);
-          const attributes = { ...resourceAttrs, ...dataPointAttrs };
-          const classified = classifyMetric(metricName, attributes);
-          if (!classified) continue;
-
-          const sessionId = stringAttr(attributes, "session.id") ?? stringAttr(attributes, "session_id") ?? "unknown-session";
-          const timestamp = Number(
-            unixNanoToMs(
-              (dataPoint as { timeUnixNano?: string | number; startTimeUnixNano?: string | number }).timeUnixNano ??
-                (dataPoint as { startTimeUnixNano?: string | number }).startTimeUnixNano
-            ) ?? Date.now()
-          );
-          const value = numericValue(dataPoint);
-          if (!Number.isFinite(value)) continue;
-
-          points.push({
-            source: pointSource,
-            signal: "otlp_metrics",
-            sessionId,
-            userId: stringAttr(attributes, "user.id") ?? stringAttr(attributes, "enduser.id"),
-            userEmail: stringAttr(attributes, "user.email"),
-            userAccountId: stringAttr(attributes, "user.account_id") ?? stringAttr(attributes, "user.account_uuid"),
-            model: stringAttr(attributes, "model"),
-            metricName,
-            kind: classified.kind,
-            tokenType: classified.tokenType,
-            value,
-            unit: (metric as { unit?: string }).unit ?? null,
-            timestamp,
-            attributes
-          });
-        }
-      }
-    }
-  }
-
-  return points;
 }
 
 export type OtelMetricRecord = {
@@ -267,75 +175,6 @@ export function parseOtelTraceRecords(batch: unknown): OtelSpanRecord[] {
   return records;
 }
 
-export function parseOtelTracePoints(batch: unknown): MetricPointInput[] {
-  const selected = selectedTokenSpans(parseOtelTraceRecords(batch));
-  const points: MetricPointInput[] = [];
-
-  for (const span of selected) {
-    const attrs = span.attributes;
-    const sessionId = traceSessionId(span);
-    const model =
-      stringAttr(attrs, "gen_ai.response.model") ??
-      stringAttr(attrs, "gen_ai.request.model") ??
-      stringAttr(attrs, "model");
-    const base = {
-      source: span.source,
-      signal: "otlp_metrics" as const,
-      sessionId,
-      userId:
-        stringAttr(attrs, "user.id") ??
-        stringAttr(attrs, "enduser.id") ??
-        stringAttr(attrs, "github.copilot.user") ??
-        stringAttr(attrs, "github.user"),
-      userEmail: stringAttr(attrs, "user.email"),
-      userAccountId: stringAttr(attrs, "user.account_id") ?? stringAttr(attrs, "user.account_uuid"),
-      model,
-      timestamp: span.timestamp,
-      attributes: attrs
-    };
-    for (const [tokenType, value] of tokenEntries(attrs)) {
-      points.push({
-        ...base,
-        metricName: "gen_ai.span.token.usage",
-        kind: "tokens",
-        tokenType,
-        value,
-        unit: "tokens"
-      });
-    }
-  }
-
-  return points;
-}
-
-export function otelTraceSessionDiagnostics(batch: unknown): OtelTraceSessionDiagnostic[] {
-  return selectedTokenSpans(parseOtelTraceRecords(batch)).map((span) => {
-    const attrs = span.attributes;
-    const tokens = tokenEntries(attrs);
-    return {
-      source: span.source,
-      spanName: span.name,
-      traceId: span.traceId,
-      spanId: span.spanId,
-      selectedSessionId: traceSessionId(span),
-      serviceName: stringAttr(attrs, "service.name") ?? null,
-      serviceVersion: stringAttr(attrs, "service.version") ?? null,
-      operationName: stringAttr(attrs, "gen_ai.operation.name") ?? null,
-      agentName: stringAttr(attrs, "gen_ai.agent.name") ?? null,
-      model: stringAttr(attrs, "gen_ai.response.model") ?? stringAttr(attrs, "gen_ai.request.model") ?? stringAttr(attrs, "model") ?? null,
-      sessionId: stringAttr(attrs, "session.id") ?? null,
-      sessionUnderscoreId: stringAttr(attrs, "session_id") ?? null,
-      conversationId: stringAttr(attrs, "conversation.id") ?? null,
-      genAiConversationId: stringAttr(attrs, "gen_ai.conversation.id") ?? null,
-      copilotChatSessionId: stringAttr(attrs, "copilot_chat.session_id") ?? null,
-      copilotChatChatSessionId: stringAttr(attrs, "copilot_chat.chat_session_id") ?? null,
-      tokenTypes: tokens.map(([tokenType]) => tokenType),
-      tokenTotal: tokens.reduce((sum, [, value]) => sum + value, 0),
-      attributeKeys: Object.keys(attrs).sort()
-    };
-  });
-}
-
 // Flattens an OTLP/JSON logs batch into structured records, merging resource + record attributes and
 // decoding the body. Codex's native telemetry is logs-only, so this is the seam through which we
 // capture (and, later, parse) what it sends. Pure / side-effect-free.
@@ -395,7 +234,24 @@ export function preferredIdentity(point: Pick<MetricPointInput, "userEmail" | "u
   return point.userEmail ?? point.userAccountId ?? point.userId ?? "unknown";
 }
 
-function getMetricDataPoints(metric: unknown): unknown[] {
+let warnedCumulative = false;
+
+// Our token/cost aggregation sums data points, which is only correct for DELTA temporality (Claude
+// Code's default). Warn once if a backend ever sends CUMULATIVE, which would overcount.
+export function warnIfCumulative(records: OtelMetricRecord[]) {
+  if (warnedCumulative) return;
+  const cumulative = records.some(
+    (record) => record.temporality === 2 && (record.metricName === "claude_code.token.usage" || record.metricName === "claude_code.cost.usage")
+  );
+  if (cumulative) {
+    warnedCumulative = true;
+    console.warn(
+      "[finius] OTLP metrics arrived with CUMULATIVE temporality; token/cost totals assume DELTA and will overcount. Set OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta."
+    );
+  }
+}
+
+export function getMetricDataPoints(metric: unknown): unknown[] {
   const m = metric as {
     sum?: { dataPoints?: unknown[] };
     gauge?: { dataPoints?: unknown[] };
@@ -404,7 +260,7 @@ function getMetricDataPoints(metric: unknown): unknown[] {
   return asArray(m.sum?.dataPoints ?? m.gauge?.dataPoints ?? m.histogram?.dataPoints);
 }
 
-function numericValue(dataPoint: unknown): number {
+export function numericValue(dataPoint: unknown): number {
   const point = dataPoint as { asDouble?: number; asInt?: number | string; value?: number; sum?: number };
   if (point.asDouble !== undefined) return Number(point.asDouble);
   if (point.asInt !== undefined) return Number(point.asInt);
@@ -413,78 +269,37 @@ function numericValue(dataPoint: unknown): number {
   return NaN;
 }
 
-function stringAttr(attributes: Record<string, unknown>, name: string) {
+export function stringAttr(attributes: Record<string, unknown>, name: string) {
   const value = attributes[name];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function unixNanoToMs(value: string | number | undefined) {
+export function unixNanoToMs(value: string | number | undefined) {
   if (value === undefined) return undefined;
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return undefined;
   return numeric > 10_000_000_000_000 ? Math.floor(numeric / 1_000_000) : numeric;
 }
 
-function normalizeTokenType(type?: string | null) {
-  if (!type) return "total";
-  // Claude Code emits camelCase types (cacheCreation, cacheRead) as well as snake/kebab variants.
-  const normalized = type.replace(/-/g, "_").toLowerCase();
-  if (normalized.includes("cache") && normalized.includes("creation")) return "cache_creation";
-  if (normalized.includes("cache") && normalized.includes("read")) return "cache_read";
-  if (normalized.includes("output")) return "output";
-  if (normalized.includes("input")) return "input";
-  return normalized;
-}
-
-function asArray<T>(value: T[] | undefined | null): T[] {
+export function asArray<T>(value: T[] | undefined | null): T[] {
   return Array.isArray(value) ? value : [];
 }
 
-function sourceFromAttributes(attributes: Record<string, unknown>): string {
-  const service = stringAttr(attributes, "service.name");
-  if (service === "github-copilot" || service === "github.copilot") return COPILOT_CLI_SOURCE;
-  if (service === "copilot-chat" || service === "github.copilot-chat") return COPILOT_CHAT_SOURCE;
-  return CLAUDE_OTEL_SOURCE;
+export function sourceFromAttributes(attributes: Record<string, unknown>): string {
+  return sourceFromServiceName(stringAttr(attributes, "service.name"));
 }
 
-function selectedTokenSpans(spans: OtelSpanRecord[]): OtelSpanRecord[] {
+// Selects the spans that carry gen_ai token usage, preferring the agent-root spans when present so we
+// don't double-count child LLM spans. Vendor-neutral (gen_ai semantic conventions); shared by provider
+// trace parsers.
+export function selectedTokenSpans(spans: OtelSpanRecord[]): OtelSpanRecord[] {
   const withTokens = spans.filter((span) => tokenEntries(span.attributes).length > 0);
   const roots = withTokens.filter((span) => stringAttr(span.attributes, "gen_ai.operation.name") === "invoke_agent" || span.name.startsWith("invoke_agent"));
   return roots.length ? roots : withTokens;
 }
 
-function traceSessionId(span: OtelSpanRecord): string {
-  const attrs = span.attributes;
-  if (isVsCodeCopilotSpan(span)) {
-    return (
-      stringAttr(attrs, "session.id") ??
-      stringAttr(attrs, "copilot_chat.chat_session_id") ??
-      stringAttr(attrs, "copilot_chat.session_id") ??
-      stringAttr(attrs, "gen_ai.conversation.id") ??
-      span.traceId ??
-      "unknown-session"
-    );
-  }
-  return (
-    stringAttr(attrs, "gen_ai.conversation.id") ??
-    stringAttr(attrs, "session.id") ??
-    stringAttr(attrs, "conversation.id") ??
-    span.traceId ??
-    "unknown-session"
-  );
-}
-
-function isVsCodeCopilotSpan(span: OtelSpanRecord): boolean {
-  if (span.source !== COPILOT_CLI_SOURCE && span.source !== COPILOT_CHAT_SOURCE) return false;
-  const attrs = span.attributes;
-  return (
-    stringAttr(attrs, "gen_ai.agent.name") === "GitHub Copilot Chat" ||
-    stringAttr(attrs, "copilot_chat.session_id") !== undefined ||
-    stringAttr(attrs, "copilot_chat.chat_session_id") !== undefined
-  );
-}
-
-function tokenEntries(attributes: Record<string, unknown>): Array<[string, number]> {
+// Decodes the gen_ai.usage.* token attributes on a span. Vendor-neutral; shared by provider trace parsers.
+export function tokenEntries(attributes: Record<string, unknown>): Array<[string, number]> {
   const pairs: Array<[string, number]> = [];
   for (const [attr, tokenType] of [
     ["gen_ai.usage.input_tokens", "input"],

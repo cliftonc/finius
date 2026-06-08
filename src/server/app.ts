@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { GitHub } from "arctic";
+import { CLAUDE_JSONL_SOURCE, MANUAL_JSONL_SOURCE } from "../shared/sources.js";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
@@ -290,7 +291,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
   app.post("/api/import/jsonl", async (c) => {
     const contentType = c.req.header("content-type") ?? "";
     let content: string;
-    let source = "manual-jsonl";
+    let source = MANUAL_JSONL_SOURCE;
     let sessionId: string | undefined;
     let format: TranscriptFormat | undefined;
 
@@ -344,7 +345,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
       content = readFileSync(resolvedPath, "utf8");
     }
 
-    const result = await storage.enqueueImport("claude-code-jsonl", sessionHint, content);
+    const result = await storage.enqueueImport(CLAUDE_JSONL_SOURCE, sessionHint, content);
     return c.json(result);
   });
 

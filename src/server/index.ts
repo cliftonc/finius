@@ -10,7 +10,7 @@ import { EventBus } from "./events.js";
 import { normalizeLiteLlm } from "./pricing.js";
 import { githubSnapshot } from "./pricing-backfill.js";
 import { LocalBlobStore } from "./storage/blob.js";
-import { SqliteStorageAdapter } from "./storage/sqlite.js";
+import { DrizzleStorageAdapter } from "./storage/adapter.js";
 
 // LiteLLM's community price feed: per-model input/output/cache token costs for Anthropic + OpenAI
 // (and many more). Override with FINIUS_PRICING_URL; disable the fetch with FINIUS_PRICING_FETCH=off.
@@ -41,7 +41,7 @@ export type StartServerOptions = {
 };
 
 export type RunningServer = {
-  storage: SqliteStorageAdapter;
+  storage: DrizzleStorageAdapter;
   events: EventBus;
   clientDist?: string;
   hostname: string;
@@ -64,7 +64,7 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   const g = options.oauth?.github;
   const githubEnabled = !!(g?.enabled && g.clientId && g.clientSecret && g.requiredOrg && g.callbackUrl);
 
-  const storage = new SqliteStorageAdapter(resolve(dbPath), { storeRawPayloads, blob });
+  const storage = new DrizzleStorageAdapter(resolve(dbPath), { storeRawPayloads, blob });
   // Seed the owner token whenever the server is secured by EITHER method, so the local CLI (hook/OTEL)
   // has a credential even in GitHub-only mode where there's no master password to exchange.
   if ((authSecret || githubEnabled) && initialAuthToken) seedInitialAuthToken(storage, initialAuthToken);
@@ -138,7 +138,7 @@ function windowlessSetTimeout(callback: () => void, delay: number) {
   return globalThis.setTimeout(callback, delay);
 }
 
-async function syncPricing(storage: SqliteStorageAdapter) {
+async function syncPricing(storage: DrizzleStorageAdapter) {
   if ((process.env.FINIUS_PRICING_FETCH ?? "on") === "off") return;
   const url = process.env.FINIUS_PRICING_URL ?? DEFAULT_PRICING_URL;
   try {
@@ -172,7 +172,7 @@ function authLine(authSecret: string | undefined, githubEnabled: boolean, requir
   return pc.dim("open (no auth)");
 }
 
-function seedInitialAuthToken(storage: SqliteStorageAdapter, token: string) {
+function seedInitialAuthToken(storage: DrizzleStorageAdapter, token: string) {
   const tokenHash = createHash("sha256").update(token).digest("hex");
   if (storage.findAuthToken(tokenHash)) return;
   storage.createAuthToken(tokenHash, "owner", Date.now());

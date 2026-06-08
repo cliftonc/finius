@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseClaudeTranscript } from "../src/server/claude.js";
+import { parseClaudeTranscript } from "../src/server/providers/claude.js";
 
 describe("parseClaudeTranscript", () => {
   it("handles valid lines, malformed lines, and missing usage", () => {

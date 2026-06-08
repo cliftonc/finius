@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/server/app";
 import { EventBus } from "../src/server/events";
-import { SqliteStorageAdapter } from "../src/server/storage/sqlite";
+import { DrizzleStorageAdapter } from "../src/server/storage/adapter";
 import { jsonlTranscript } from "./fixtures";
 
 function tmpDbPath() {
@@ -14,15 +14,15 @@ function tmpDbPath() {
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
-let storage: SqliteStorageAdapter | null = null;
+let storage: DrizzleStorageAdapter | null = null;
 
 function makeApp(authSecret?: string) {
-  storage = new SqliteStorageAdapter(tmpDbPath());
+  storage = new DrizzleStorageAdapter(tmpDbPath());
   return createApp({ storage, events: new EventBus(), authSecret });
 }
 
 function makeGithubApp(authSecret = "secret") {
-  storage = new SqliteStorageAdapter(tmpDbPath());
+  storage = new DrizzleStorageAdapter(tmpDbPath());
   return createApp({
     storage,
     events: new EventBus(),
@@ -315,7 +315,7 @@ describe("auth — github oauth", () => {
   });
 
   it("secures the server with GitHub OAuth even when no master password is set", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     const app = createApp({
       storage,
       events: new EventBus(),

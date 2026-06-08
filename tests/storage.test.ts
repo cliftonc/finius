@@ -2,14 +2,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteStorageAdapter } from "../src/server/storage/sqlite";
+import { DrizzleStorageAdapter } from "../src/server/storage/adapter";
 import { copilotTraceBatch, copilotVsCodeTraceBatch, copilotVsCodeTranscript, jsonlTranscript, otlpLogBatch, otlpMetricBatch } from "./fixtures";
 
 function tmpDbPath() {
   return join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite");
 }
 
-let storage: SqliteStorageAdapter | null = null;
+let storage: DrizzleStorageAdapter | null = null;
 
 afterEach(() => {
   storage?.close();
@@ -18,7 +18,7 @@ afterEach(() => {
 
 describe("SQLite storage adapter", () => {
   it("dedupes OTLP batches and aggregates metrics", async () => {
-    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
 
     expect(await storage.ingestOtelMetrics(otlpMetricBatch())).toEqual({ duplicate: false, points: 3 });
     expect(await storage.ingestOtelMetrics(otlpMetricBatch())).toEqual({ duplicate: true, points: 0 });
@@ -30,8 +30,24 @@ describe("SQLite storage adapter", () => {
     expect(summary.sessionCount).toBe(1);
   });
 
+  it("returns inserted row ids as JS numbers, not bigint (Drizzle builder guard)", async () => {
+    storage = new DrizzleStorageAdapter(tmpDbPath());
+    // insertRawBatch + insertMetricPoint + upsertSession all run through the Drizzle builder on ingest.
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
+    const sessions = await storage.listSessions({});
+    expect(sessions).toHaveLength(1);
+    expect(typeof sessions[0].id).toBe("number");
+    expect(Number.isInteger(sessions[0].id)).toBe(true);
+
+    // createAuthToken (builder insert) + findAuthToken (builder select) must round-trip a number id.
+    storage.createAuthToken("hash-1", "label", Date.now());
+    const token = storage.findAuthToken("hash-1");
+    expect(token).not.toBeNull();
+    expect(typeof token!.id).toBe("number");
+  });
+
   it("dedupes identical JSONL imports instead of double-counting", async () => {
-    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     const content = '{"session_id":"s1","message":{"usage":{"input_tokens":100,"output_tokens":20}}}';
 
     const first = await storage.importJsonl("manual-jsonl", {}, content);
@@ -48,7 +64,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("aggregates people and exposes filter options", async () => {
-    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
 
     const people = await storage.listPeople({});
@@ -63,7 +79,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("aggregates models and filters summaries by session", async () => {
-    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
     await storage.ingestOtelMetrics(otlpMetricBatch("session-b"));
 
@@ -80,7 +96,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("stores OTLP logs without creating metric points", async () => {
-    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
 
     expect(await storage.ingestOtelLogs(otlpLogBatch())).toEqual({ duplicate: false, events: 1 });
     const summary = await storage.getSummary({});
@@ -89,7 +105,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("ingests Copilot OTLP traces as source-specific token metrics", async () => {
-    storage = new SqliteStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
 
     expect(await storage.ingestOtelTraces(copilotTraceBatch())).toMatchObject({ duplicate: false, spans: 2 });
     expect(await storage.ingestOtelTraces(copilotTraceBatch())).toEqual({ duplicate: true, spans: 0, points: 0 });
@@ -105,7 +121,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("serves filtered summaries and breakdowns from the rollup", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
     await storage.ingestOtelMetrics(otlpMetricBatch("session-b"));
 
@@ -129,7 +145,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("sums across hourly buckets but counts distinct sessions correctly", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     // Same session, two timestamps five hours apart -> two hourly rollup buckets, one session.
     const content = [
       '{"session_id":"s1","timestamp":"2024-01-01T00:30:00Z","message":{"usage":{"input_tokens":10}}}',
@@ -151,7 +167,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("answers mid-hour `from`/`to` windows from metric_points, not the hourly rollup", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     // One point at 00:30; the hourly rollup buckets it under 00:00. A `from` later than the top of
     // the hour must still see it (regression: a raw `bucket >= from` compare dropped the bucket).
     const content = '{"session_id":"s1","timestamp":"2024-01-01T00:30:00Z","message":{"usage":{"input_tokens":42}}}';
@@ -167,7 +183,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("returns a per-model token and session timeseries", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     // Two sessions on the same model in the same hour bucket...
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
     await storage.ingestOtelMetrics(otlpMetricBatch("session-b"));
@@ -212,7 +228,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("does not double-count a session that has both OTel and a transcript in the per-model timeseries", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a")); // OTel: 1200 in / 350 out
     // Shadowed transcript for the same session/model — must not add a second session or extra tokens.
     await storage.importJsonl("claude-code-jsonl", { sessionId: "session-a" }, jsonlTranscript("session-a", { input_tokens: 999, output_tokens: 111 }, 0.5));
@@ -223,7 +239,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("aggregates pull_request and commit counts into the summary and timeseries", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     const batch = {
       resourceMetrics: [
         {
@@ -251,7 +267,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("stores an imported transcript as a file linked to its session", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     const content =
       '{"session_id":"s1","message":{"usage":{"input_tokens":100,"output_tokens":20}}}\n' +
       '{"session_id":"s1","message":{"usage":{"input_tokens":5}}}';
@@ -276,7 +292,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("links an uploaded transcript to the OTel session without double-counting", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
 
     // Same session UUID, but the transcript reports different numbers (and a cost). OTel is
@@ -310,7 +326,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("links a VS Code Copilot transcript to the stable OTLP session id", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.ingestOtelTraces(copilotVsCodeTraceBatch("stable-vscode-session"));
 
     const content = copilotVsCodeTranscript("1e41a2d2-f8eb-4905-8434-111858d19287");
@@ -325,7 +341,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("falls back to transcript-derived metrics for sessions with no OTel", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.importJsonl("claude-code-jsonl", { sessionId: "solo" }, jsonlTranscript("solo", { input_tokens: 40, output_tokens: 7 }, 0.01));
 
     const summary = await storage.getSummary({});
@@ -337,7 +353,7 @@ describe("SQLite storage adapter", () => {
   });
 
   it("mixes OTel and transcript-only sessions with per-session precedence", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a")); // OTel: 1200 in / 350 out / 0.024
     await storage.importJsonl("claude-code-jsonl", { sessionId: "session-a" }, jsonlTranscript("session-a", { input_tokens: 999, output_tokens: 111 }, 0.5)); // shadowed by OTel
     await storage.importJsonl("claude-code-jsonl", { sessionId: "solo" }, jsonlTranscript("solo", { input_tokens: 40, output_tokens: 7 }, 0.01)); // fallback
@@ -353,8 +369,39 @@ describe("SQLite storage adapter", () => {
     expect(series.reduce((sum, p) => sum + p.inputTokens, 0)).toBe(1240);
   });
 
+  it("demotes a transcript-only session's fallback metrics when OTel arrives later (late-OTel transition)", async () => {
+    storage = new DrizzleStorageAdapter(tmpDbPath());
+    // Transcript first, no OTel yet: the transcript is the fallback and counts (is_primary=1).
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "session-a" }, jsonlTranscript("session-a", { input_tokens: 999, output_tokens: 111 }, 0.5));
+
+    const before = await storage.getSummary({});
+    expect(before.inputTokens).toBe(999);
+    expect(before.outputTokens).toBe(111);
+    expect(before.sessionCount).toBe(1);
+
+    // OTel arrives for the SAME session: the transcript is now shadowed and must be demoted, and the
+    // rollup rebuilt so it reflects only the OTel numbers.
+    await storage.ingestOtelMetrics(otlpMetricBatch("session-a")); // OTel: 1200 in / 350 out / 0.024
+
+    // (a) the transcript is demoted — default totals equal the OTel numbers only.
+    const after = await storage.getSummary({});
+    expect(after.inputTokens).toBe(1200);
+    expect(after.outputTokens).toBe(350);
+    expect(after.totalCost).toBeCloseTo(0.024, 6);
+    expect(after.sessionCount).toBe(1);
+
+    // (b) the rollup is consistent — the (rollup-served) day timeseries total equals the summary total.
+    const series = await storage.getTimeseries({ granularity: "day" });
+    expect(series.reduce((sum, p) => sum + p.inputTokens, 0)).toBe(1200);
+
+    // (c) the comparison view still shows the raw transcript numbers (the demoted points are retained).
+    const comparison = await storage.getSummary({ source: "claude-code-jsonl" });
+    expect(comparison.inputTokens).toBe(999);
+    expect(comparison.outputTokens).toBe(111);
+  });
+
   it("records explicit per-session source state (otel / jsonl / both) on one session row", async () => {
-    storage = new SqliteStorageAdapter(tmpDbPath());
+    storage = new DrizzleStorageAdapter(tmpDbPath());
     // OTel-only session, JSONL-only session, and a session that has both signals.
     await storage.ingestOtelMetrics(otlpMetricBatch("otel-only"));
     await storage.importJsonl("claude-code-jsonl", { sessionId: "jsonl-only" }, jsonlTranscript("jsonl-only", { input_tokens: 5 }, 0.001));

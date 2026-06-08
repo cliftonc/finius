@@ -1,4 +1,5 @@
 import { intro, outro, select, spinner } from "@clack/prompts";
+import { CLAUDE_JSONL_SOURCE } from "../shared/sources.js";
 import { backfill, findClaudeTranscripts } from "./backfill.js";
 import { CODEX_SOURCE, findCodexRollouts } from "./codex.js";
 import { COPILOT_VSCODE_SOURCE, copilotSessionIdFromPath, findCopilotVsCodeTranscripts } from "./copilot.js";
@@ -28,7 +29,7 @@ export async function runImport(args: string[] = []): Promise<number> {
 
   let failed = 0;
   if (target === "claude" || target === "all") {
-    failed += (await backfill(findClaudeTranscripts(), { source: "claude-code-jsonl", format: "claude", label: "Claude sessions" })).failed;
+    failed += (await backfill(findClaudeTranscripts(), { source: CLAUDE_JSONL_SOURCE, format: "claude", label: "Claude sessions" })).failed;
   }
   if (target === "codex" || target === "all") {
     failed += (await backfill(findCodexRollouts(), { source: CODEX_SOURCE, format: "codex", label: "Codex sessions" })).failed;

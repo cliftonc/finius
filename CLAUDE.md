@@ -56,7 +56,10 @@ Build emits via `tsconfig.build.json` (`rootDir: src`, excludes `src/client`) so
 stays the editor/typecheck config (wider `include`); don't point the build at it or output nests under
 `dist/src`.
 
-Requires Node with the built-in `node:sqlite` module (Node 22.5+; developed on v24).
+Requires Node with the built-in `node:sqlite` module (Node 22.5+; developed on v24). Persistence is
+Drizzle ORM over that built-in driver (`drizzle-orm/node-sqlite`, currently the `1.0.0-rc` line — the
+only release with the `node:sqlite` driver) — no native build step, so `npx finius` still needs no
+compilation.
 
 ## Telemetry
 
@@ -74,7 +77,7 @@ marker rather than replacing it.
 
 ## Architecture
 
-- `src/server/index.ts` — exports `startServer(options)` which wires `SqliteStorageAdapter` +
+- `src/server/index.ts` — exports `startServer(options)` which wires `DrizzleStorageAdapter` +
   `EventBus` into the app, serves the built client (resolved relative to the module so it works under
   `npx`, falling back to `dist/client`), and binds to `127.0.0.1:8787`. Auto-starts only when run
   directly (`node dist/server/index.js`); the CLI's `serve` imports `startServer` instead.
@@ -115,22 +118,48 @@ marker rather than replacing it.
   (GitHub, etc.) extend `isValidCredential` — no route changes. When `authSecret` is unset Finius stays
   fully open (default). The browser shows a `LoginScreen` (App.tsx) on any 401; the CLI hook + OTEL
   exporter send the token (the latter via `OTEL_EXPORTER_OTLP_HEADERS`).
-- `src/server/storage/sqlite.ts` — the `StorageAdapter` implementation. Owns the schema (`migrate()`),
-  batch-level idempotency (`raw_batches.hash` UNIQUE), session upsert, the `users` registry, the hourly
-  `metric_rollup`
-  (`upsertRollup`, built once by `migrateRollup()` and maintained on ingest), and all aggregation SQL.
-  Reads route to the rollup when possible (`canUseRollup`/`rollupWhere`) and fall back to
-  `metric_points` for session filters, sub-hour timeseries, and distinct counts. The `users` table is
-  one row per person, deduped by email (account_id/user_id/github_login as secondary link keys),
-  populated from any identity seen (OTel or JSONL) via `upsertUser` in `upsertSession` and back-filled
-  once from `sessions` (`migrateUsers`); `sessions.user_row_id` points at it and `listPeople` enriches
-  each row with `displayName`/`githubLogin`/`email` from it (JS-side join, filter semantics unchanged).
+- `src/server/storage/adapter.ts` — `DrizzleStorageAdapter`, the `StorageAdapter` implementation backed
+  by **Drizzle ORM** (`drizzle-orm@1.0.0-rc.3`'s `drizzle-orm/node-sqlite` driver over the built-in
+  `DatabaseSync`; zero native deps). It's a **thin, DB-neutral facade**: it owns only ingest
+  orchestration, pricing, and the in-memory state (price index, blob, the `SerialQueue`, the in-flight
+  dedup set), holds both the Drizzle handle (`this.orm`) and the raw `DatabaseSync` (`this.db`, same
+  connection), and **delegates every DB access to free functions in `src/server/db/`** (reads, auth,
+  users, AND writes). The orchestration is database-neutral over the Drizzle handle; SQLite is the only
+  concrete binding (`db/client.ts` + `db/dialect.ts`), so the name is `Drizzle…`, not `Sqlite…`.
+  Batch-level idempotency is `raw_batches.hash` UNIQUE; the `{ duplicate: true }` short-circuit is preserved.
+- `src/server/db/` — the Drizzle data layer (free functions, Drizzle handle first arg). `schema.ts`
+  (table definitions; the drizzle-kit migration under `migrations/` is the source of truth, applied at
+  startup by `client.ts`'s `runMigrations`, which **adopts** existing populated DBs via a column shim +
+  materialized-`jsonlWins` `is_primary` backfill rather than re-creating them). `client.ts` (`connect`,
+  `runMigrations`, `DrizzleDb` type); `fragments.ts` (composable `sql` WHERE fragments + `canUseRollup`,
+  replacing the old `query-helpers.ts`); `dialect.ts` (the **Postgres seam** —
+  `GROUP_CONCAT`/`json_extract`/time-bucketing live here, so a future Postgres dialect swaps one file).
+  **Write modules:** `ingest.ts` (the write side — `insertMetricPoint` with materialized `is_primary`,
+  `upsertSession`, `upsertRollup`/`rebuildRollup`, the shared `ingestMetricPoints` loop, plus raw-batch,
+  log-event, source-file, copilot-session-resolve, and prune helpers), `pricing-store.ts`
+  (`model_prices` access — `loadPriceIndex`/`getPricing`/`importPricing` — and `recomputeComputedCost`).
+  **Read modules:** `metrics.ts` (summary/timeseries/breakdowns; reads route to `metric_rollup` via
+  `canUseRollup`, else `metric_points`), `sessions.ts` (`buildSessions`), `people.ts`
+  (people/models/filter options/log events), `users.ts` (the per-person registry — deduped by email,
+  `upsertUser`/`migrateUsers`/`userDirectory`), `auth.ts`. **Precedence is materialized** as
+  `metric_points.is_primary` (set at ingest from the `src/shared/sources.ts` registry's preferred signal
+  + a fallback; = the old `jsonlWins`), so the hourly `metric_rollup` is unified over `is_primary`
+  points and reads are a plain `WHERE is_primary = 1`.
+- `src/shared/sources.ts` — the central provider/source registry (`PROVIDERS` preferred-signal +
+  `SOURCES` table), shared by server (`sourceFromAttributes`, `is_primary`) and CLI (upload sources).
+  Adding a provider/source is one entry here.
 - `src/server/storage/blob.ts` — `BlobStore` interface + `LocalBlobStore`; holds imported transcript
   files (content-addressed by sha256), linked to sessions via the `source_files` table.
-- `src/server/otel.ts` — pure parsers: OTLP protobuf-JSON → `MetricPointInput[]`, attribute decoding,
-  `stableHash`, `preferredIdentity`, token-type normalization.
-- `src/server/transcripts.ts` dispatches transcript parsing; agent-specific parsers live in
-  `src/server/claude.ts` and `src/server/codex.ts`.
+- `src/server/otel.ts` — **shared, reusable** OTLP parsers only: protobuf-JSON decoding, attribute
+  flattening, `stableHash`, `preferredIdentity`, `warnIfCumulative`, the generic span/log/metric-record
+  flatteners, and the vendor-neutral `gen_ai.*` `tokenEntries`/`selectedTokenSpans`. `src/server/jsonl.ts`
+  — shared JSONL value coercions (`numberValue`/`stringValue`/`parseTimestamp`/`objectValue`).
+- `src/server/providers/` — one module per agent owning ALL of its parsing (OTLP + transcript):
+  `claude.ts` (`parseClaudeTranscript` + `parseOtelMetricPoints`/`classifyMetric`/`normalizeTokenType`),
+  `codex.ts` (`parseCodexTranscript`), `copilot.ts` (`parseCopilotTranscript` + `parseOtelTracePoints`/
+  `otelTraceSessionDiagnostics`/`isVsCodeCopilotSpan`). `src/server/transcripts.ts` dispatches transcript
+  parsing by format. Adding a provider is one `providers/<x>.ts` + one `sources.ts` entry + one
+  `transcripts.ts` switch arm.
 - `src/server/events.ts` — in-process pub/sub `EventBus` backing the SSE stream.
 - `src/server/types.ts` — shared types and the `StorageAdapter` interface.
 - `src/client/` — React app. `api.ts` is the typed fetch layer; `ui/App.tsx` is the whole dashboard.
@@ -147,8 +176,27 @@ endpoint), `FINIUS_AUTH_PASSWORD` (enables Secure Mode; normally set via `finius
 
 - ESM throughout (`"type": "module"`); server imports use `.js` extensions on relative paths so the
   emitted JS resolves — keep this when adding files.
-- Storage logic goes behind the `StorageAdapter` interface; keep parsers in `otel.ts`, `claude.ts`,
-  and `codex.ts` pure and side-effect-free so they stay unit-testable.
+- **Prefer functional style: free functions over classes.** The DB layer (`db/*.ts`) is free functions
+  taking the Drizzle handle (`db`) as the first arg — not methods on a class — so they compose inside the
+  adapter's transactions and are trivially unit-testable. `DrizzleStorageAdapter` is the one class, and
+  only because it holds genuinely stateful, long-lived resources (the Drizzle/raw connections, the price
+  index, the `SerialQueue`, the in-flight set); it stays **thin**, delegating all DB work to the `db/`
+  free functions. When adding behaviour, reach for a free function in the right module first; add to the
+  class only for state that must persist across calls.
+- Storage logic goes behind the `StorageAdapter` interface; keep the provider parsers (`providers/*.ts`)
+  and the shared `otel.ts`/`jsonl.ts` helpers pure and side-effect-free so they stay unit-testable.
+  Read AND write DB access lives in the `db/` modules as free functions over the Drizzle handle (reads in
+  `metrics`/`sessions`/`people`/`users`/`auth`, writes in `ingest`/`pricing-store`); the adapter keeps
+  only the stateful ingest + pricing orchestration and delegates to them.
+- Schema changes go through **drizzle-kit migrations** (`db/schema.ts` → `npx drizzle-kit generate` →
+  the `db/migrations/` file is applied at startup). `tests/schema-parity.test.ts` guards the snapshot;
+  regenerate it deliberately when a schema change is intentional. Keep dialect-specific SQL
+  (`GROUP_CONCAT`, `json_extract`, time-bucketing) behind `db/dialect.ts` so Postgres stays a one-file
+  swap later.
+- A new **source** for an existing agent is one entry in `src/shared/sources.ts` (`provider`, `signal`,
+  `serviceNames`); its `is_primary`/precedence then follows from the provider's preferred signal
+  automatically. A new **agent** is that entry plus a `src/server/providers/<agent>.ts` module (its
+  OTLP + transcript parsing) and a `src/server/transcripts.ts` switch arm.
 - Ingest paths are idempotent via `raw_batches.hash`; preserve the `{ duplicate: true }` short-circuit
   when adding new ingest sources.
 - Tests use real on-disk SQLite in a tmp dir (see `tests/fixtures.ts`); favor that over mocking.

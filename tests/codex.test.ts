@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseCodexTranscript } from "../src/server/codex.js";
+import { parseCodexTranscript } from "../src/server/providers/codex.js";
 import { detectTranscriptFormat, parseTranscript, shouldReplaceBySession } from "../src/server/transcripts.js";
 import type { MetricPointInput } from "../src/server/types.js";
 

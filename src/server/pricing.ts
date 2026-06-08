@@ -98,8 +98,8 @@ export function priceFor(model: string | null | undefined, timestamp: number, in
 }
 
 // Turn token points into synthesized cost points. One cost point per priced token point, copying the
-// source/signal/session/model/timestamp so the existing aggregation + jsonlWins precedence treat the
-// cost exactly like its tokens (and shadow it when the session has authoritative ingested cost).
+// source/signal/session/model/timestamp so the cost inherits the same is_primary disposition as its
+// tokens (counted for a primary source like Codex/manual; comparison-only for claude-code-jsonl).
 export function computeCostPoints(tokenPoints: MetricPointInput[], index: PriceIndex): MetricPointInput[] {
   const points: MetricPointInput[] = [];
   for (const point of tokenPoints) {

@@ -10,6 +10,7 @@ import {
   withFiniusHook,
   withTelemetryEnv
 } from "./claude-settings.js";
+import { CLAUDE_JSONL_SOURCE } from "../shared/sources.js";
 import { backfill, findClaudeTranscripts } from "./backfill.js";
 import { applyCodexConfig, CODEX_CONFIG_PATH, CODEX_SOURCE, findCodexRollouts, isCodexInstalled } from "./codex.js";
 import { COPILOT_VSCODE_SOURCE, copilotSessionIdFromPath, findCopilotVsCodeTranscripts } from "./copilot.js";
@@ -569,7 +570,7 @@ async function configureClaude(serverUrl: string, credential: string | undefined
   // The hook only catches future sessions; offer to import what's already on disk (one at a time),
   // but only when the server is reachable. Otherwise the uploads would fail immediately.
   if (canImport && ask(await confirm({ message: "Import your existing Claude sessions now?", initialValue: false }))) {
-    await backfill(findClaudeTranscripts(), { source: "claude-code-jsonl", format: "claude", label: "Claude sessions" });
+    await backfill(findClaudeTranscripts(), { source: CLAUDE_JSONL_SOURCE, format: "claude", label: "Claude sessions" });
   }
 }
 

@@ -2,13 +2,14 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { type CodexBlockOptions, type CodexMergeResult, withFiniusCodexBlock } from "./codex-config.js";
+import { CODEX_SOURCE as CODEX_SOURCE_ID } from "../shared/sources.js";
 import { uploadTranscript, walkFiles } from "./backfill.js";
 
 // Codex stores everything under ~/.codex (override with CODEX_HOME, as the app itself does).
 export const CODEX_HOME = process.env.CODEX_HOME ? resolve(process.env.CODEX_HOME) : join(homedir(), ".codex");
 export const CODEX_CONFIG_PATH = join(CODEX_HOME, "config.toml");
 const CODEX_SESSIONS_DIR = join(CODEX_HOME, "sessions");
-export const CODEX_SOURCE = "codex-cli-jsonl";
+export const CODEX_SOURCE = CODEX_SOURCE_ID;
 
 // Codex is "installed" if its home dir or the macOS app bundle is present.
 export function isCodexInstalled(): boolean {

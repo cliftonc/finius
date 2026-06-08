@@ -1,5 +1,6 @@
-import type { ImportResult, MetricPointInput } from "./types.js";
-import type { ParsedTranscript } from "./transcripts.js";
+import type { ImportResult, MetricPointInput } from "../types.js";
+import type { ParsedTranscript } from "../transcripts.js";
+import { numberValue, parseTimestamp, stringValue } from "../jsonl.js";
 
 // Parser for OpenAI Codex "rollout" transcripts (`~/.codex/sessions/**/rollout-*.jsonl`). Each line is
 // `{ timestamp, type, payload }`. Token usage rides on `event_msg` lines whose `payload.type` is
@@ -105,20 +106,4 @@ export function parseCodexTranscript(
   }
 
   return { result, points, rawEvents };
-}
-
-function numberValue(value: unknown) {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : undefined;
-}
-
-function stringValue(value: unknown) {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function parseTimestamp(value: unknown) {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value !== "string") return undefined;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
 }
