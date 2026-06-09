@@ -4,7 +4,7 @@
 // in-memory PriceIndex (refreshed via loadPriceIndex) that the cost hot path reads synchronously.
 
 import { type DrizzleDb } from "./client.js";
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { metricPoints, modelPrices } from "./schema.js";
 import * as ingest from "./ingest.js";
 import { COMPUTED_COST_METRIC, computeCostPoints, indexPrices, type PriceIndex } from "../pricing.js";
@@ -70,21 +70,43 @@ export function importPricing(db: DrizzleDb, prices: ModelPrice[]): { imported: 
 export function recomputeComputedCost(db: DrizzleDb, priceIndex: PriceIndex): { costPoints: number } {
   const costPointCount = db.transaction(() => {
     db.delete(metricPoints).where(eq(metricPoints.metricName, COMPUTED_COST_METRIC)).run();
-    // After the delete, every remaining kind='cost' row is an agent-reported cost.
+    // After the delete, every remaining kind='cost' AND signal='jsonl' row is a cost the TRANSCRIPT
+    // itself reported — those sessions skip synthesis (don't stack computed cost on real cost). We must
+    // NOT key on OTel cost (signal='otlp_metrics'): the live path synthesizes JSONL cost per-transcript
+    // regardless of OTel and lets is_primary shadow it, so the comparison/source-filtered view still
+    // shows the JSONL figure. Skipping OTel-cost sessions here would delete that shadowed cost and never
+    // recreate it — matching the live path means scoping the skip to real jsonl-reported cost only.
     const reported = new Set(
-      (db.all<{ id: number }>(sql`SELECT DISTINCT session_row_id AS id FROM ${metricPoints} WHERE kind = 'cost'`) as Array<{ id: number }>).map((r) => r.id)
+      db
+        .selectDistinct({ id: metricPoints.sessionRowId })
+        .from(metricPoints)
+        .where(and(eq(metricPoints.kind, "cost"), eq(metricPoints.signal, "jsonl")))
+        .all()
+        .map((r) => r.id)
     );
-    const tokenRows = db.all<{ sessionRowId: number } & Omit<MetricPointInput, "kind" | "attributes">>(
-      sql`SELECT source, signal, session_id AS sessionId, session_row_id AS sessionRowId, user_id AS userId,
-          user_email AS userEmail, user_account_id AS userAccountId, model, metric_name AS metricName,
-          token_type AS tokenType, value, timestamp
-         FROM ${metricPoints} WHERE signal = 'jsonl' AND kind = 'tokens'`
-    ) as Array<{ sessionRowId: number } & Omit<MetricPointInput, "kind" | "attributes">>;
+    const tokenRows = db
+      .select({
+        source: metricPoints.source,
+        signal: metricPoints.signal,
+        sessionId: metricPoints.sessionId,
+        sessionRowId: metricPoints.sessionRowId,
+        userId: metricPoints.userId,
+        userEmail: metricPoints.userEmail,
+        userAccountId: metricPoints.userAccountId,
+        model: metricPoints.model,
+        metricName: metricPoints.metricName,
+        tokenType: metricPoints.tokenType,
+        value: metricPoints.value,
+        timestamp: metricPoints.timestamp
+      })
+      .from(metricPoints)
+      .where(and(eq(metricPoints.signal, "jsonl"), eq(metricPoints.kind, "tokens")))
+      .all();
     const tokenPoints: MetricPointInput[] = tokenRows
       .filter((r) => !reported.has(r.sessionRowId))
       .map((r) => ({
         source: r.source,
-        signal: r.signal,
+        signal: r.signal as MetricPointInput["signal"], // query filters signal = 'jsonl'
         sessionId: r.sessionId,
         userId: r.userId,
         userEmail: r.userEmail,

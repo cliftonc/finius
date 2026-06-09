@@ -66,6 +66,15 @@ Source: https://code.claude.com/docs/en/monitoring-usage (verified against real 
   `metric_source` (`'otel'` whenever OTel has been seen, else `'jsonl'`). These are now **display
   state only** (returned in `SessionSummary`); read-time precedence is the materialized `is_primary`
   flag below, not a query against `metric_source`.
+- **No "ghost" rows from telemetry-only metrics.** Claude Code emits `claude_code.active_time.total`
+  and `claude_code.session.count` even for sessions that never made an API call, which would otherwise
+  create a 0-token session row (`metric_points.session_row_id` is NOT NULL, so a point can't exist
+  without a row). The shared `ingestMetricPoints` loop therefore **drops** those two kinds
+  (`GHOST_KINDS = {active_time, session}`) when their session carries no substantive point (tokens,
+  cost, lines, decision, pull_request, commit) anywhere in the batch and has no pre-existing row. A real
+  session keeps its `active_time` because the batch also carries substantive points (eligibility is
+  computed batch-wide, so point order doesn't matter); a session whose `active_time` arrives strictly
+  before its first substantive metric loses that early tick — an accepted trade.
 - **OTel ↔ JSONL precedence is materialized at ingest as `metric_points.is_primary` (no double
   counting).** OTel and a transcript for the same session both carry token/cost, so they must not be
   summed. Each provider has a **preferred signal** (the central registry `src/shared/sources.ts`:
@@ -76,11 +85,20 @@ Source: https://code.claude.com/docs/en/monitoring-usage (verified against real 
   presence and stores it once; when the preferred signal first arrives for a session that only had the
   other signal (e.g. OTel after a backfilled transcript), the previously-promoted points are **demoted**
   to `is_primary = 0` and the rollup is rebuilt for that batch. This is exactly the old `jsonlWins`
-  precedence, just materialized so reads are a plain `WHERE is_primary = 1`.
+  precedence, just materialized so reads are a plain `WHERE is_primary = 1`. `rebuildIsPrimary(db)`
+  (db/ingest.ts) re-materializes the flag for the **whole table** from the registry rule — a point is
+  shadowed iff it's a non-preferred-signal ("shadowable") source AND its session also holds a
+  preferred-source point (an EXISTS over actual points, not the sticky flags). It's the authoritative,
+  idempotent repair for any drift (a stale historical backfill, a precedence-rule change) that the
+  per-point insert path can't reach; exposed via `POST /api/maintenance/rebuild-primary` (cron-token
+  guarded) and the adapter's `rebuildIsPrimary()` (which also rebuilds the rollup). NOTE: `is_primary`
+  tracks the preferred *signal*, not whether that signal reported tokens — a session with OTel present
+  but token-less still shadows its transcript, so it can read as 0 tokens in the default view (use the
+  comparison `source` filter to see the transcript numbers).
 - **The rollup is unified over primary points.** `metric_rollup` (hourly) holds the aggregate of every
   `metric_points WHERE is_primary = 1` — both OTel and primary JSONL — maintained incrementally by
   `upsertRollup` on primary inserts and rebuilt wholesale by `rebuildRollup()` (on a transition, a
-  Codex replace-by-session, the cost recompute, or the one-time legacy backfill). Default home-view
+  Codex replace-by-session, the cost recompute, or the `rebuild-primary` maintenance call). Default home-view
   reads (summary, hour/day/week timeseries, filter options) read `metric_rollup` directly. The old
   OTel-only rollup + `EFFECTIVE_ROLLUP` union are gone.
 - **Comparison view.** An explicit `source` filter bypasses `is_primary` (raw per-source numbers) so you
@@ -98,16 +116,21 @@ Source: https://code.claude.com/docs/en/monitoring-usage (verified against real 
   exist; they routinely disagree (OTel often misses requests the transcript captured). Distinct counts
   (sessions/users) always come from `metric_points` — they can't be summed across rollup buckets.
 - **Schema & migrations (Drizzle).** The schema is a Drizzle definition (`db/schema.ts`); the
-  drizzle-kit migration under `db/migrations/` is the source of truth, applied at startup by
-  `db/client.ts`'s `runMigrations` (called from the adapter constructor). A populated DB already in the
-  wild is **adopted, not re-created**: the shim adds any missing columns (`user_row_id`, `is_primary`)
-  before the (idempotent `IF NOT EXISTS`) baseline runs, backfilling `is_primary` as materialized
-  `jsonlWins` (`signal='jsonl' AND metric_source='otel' → 0`) and rebuilding the rollup once. New schema
-  changes go through drizzle-kit migrations. Uses `drizzle-orm@1.0.0-rc.3`'s `drizzle-orm/node-sqlite`
-  driver over the built-in `DatabaseSync` (zero native deps). `tests/schema-parity.test.ts` guards the
-  schema against drift. The old per-source session rows and the `raw_events` audit table are gone.
-- Maintenance: `POST /api/maintenance/prune-raw-batches` (bearer `FINIUS_CRON_TOKEN`, fails closed)
-  deletes `raw_batches` older than `FINIUS_RAW_RETENTION_DAYS` (default 7).
+  drizzle-kit-generated migrations under `db/migrations/` are the **single source of truth**, applied
+  verbatim at startup by `db/client.ts`'s `runMigrations` (just `migrate(db, …)`, called from the adapter
+  constructor) — the migrator creates everything on a fresh DB and is a no-op once recorded in
+  `__drizzle_migrations`. The DB is assumed re-creatable, so there is **no legacy-adoption shim** and
+  migrations are **never hand-edited**: schema changes flow `schema.ts` → `npm run db:generate` → commit
+  the new `db/migrations/<ts>_<name>/` (no manual SQL, no `IF NOT EXISTS`, no `WITHOUT ROWID` — the last
+  was dropped because drizzle-orm can't emit it and it's SQLite-only, which also unblocks Postgres). Uses
+  `drizzle-orm@1.0.0-rc.3`'s `drizzle-orm/node-sqlite` driver over the built-in `DatabaseSync` (zero
+  native deps). `tests/schema-parity.test.ts` guards the physical schema against the committed
+  `tests/fixtures/schema-snapshot.json` snapshot. The old per-source session rows and the `raw_events`
+  audit table are gone.
+- Maintenance (all bearer `FINIUS_CRON_TOKEN`, fail closed): `POST /api/maintenance/prune-raw-batches`
+  deletes `raw_batches` older than `FINIUS_RAW_RETENTION_DAYS` (default 7); `POST
+  /api/maintenance/recompute-cost` rebuilds the synthesized cost points; `POST
+  /api/maintenance/rebuild-primary` re-materializes `is_primary` (+ rollup) for the whole table.
 - **Per-provider domains.** Each agent has one module under `providers/` owning ALL of its parsing —
   `providers/claude.ts` (`parseClaudeTranscript` + the Claude OTLP-metric parser `parseOtelMetricPoints`
   / `classifyMetric` / `normalizeTokenType`), `providers/codex.ts` (`parseCodexTranscript`),
@@ -131,6 +154,18 @@ Source: https://code.claude.com/docs/en/monitoring-usage (verified against real 
   `people.ts` (people/models/filter options/log events), `users.ts` (the identity registry), `auth.ts`,
   with `db/fragments.ts` (composable `sql` WHERE fragments) and `db/dialect.ts` (the Postgres seam:
   `GROUP_CONCAT`/`json_extract`/time-bucketing live there, so a future Postgres dialect swaps one file).
+- **Reads are async (portable `.execute()`); writes/transactions are sync (deliberate).** The `db/` read
+  functions (`metrics.ts`, `people.ts`, `sessions.ts`, plus `userDirectory`/`enrichUsers`) are `async` and
+  execute via `await builder.execute()` — NOT the SQLite-only `.all()/.get()/.run()` — so the same query
+  code runs unchanged on a future async Postgres driver. (The `StorageAdapter` boundary was already
+  `Promise`-returning, so this just aligns the internals.) The **write/transaction layer stays
+  synchronous**: `drizzle-orm/node-sqlite`'s `db.transaction(async cb)` does NOT await an async callback —
+  a throw inside it leaves rows COMMITTED instead of rolled back — so the ingest transactions
+  (`this.orm.transaction(() => …)`) and their write primitives must keep sync callbacks to preserve
+  atomicity (the no-double-count invariant). `getUserById` also stays sync (called inside
+  `upsertOAuthUser`'s transaction and exposed as a sync adapter method). The write core becomes async only
+  when an async driver is actually adopted. Two raw `db.all(sql)` reads (`buildSessions`,
+  `getLogEventSummary`) stay sync — node:sqlite has no portable `db.execute(sql)` — a dialect seam.
 
 ## Temporality (important)
 

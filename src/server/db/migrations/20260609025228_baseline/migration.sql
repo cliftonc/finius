@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS `auth_tokens` (
+CREATE TABLE `auth_tokens` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`token_hash` text NOT NULL CONSTRAINT `auth_tokens_token_hash_unique` UNIQUE,
 	`label` text,
@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS `auth_tokens` (
 	`user_row_id` integer
 );
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `log_events` (
+CREATE TABLE `log_events` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`event_name` text,
 	`severity` text,
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS `log_events` (
 	CONSTRAINT `log_events_raw_batch_id_raw_batches_id_fk` FOREIGN KEY (`raw_batch_id`) REFERENCES `raw_batches`(`id`)
 );
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `metric_points` (
+CREATE TABLE `metric_points` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`source` text NOT NULL,
 	`signal` text NOT NULL,
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS `metric_points` (
 	CONSTRAINT `metric_points_raw_batch_id_raw_batches_id_fk` FOREIGN KEY (`raw_batch_id`) REFERENCES `raw_batches`(`id`)
 );
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `metric_rollup` (
+CREATE TABLE `metric_rollup` (
 	`bucket` integer NOT NULL,
 	`source` text NOT NULL,
 	`user_identity` text NOT NULL,
@@ -53,9 +53,9 @@ CREATE TABLE IF NOT EXISTS `metric_rollup` (
 	`sum_value` real DEFAULT 0 NOT NULL,
 	`cnt` integer DEFAULT 0 NOT NULL,
 	CONSTRAINT `metric_rollup_pk` PRIMARY KEY(`bucket`, `source`, `user_identity`, `model`, `kind`, `token_type`)
-) WITHOUT ROWID;
+);
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `model_prices` (
+CREATE TABLE `model_prices` (
 	`model` text NOT NULL,
 	`provider` text,
 	`input_per_token` real DEFAULT 0 NOT NULL,
@@ -64,9 +64,9 @@ CREATE TABLE IF NOT EXISTS `model_prices` (
 	`cache_creation_per_token` real DEFAULT 0 NOT NULL,
 	`effective_date` integer DEFAULT 0 NOT NULL,
 	CONSTRAINT `model_prices_pk` PRIMARY KEY(`model`, `effective_date`)
-) WITHOUT ROWID;
+);
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `oauth_accounts` (
+CREATE TABLE `oauth_accounts` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`provider` text NOT NULL,
 	`provider_user_id` text NOT NULL,
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS `oauth_accounts` (
 	CONSTRAINT `oauth_accounts_provider_provider_user_id_unique` UNIQUE(`provider`,`provider_user_id`)
 );
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `raw_batches` (
+CREATE TABLE `raw_batches` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`signal` text NOT NULL,
 	`hash` text NOT NULL UNIQUE,
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS `raw_batches` (
 	`received_at` integer NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `sessions` (
+CREATE TABLE `sessions` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`session_id` text NOT NULL UNIQUE,
 	`user_id` text,
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS `sessions` (
 	CONSTRAINT `sessions_user_row_id_users_id_fk` FOREIGN KEY (`user_row_id`) REFERENCES `users`(`id`)
 );
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `source_files` (
+CREATE TABLE `source_files` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`source` text NOT NULL,
 	`session_row_id` integer,
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS `source_files` (
 	CONSTRAINT `source_files_session_row_id_sessions_id_fk` FOREIGN KEY (`session_row_id`) REFERENCES `sessions`(`id`)
 );
 --> statement-breakpoint
-CREATE TABLE IF NOT EXISTS `users` (
+CREATE TABLE `users` (
 	`id` integer PRIMARY KEY AUTOINCREMENT,
 	`email` text UNIQUE,
 	`account_id` text,
@@ -124,22 +124,22 @@ CREATE TABLE IF NOT EXISTS `users` (
 	`last_seen_at` integer NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_auth_tokens_hash` ON `auth_tokens` (`token_hash`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_auth_tokens_user_row` ON `auth_tokens` (`user_row_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_log_events_name` ON `log_events` (`event_name`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_log_events_batch` ON `log_events` (`raw_batch_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_metric_points_timestamp` ON `metric_points` (`timestamp`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_metric_points_session` ON `metric_points` (`session_row_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_metric_points_model` ON `metric_points` (`model`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_metric_points_signal_session` ON `metric_points` (`signal`,`session_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_metric_points_primary` ON `metric_points` (`is_primary`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_metric_points_metric_name` ON `metric_points` (`metric_name`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_rollup_bucket` ON `metric_rollup` (`bucket`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_oauth_accounts_user_row` ON `oauth_accounts` (`user_row_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_raw_batches_received_at` ON `raw_batches` (`received_at`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_sessions_seen` ON `sessions` (`last_seen_at`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_sessions_user_row` ON `sessions` (`user_row_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_source_files_session` ON `source_files` (`session_row_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_users_account_id` ON `users` (`account_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_users_user_id` ON `users` (`user_id`);--> statement-breakpoint
-CREATE INDEX IF NOT EXISTS `idx_users_github_login` ON `users` (`github_login`);
+CREATE INDEX `idx_auth_tokens_hash` ON `auth_tokens` (`token_hash`);--> statement-breakpoint
+CREATE INDEX `idx_auth_tokens_user_row` ON `auth_tokens` (`user_row_id`);--> statement-breakpoint
+CREATE INDEX `idx_log_events_name` ON `log_events` (`event_name`);--> statement-breakpoint
+CREATE INDEX `idx_log_events_batch` ON `log_events` (`raw_batch_id`);--> statement-breakpoint
+CREATE INDEX `idx_metric_points_timestamp` ON `metric_points` (`timestamp`);--> statement-breakpoint
+CREATE INDEX `idx_metric_points_session` ON `metric_points` (`session_row_id`);--> statement-breakpoint
+CREATE INDEX `idx_metric_points_model` ON `metric_points` (`model`);--> statement-breakpoint
+CREATE INDEX `idx_metric_points_signal_session` ON `metric_points` (`signal`,`session_id`);--> statement-breakpoint
+CREATE INDEX `idx_metric_points_primary` ON `metric_points` (`is_primary`);--> statement-breakpoint
+CREATE INDEX `idx_metric_points_metric_name` ON `metric_points` (`metric_name`);--> statement-breakpoint
+CREATE INDEX `idx_rollup_bucket` ON `metric_rollup` (`bucket`);--> statement-breakpoint
+CREATE INDEX `idx_oauth_accounts_user_row` ON `oauth_accounts` (`user_row_id`);--> statement-breakpoint
+CREATE INDEX `idx_raw_batches_received_at` ON `raw_batches` (`received_at`);--> statement-breakpoint
+CREATE INDEX `idx_sessions_seen` ON `sessions` (`last_seen_at`);--> statement-breakpoint
+CREATE INDEX `idx_sessions_user_row` ON `sessions` (`user_row_id`);--> statement-breakpoint
+CREATE INDEX `idx_source_files_session` ON `source_files` (`session_row_id`);--> statement-breakpoint
+CREATE INDEX `idx_users_account_id` ON `users` (`account_id`);--> statement-breakpoint
+CREATE INDEX `idx_users_user_id` ON `users` (`user_id`);--> statement-breakpoint
+CREATE INDEX `idx_users_github_login` ON `users` (`github_login`);

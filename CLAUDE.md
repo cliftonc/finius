@@ -105,8 +105,8 @@ marker rather than replacing it.
   to enable auth (generating `authPassword`).
 - `src/server/app.ts` — Hono routes: `/otlp/v1/{metrics,logs}` ingest, `/api/metrics/{summary,timeseries}`,
   `/api/sessions[/:id]` (+ `/:id/transcript[/info]`), `/api/people`, `/api/models`, `/api/meta` (filter
-  options), `/api/import/{jsonl,claude-hook}`, `/api/auth/login`, `/api/maintenance/prune-raw-batches`
-  (bearer-token, fails closed), and the `/events` SSE stream. All list/metric routes accept the same
+  options), `/api/import/{jsonl,claude-hook}`, `/api/auth/login`, `/api/maintenance/{prune-raw-batches,
+  recompute-cost,rebuild-primary}` (bearer-token, fails closed), and the `/events` SSE stream. All list/metric routes accept the same
   filters (`from`, `to`, `source`, `user`, `model`, `session`) parsed by `readFilters`.
 - **Auth ("Secure Mode").** When `authSecret` is set (`finius setup`'s generated word-password, saved as
   `authPassword` in `~/.finius/config.json`, passed through by `serve`, or `FINIUS_AUTH_PASSWORD`), a
@@ -128,9 +128,10 @@ marker rather than replacing it.
   concrete binding (`db/client.ts` + `db/dialect.ts`), so the name is `Drizzle…`, not `Sqlite…`.
   Batch-level idempotency is `raw_batches.hash` UNIQUE; the `{ duplicate: true }` short-circuit is preserved.
 - `src/server/db/` — the Drizzle data layer (free functions, Drizzle handle first arg). `schema.ts`
-  (table definitions; the drizzle-kit migration under `migrations/` is the source of truth, applied at
-  startup by `client.ts`'s `runMigrations`, which **adopts** existing populated DBs via a column shim +
-  materialized-`jsonlWins` `is_primary` backfill rather than re-creating them). `client.ts` (`connect`,
+  (table definitions). The drizzle-kit-generated migrations under `migrations/` are the **single source
+  of truth**, applied verbatim at startup by `client.ts`'s `runMigrations` (the drizzle migrator —
+  creates everything on a fresh DB, no-op once recorded in `__drizzle_migrations`); there is no
+  legacy-adoption shim and migrations are never hand-edited. `client.ts` (`connect`,
   `runMigrations`, `DrizzleDb` type); `fragments.ts` (composable `sql` WHERE fragments + `canUseRollup`,
   replacing the old `query-helpers.ts`); `dialect.ts` (the **Postgres seam** —
   `GROUP_CONCAT`/`json_extract`/time-bucketing live here, so a future Postgres dialect swaps one file).
@@ -141,7 +142,7 @@ marker rather than replacing it.
   **Read modules:** `metrics.ts` (summary/timeseries/breakdowns; reads route to `metric_rollup` via
   `canUseRollup`, else `metric_points`), `sessions.ts` (`buildSessions`), `people.ts`
   (people/models/filter options/log events), `users.ts` (the per-person registry — deduped by email,
-  `upsertUser`/`migrateUsers`/`userDirectory`), `auth.ts`. **Precedence is materialized** as
+  `upsertUser`/`userDirectory`), `auth.ts`. **Precedence is materialized** as
   `metric_points.is_primary` (set at ingest from the `src/shared/sources.ts` registry's preferred signal
   + a fallback; = the old `jsonlWins`), so the hourly `metric_rollup` is unified over `is_primary`
   points and reads are a plain `WHERE is_primary = 1`.
@@ -188,11 +189,17 @@ endpoint), `FINIUS_AUTH_PASSWORD` (enables Secure Mode; normally set via `finius
   Read AND write DB access lives in the `db/` modules as free functions over the Drizzle handle (reads in
   `metrics`/`sessions`/`people`/`users`/`auth`, writes in `ingest`/`pricing-store`); the adapter keeps
   only the stateful ingest + pricing orchestration and delegates to them.
-- Schema changes go through **drizzle-kit migrations** (`db/schema.ts` → `npx drizzle-kit generate` →
-  the `db/migrations/` file is applied at startup). `tests/schema-parity.test.ts` guards the snapshot;
-  regenerate it deliberately when a schema change is intentional. Keep dialect-specific SQL
-  (`GROUP_CONCAT`, `json_extract`, time-bucketing) behind `db/dialect.ts` so Postgres stays a one-file
-  swap later.
+- Schema changes ALWAYS go through **drizzle-kit migrations** — never hand-edit a generated migration
+  and never apply a schema change manually. The flow is: edit `db/schema.ts` → `npm run db:generate`
+  (`drizzle-kit generate`) → commit the new `db/migrations/<timestamp>_<name>/` folder → it is applied
+  automatically at startup by `runMigrations` (the build's `copy:migrations` step ships the `.sql` into
+  `dist` so the packaged/`npx` runtime migrates too). The generated SQL is the source of truth verbatim;
+  this is why `WITHOUT ROWID` was dropped (drizzle-orm can't emit it, and it's SQLite-only — keeping it
+  would force a manual post-edit and block the Postgres path). `tests/schema-parity.test.ts` guards the
+  physical schema against a committed snapshot (`tests/fixtures/schema-snapshot.json`); regenerate that
+  fixture deliberately (build a fresh DB via `connect` + `runMigrations` and dump the test's
+  `describeSchema`) only when a schema change is intentional. Keep dialect-specific SQL (`GROUP_CONCAT`,
+  `json_extract`, time-bucketing) behind `db/dialect.ts` so Postgres stays a one-file swap later.
 - A new **source** for an existing agent is one entry in `src/shared/sources.ts` (`provider`, `signal`,
   `serviceNames`); its `is_primary`/precedence then follows from the provider's preferred signal
   automatically. A new **agent** is that entry plus a `src/server/providers/<agent>.ts` module (its

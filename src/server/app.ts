@@ -245,6 +245,18 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
     return c.json(await storage.recomputeComputedCost());
   });
 
+  // Re-materialize metric_points.is_primary (the OTel↔JSONL precedence flag) for the whole table from
+  // the source registry's preferred-signal rule and rebuild the rollup. Idempotent repair for drift in
+  // the stored flag (e.g. a stale historical backfill). Same bearer-token, fail-closed semantics.
+  app.post("/api/maintenance/rebuild-primary", async (c) => {
+    if (!cronToken) return c.json({ error: "maintenance endpoints are disabled (set FINIUS_CRON_TOKEN)" }, 503);
+    if (!timingSafeEqualStr(bearerToken(c.req.header("authorization")), cronToken)) {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+    await storage.rebuildIsPrimary();
+    return c.json({ ok: true });
+  });
+
   // Inspection surface for captured OTLP log records (Codex telemetry is logs-only): one entry per
   // distinct event name with a count + a sample, so we can see the real shape before parsing it.
   app.get("/api/logs/events", async (c) => c.json(await storage.getLogEventSummary()));

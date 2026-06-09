@@ -9,11 +9,11 @@
 // caller wraps them in `db.transaction(...)`, exactly as the adapter did inline.
 
 import { type DrizzleDb } from "./client.js";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lt, ne, notInArray, sql } from "drizzle-orm";
 import { logEvents, metricPoints, metricRollup, rawBatches, sessions, sourceFiles } from "./schema.js";
 import { dialect } from "./dialect.js";
 import * as usersDb from "./users.js";
-import { PROVIDERS, providerOfSource } from "../../shared/sources.js";
+import { PROVIDERS, SOURCES, type Signal, isPrimarySource, providerOfSource } from "../../shared/sources.js";
 import { preferredIdentity } from "../otel.js";
 import type { MetricPointInput, OtelLogRecord, TranscriptInfo } from "../types.js";
 
@@ -125,10 +125,10 @@ export function recordSourceFile(
 // back-references first so the aggregated data survives. Opens its own transaction.
 export function pruneRawBatches(db: DrizzleDb, beforeTimestampMs: number): { deleted: number } {
   const deleted = db.transaction(() => {
-    const staleBatches = db.select({ id: rawBatches.id }).from(rawBatches).where(sql`${rawBatches.receivedAt} < ${beforeTimestampMs}`);
+    const staleBatches = db.select({ id: rawBatches.id }).from(rawBatches).where(lt(rawBatches.receivedAt, beforeTimestampMs));
     db.update(metricPoints).set({ rawBatchId: null }).where(inArray(metricPoints.rawBatchId, staleBatches)).run();
     db.update(logEvents).set({ rawBatchId: null }).where(inArray(logEvents.rawBatchId, staleBatches)).run();
-    const result = db.delete(rawBatches).where(sql`${rawBatches.receivedAt} < ${beforeTimestampMs}`).run();
+    const result = db.delete(rawBatches).where(lt(rawBatches.receivedAt, beforeTimestampMs)).run();
     return Number(result.changes);
   });
   return { deleted };
@@ -172,7 +172,7 @@ export function insertMetricPoint(db: DrizzleDb, point: MetricPointInput, rawBat
     const result = db
       .update(metricPoints)
       .set({ isPrimary: 0 })
-      .where(and(eq(metricPoints.sessionRowId, sessionRowId), sql`${metricPoints.signal} <> ${pref}`, eq(metricPoints.isPrimary, 1)))
+      .where(and(eq(metricPoints.sessionRowId, sessionRowId), ne(metricPoints.signal, pref), eq(metricPoints.isPrimary, 1)))
       .run();
     transitioned = Number(result.changes) > 0;
   }
@@ -254,14 +254,83 @@ export function rebuildRollup(db: DrizzleDb): void {
 // The shared ingest loop used by the OTLP metrics/traces paths: insert each point, feed the rollup from
 // its DYNAMIC primacy, and rebuild once if any insert triggered a transition (late preferred signal
 // demoting a session's promoted transcript points). Caller wraps in a transaction.
+//
+// `active_time` and `session` (start count) are the only metrics Claude Code emits for a session that
+// did no real work — they fire on mere activity / session start. Every other kind (tokens, cost, lines,
+// decision, pull_request, commit) is substantive activity worth a session.
+const GHOST_KINDS = new Set(["active_time", "session"]);
+
+// A session row should exist only for sessions with REAL activity. Claude Code exports `active_time`/
+// `session.count` for sessions that never made an API call; inserting those alone would create a
+// 0-token "ghost" session row (session_row_id is NOT NULL, so the point can't exist without a row). We
+// therefore DROP these telemetry-only points when their session has no substantive metric. Eligibility
+// is computed batch-wide so point ORDER within the batch doesn't matter: a session counts if it carries
+// any substantive point ANYWHERE in this batch, OR it already has a row from earlier activity.
 export function ingestMetricPoints(db: DrizzleDb, points: MetricPointInput[], rawBatchId: number | null): void {
+  const substantive = new Set(points.filter((p) => !GHOST_KINDS.has(p.kind)).map((p) => p.sessionId));
+  const candidateIds = [...new Set(points.map((p) => p.sessionId))].filter((id) => !substantive.has(id));
+  const existing = new Set<string>(
+    candidateIds.length === 0
+      ? []
+      : db.select({ sessionId: sessions.sessionId }).from(sessions).where(inArray(sessions.sessionId, candidateIds)).all().map((r) => r.sessionId)
+  );
   let needsRebuild = false;
   for (const point of points) {
+    if (GHOST_KINDS.has(point.kind) && !substantive.has(point.sessionId) && !existing.has(point.sessionId)) continue;
     const { isPrimary, transitioned } = insertMetricPoint(db, point, rawBatchId);
     if (isPrimary) upsertRollup(db, point);
     if (transitioned) needsRebuild = true;
   }
   if (needsRebuild) rebuildRollup(db);
+}
+
+// Re-materialize is_primary for the ENTIRE table from first principles (the registry's preferred-signal
+// rule), independent of the per-point insert-time computation. A point is primary unless shadowed; a
+// non-preferred-signal ("shadowable") point is shadowed iff its session ALSO holds a preferred-signal
+// point. Authoritative + idempotent: the preferred signal's presence is read from the ACTUAL points in
+// the session (an EXISTS), NOT the sticky has_otel/has_jsonl flags — a replaceSessionPoints delete can
+// leave a flag over-claiming a signal that no longer has points, which would wrongly shadow the
+// survivor. On healthy data this yields exactly what a fresh sequence of insertMetricPoint calls would.
+// Unlike the per-point path, this also corrects rows that drifted (a bad backfill, a precedence-rule
+// change). Callers run this inside their own transaction and rebuild the rollup afterward (the rollup
+// must reflect the corrected is_primary).
+export function rebuildIsPrimary(db: DrizzleDb): void {
+  // Sources whose signal is NOT their provider's preferred signal (the only ones that can be shadowed):
+  // today claude-code-jsonl + copilot-vscode-jsonl. Codex/manual JSONL are their providers' PREFERRED
+  // signal, so they're never shadowable. Unknown sources are treated as primary (isPrimarySource).
+  const shadowable = SOURCES.filter((s) => !isPrimarySource(s.id));
+  if (shadowable.length === 0) {
+    db.update(metricPoints).set({ isPrimary: 1 }).run();
+    return;
+  }
+  // 1. Everything that is not a known shadowable source is primary (incl. unknown sources).
+  db.update(metricPoints).set({ isPrimary: 1 }).where(notInArray(metricPoints.source, shadowable.map((s) => s.id))).run();
+  // 2. A shadowable point is shadowed (0) iff the session holds a point of THAT point's provider's
+  //    preferred SIGNAL — exactly the per-point insert rule (insertMetricPoint reads has_otel/has_jsonl,
+  //    i.e. the presence of the preferred signal). NOT "any non-shadowable source": a different provider's
+  //    preferred-jsonl source (codex/manual) in the same session must NOT shadow a claude/copilot
+  //    transcript. Group the shadowable sources by their preferred signal and shadow each group against
+  //    its own signal, so the rule is correct for any registry shape (today every group is otlp_metrics).
+  const groups = new Map<Signal, string[]>();
+  for (const s of shadowable) {
+    const pref = PROVIDERS[providerOfSource(s.id)].preferredSignal;
+    (groups.get(pref) ?? groups.set(pref, []).get(pref)!).push(s.id);
+  }
+  for (const [pref, ids] of groups) {
+    const idList = sql.join(
+      ids.map((id) => sql`${id}`),
+      sql`, `
+    );
+    // The correlated subquery references the outer table by name (SQLite allows this; no target alias).
+    db.run(sql`
+      UPDATE metric_points SET is_primary = CASE
+        WHEN EXISTS (
+          SELECT 1 FROM metric_points pp
+          WHERE pp.session_row_id = metric_points.session_row_id
+            AND pp.signal = ${pref}
+        ) THEN 0 ELSE 1 END
+      WHERE source IN (${idList})`);
+  }
 }
 
 // Upsert the single session row for this point's UUID and fold in which signal it came from. The OR

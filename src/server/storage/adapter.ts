@@ -86,9 +86,9 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     const { db, sqlite } = connect(path);
     this.db = sqlite;
     this.orm = db;
-    // Build/adopt the schema via the drizzle-kit migrations (fresh creates everything; legacy gets the
-    // is_primary/user_row_id shims + rollup rebuild before the migrator runs), then the users backfill.
-    runMigrations(sqlite, db, { rebuildRollup: () => ingest.rebuildRollup(this.orm), migrateUsers: () => usersDb.migrateUsers(this.orm) });
+    // Build the schema via the drizzle-kit migrations (the generated migrations are the single source
+    // of truth; the migrator creates everything on a fresh DB and is a no-op once applied).
+    runMigrations(db);
     this.loadPricing();
   }
 
@@ -402,6 +402,17 @@ export class DrizzleStorageAdapter implements StorageAdapter {
 
   async recomputeComputedCost(): Promise<{ costPoints: number }> {
     return pricingStore.recomputeComputedCost(this.orm, this.priceIndex);
+  }
+
+  // Re-materialize metric_points.is_primary for the whole table from first principles (the registry's
+  // preferred-signal precedence) and rebuild the rollup to match. Idempotent repair for any drift in
+  // the stored flag (e.g. a bad historical backfill, a precedence-rule change). Exposed via the
+  // cron-token-guarded /api/maintenance/rebuild-primary endpoint.
+  async rebuildIsPrimary(): Promise<void> {
+    this.orm.transaction(() => {
+      ingest.rebuildIsPrimary(this.orm);
+      ingest.rebuildRollup(this.orm);
+    });
   }
 
 }

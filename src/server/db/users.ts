@@ -1,5 +1,5 @@
-// Users registry: free functions over the Drizzle handle for the `users` table — find/upsert/enrich,
-// the OAuth account link, and the legacy backfill. Extracted from the storage adapter so the
+// Users registry: free functions over the Drizzle handle for the `users` table — find/upsert/enrich
+// and the OAuth account link. Extracted from the storage adapter so the
 // metrics/sessions/people read modules (and the adapter's ingest) can share one implementation.
 // Every function takes the Drizzle handle (`db`) as its first arg and uses ONLY it (the same shared
 // connection the adapter's transactions run on), so an upsert called inside an adapter BEGIN/COMMIT
@@ -81,28 +81,6 @@ export function findUserByAnyEmail(db: DrizzleDb, emails: string[]): number | nu
   return null;
 }
 
-// Build the users registry once from identities already stored on sessions (existing DBs predate the
-// table). No-op once users has any rows — from then on upsertSession maintains it incrementally.
-export function migrateUsers(db: DrizzleDb): void {
-  const { n } = db.get<{ n: number }>(sql`SELECT COUNT(*) AS n FROM ${users}`) as { n: number };
-  if (n > 0) return;
-  const sessionRows = db.all<{ id: number; user_email: string | null; user_account_id: string | null; user_id: string | null; first_seen_at: number }>(
-    sql`SELECT id, user_email, user_account_id, user_id, first_seen_at FROM sessions`
-  ) as Array<{ id: number; user_email: string | null; user_account_id: string | null; user_id: string | null; first_seen_at: number }>;
-  if (sessionRows.length === 0) return;
-  db.run(sql`BEGIN`);
-  try {
-    for (const s of sessionRows) {
-      const uid = upsertUser(db, { userEmail: s.user_email, userAccountId: s.user_account_id, userId: s.user_id }, s.first_seen_at);
-      if (uid !== null) db.run(sql`UPDATE sessions SET user_row_id = ${uid} WHERE id = ${s.id}`);
-    }
-    db.run(sql`COMMIT`);
-  } catch (error) {
-    db.run(sql`ROLLBACK`);
-    throw error;
-  }
-}
-
 export function getUserById(db: DrizzleDb, id: number): AuthUser | null {
   const row = db
     .select({ id: users.id, email: users.email, displayName: users.displayName, githubLogin: users.githubLogin })
@@ -168,8 +146,8 @@ export function upsertOAuthUser(db: DrizzleDb, input: OAuthUserInput, now: numbe
 
 // Map every identity value (email / account_id / user_id) to its users-registry row, so a People
 // group keyed by any of those strings can be resolved to one canonical person for display.
-export function userDirectory(db: DrizzleDb): Map<string, UserIdentityFields> {
-  const userRows = db
+export async function userDirectory(db: DrizzleDb): Promise<Map<string, UserIdentityFields>> {
+  const userRows = (await db
     .select({
       email: users.email,
       accountId: users.accountId,
@@ -178,7 +156,7 @@ export function userDirectory(db: DrizzleDb): Map<string, UserIdentityFields> {
       githubLogin: users.githubLogin
     })
     .from(users)
-    .all() as Array<{ email: string | null; accountId: string | null; userId: string | null; displayName: string | null; githubLogin: string | null }>;
+    .execute()) as Array<{ email: string | null; accountId: string | null; userId: string | null; displayName: string | null; githubLogin: string | null }>;
   const map = new Map<string, UserIdentityFields>();
   for (const u of userRows) {
     const value = { email: u.email, displayName: u.displayName, githubLogin: u.githubLogin };
@@ -190,8 +168,8 @@ export function userDirectory(db: DrizzleDb): Map<string, UserIdentityFields> {
 // Attach friendly identity fields (email / display name / GitHub login) from the `users` registry to
 // rows keyed by their canonical identity string (`user`), so every list can prefer a GitHub login or
 // display name over the raw email. Shared by People, the summary Users breakdown, and sessions.
-export function enrichUsers<T extends { user: string }>(db: DrizzleDb, rows: T[]): Array<T & UserIdentityFields> {
-  const directory = userDirectory(db);
+export async function enrichUsers<T extends { user: string }>(db: DrizzleDb, rows: T[]): Promise<Array<T & UserIdentityFields>> {
+  const directory = await userDirectory(db);
   return rows.map((row) => {
     const u = directory.get(row.user);
     return {

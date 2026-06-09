@@ -24,7 +24,7 @@ export async function getSession(db: DrizzleDb, id: number): Promise<SessionSumm
 // restricted to the session's authoritative signal (so totals never mix OTel with a shadowed
 // transcript); an explicit `source` filter switches to that source's raw points for the OTel-vs-
 // JSONL comparison view, and limits the list to sessions that actually carry that source.
-export function buildSessions(db: DrizzleDb, filters: SummaryFilters, tail: SQL): Promise<SessionSummary[]> {
+export async function buildSessions(db: DrizzleDb, filters: SummaryFilters, tail: SQL): Promise<SessionSummary[]> {
   const joinCondition: SQL = filters.source
     ? sql`p.session_row_id = s.id AND p.source = ${filters.source}`
     : sql`p.session_row_id = s.id AND p.is_primary = 1`;
@@ -65,14 +65,9 @@ export function buildSessions(db: DrizzleDb, filters: SummaryFilters, tail: SQL)
            WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'tokens') AS otelTotalTokens,
         (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
            WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' AND mp.kind = 'tokens') AS jsonlTotalTokens,
-        -- Per-signal cost too: OTel-reported vs synthesized JSONL cost, so the UI can show the delta.
-        (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'cost') AS otelTotalCost,
-        (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' AND mp.kind = 'cost') AS jsonlTotalCost,
-        -- Same per-signal split for cost. OTel cost is Claude's reported figure; JSONL cost is the
-        -- synthesized finius.cost.computed point (kind=cost, signal=jsonl). Independent of the
-        -- authoritative join so the UI can show the delta when a session carries both.
+        -- Per-signal cost too. OTel cost is Claude's reported figure; JSONL cost is the synthesized
+        -- finius.cost.computed point (kind=cost, signal=jsonl). Independent of the authoritative join so
+        -- the UI can show the delta when a session carries both.
         (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
            WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'cost') AS otelTotalCost,
         (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
@@ -105,21 +100,19 @@ export function buildSessions(db: DrizzleDb, filters: SummaryFilters, tail: SQL)
 
   // Resolve each session's friendly identity (GitHub login / display name) the same way People does,
   // keyed by the session's canonical identity string, so the sessions list can prefer it over email.
-  const directory = userDirectory(db);
-  return Promise.resolve(
-    rows.map(({ otelSource, jsonlSource, ...row }) => {
-      const u = (row.userRowId ? getUserById(db, row.userRowId) : null) ?? directory.get(row.userEmail ?? row.userAccountId ?? row.userId ?? "unknown");
-      return {
-        ...row,
-        source: row.metricSource === "otel" ? otelSource ?? OTEL_SOURCE : jsonlSource ?? "claude-code-jsonl",
-        metricSource: row.metricSource,
-        hasOtel: row.hasOtel === 1,
-        hasJsonl: row.hasJsonl === 1,
-        githubLogin: u?.githubLogin ?? null,
-        displayName: u?.displayName ?? null,
-        models: row.models?.split(",").filter(Boolean) ?? [],
-        hasTranscript: row.hasTranscript === 1
-      };
-    })
-  );
+  const directory = await userDirectory(db);
+  return rows.map(({ otelSource, jsonlSource, ...row }) => {
+    const u = (row.userRowId ? getUserById(db, row.userRowId) : null) ?? directory.get(row.userEmail ?? row.userAccountId ?? row.userId ?? "unknown");
+    return {
+      ...row,
+      source: row.metricSource === "otel" ? otelSource ?? OTEL_SOURCE : jsonlSource ?? "claude-code-jsonl",
+      metricSource: row.metricSource,
+      hasOtel: row.hasOtel === 1,
+      hasJsonl: row.hasJsonl === 1,
+      githubLogin: u?.githubLogin ?? null,
+      displayName: u?.displayName ?? null,
+      models: row.models?.split(",").filter(Boolean) ?? [],
+      hasTranscript: row.hasTranscript === 1
+    };
+  });
 }

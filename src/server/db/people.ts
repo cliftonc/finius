@@ -3,85 +3,114 @@
 // (fragments.ts), the Postgres-seam SQL bits (dialect.ts), and the users-registry enrichment (users.ts).
 
 import { type DrizzleDb } from "./client.js";
-import { sql } from "drizzle-orm";
+import { and, countDistinct, desc, eq, inArray, isNotNull, max, ne, sql } from "drizzle-orm";
 import { logEvents, metricPoints, metricRollup } from "./schema.js";
-import { POINT_IDENTITY, pointWhere, whereClause, whereClauseAnd } from "./fragments.js";
+import { POINT_IDENTITY, pointWhere, sumWhen } from "./fragments.js";
 import { dialect } from "./dialect.js";
 import { enrichUsers } from "./users.js";
 import type { SummaryFilters, PersonSummary, ModelSummary, FilterOptions, LogEventSummary } from "../types.js";
 
-export function listPeople(db: DrizzleDb, filters: SummaryFilters): PersonSummary[] {
-  const where = pointWhere(filters, { dedupe: true });
-  const rows = db.all<Omit<PersonSummary, "models" | "email" | "displayName" | "githubLogin"> & { models: string | null }>(
-    sql`SELECT
-        ${POINT_IDENTITY} AS user,
-        COUNT(DISTINCT session_row_id) AS sessions,
-        COALESCE(SUM(CASE WHEN kind = 'cost' THEN value ELSE 0 END), 0) AS totalCost,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN value ELSE 0 END), 0) AS inputTokens,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN value ELSE 0 END), 0) AS outputTokens,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type IN ('cache_creation', 'cache_read') THEN value ELSE 0 END), 0) AS cacheTokens,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' THEN value ELSE 0 END), 0) AS totalTokens,
-        MAX(timestamp) AS lastSeenAt,
-        ${dialect.groupConcatDistinct(sql`model`)} AS models
-      FROM ${metricPoints} ${whereClause(where)}
-      GROUP BY ${POINT_IDENTITY}
-      ORDER BY totalCost DESC, totalTokens DESC`
-  ) as Array<Omit<PersonSummary, "models" | "email" | "displayName" | "githubLogin"> & { models: string | null }>;
+const value = metricPoints.value;
+const kind = metricPoints.kind;
+const tokenType = metricPoints.tokenType;
+const inputTokens = () => sumWhen(and(eq(kind, "tokens"), eq(tokenType, "input"))!, value);
+const outputTokens = () => sumWhen(and(eq(kind, "tokens"), eq(tokenType, "output"))!, value);
+const cacheTokens = () => sumWhen(and(eq(kind, "tokens"), inArray(tokenType, ["cache_creation", "cache_read"]))!, value);
+const totalTokens = () => sumWhen(eq(kind, "tokens"), value);
+const totalCost = () => sumWhen(eq(kind, "cost"), value);
+
+export async function listPeople(db: DrizzleDb, filters: SummaryFilters): Promise<PersonSummary[]> {
+  // Hoist cost/tokens so ORDER BY references the expression (inline `sql` columns carry no alias).
+  const cost = totalCost();
+  const tokens = totalTokens();
+  const rows = (await db
+    .select({
+      user: POINT_IDENTITY,
+      sessions: countDistinct(metricPoints.sessionRowId),
+      totalCost: cost,
+      inputTokens: inputTokens(),
+      outputTokens: outputTokens(),
+      cacheTokens: cacheTokens(),
+      totalTokens: tokens,
+      lastSeenAt: max(metricPoints.timestamp),
+      models: dialect.groupConcatDistinct(metricPoints.model)
+    })
+    .from(metricPoints)
+    .where(pointWhere(filters, { dedupe: true }))
+    .groupBy(POINT_IDENTITY)
+    .orderBy(desc(cost), desc(tokens))
+    .execute()) as Array<Omit<PersonSummary, "models" | "email" | "displayName" | "githubLogin"> & { models: string | null }>;
 
   // Enrich each identity-string group with friendly fields from the users registry. JS-side join (the
-  // table is tiny — one row per person) keeps the aggregate SQL and the `user` filter untouched.
-  return enrichUsers(db, rows).map((row) => ({
+  // table is tiny — one row per person) keeps the aggregate query and the `user` filter untouched.
+  return (await enrichUsers(db, rows)).map((row) => ({
     ...row,
     models: row.models?.split(",").filter(Boolean) ?? []
   }));
 }
 
-export function listModels(db: DrizzleDb, filters: SummaryFilters): ModelSummary[] {
-  const where = pointWhere(filters, { dedupe: true });
+export async function listModels(db: DrizzleDb, filters: SummaryFilters): Promise<ModelSummary[]> {
   // Only token/cost points carry a model; other kinds (lines/decision) have NULL model.
-  const scoped = whereClauseAnd(where, sql`model IS NOT NULL`);
-  const rows = db.all<ModelSummary>(
-    sql`SELECT
-        model,
-        COUNT(DISTINCT session_row_id) AS sessions,
-        COUNT(DISTINCT ${POINT_IDENTITY}) AS users,
-        COALESCE(SUM(CASE WHEN kind = 'cost' THEN value ELSE 0 END), 0) AS totalCost,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'input' THEN value ELSE 0 END), 0) AS inputTokens,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type = 'output' THEN value ELSE 0 END), 0) AS outputTokens,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' AND token_type IN ('cache_creation', 'cache_read') THEN value ELSE 0 END), 0) AS cacheTokens,
-        COALESCE(SUM(CASE WHEN kind = 'tokens' THEN value ELSE 0 END), 0) AS totalTokens,
-        MAX(timestamp) AS lastSeenAt
-      FROM ${metricPoints} ${scoped}
-      GROUP BY model
-      ORDER BY totalCost DESC, totalTokens DESC`
-  ) as ModelSummary[];
-  return rows;
+  const cost = totalCost();
+  const tokens = totalTokens();
+  return (await db
+    .select({
+      model: metricPoints.model,
+      sessions: countDistinct(metricPoints.sessionRowId),
+      users: countDistinct(POINT_IDENTITY),
+      totalCost: cost,
+      inputTokens: inputTokens(),
+      outputTokens: outputTokens(),
+      cacheTokens: cacheTokens(),
+      totalTokens: tokens,
+      lastSeenAt: max(metricPoints.timestamp)
+    })
+    .from(metricPoints)
+    .where(and(pointWhere(filters, { dedupe: true }), isNotNull(metricPoints.model)))
+    .groupBy(metricPoints.model)
+    .orderBy(desc(cost), desc(tokens))
+    .execute()) as ModelSummary[];
 }
 
-export function getFilterOptions(db: DrizzleDb): FilterOptions {
+export async function getFilterOptions(db: DrizzleDb): Promise<FilterOptions> {
   // The rollup is OTel-only, so union its distinct dimensions with metric_points (all signals) to
   // keep the transcript-derived source ('claude-code-jsonl') and any jsonl-only users/models
   // selectable — the comparison view filters on the JSONL source even when every JSONL session is
   // also covered by OTel (and therefore absent from the OTel rollup).
-  const sources = db.all<{ source: string }>(
-    sql`SELECT source FROM ${metricRollup} UNION SELECT source FROM ${metricPoints} ORDER BY source`
-  ) as Array<{ source: string }>;
-  const userOpts = db.all<{ user: string }>(
-    sql`SELECT user_identity AS user FROM ${metricRollup}
-       UNION SELECT COALESCE(user_email, user_account_id, user_id, 'unknown') AS user FROM ${metricPoints}
-       ORDER BY user`
-  ) as Array<{ user: string }>;
-  const models = db.all<{ model: string }>(
-    sql`SELECT model FROM ${metricRollup} WHERE model <> ''
-       UNION SELECT model FROM ${metricPoints} WHERE model IS NOT NULL AND model <> ''
-       ORDER BY model`
-  ) as Array<{ model: string }>;
+  // ORDER BY 1 (ordinal) sorts the compound by its first output column — independent of the per-branch
+  // alias names (the rollup column `user_identity` is surfaced as `user`), and portable to Postgres.
+  const sources = (await db
+    .select({ source: metricRollup.source })
+    .from(metricRollup)
+    .union(db.select({ source: metricPoints.source }).from(metricPoints))
+    .orderBy(sql`1`)
+    .execute()) as Array<{ source: string }>;
+  const userOpts = (await db
+    .select({ user: metricRollup.userIdentity })
+    .from(metricRollup)
+    .union(db.select({ user: sql<string>`${POINT_IDENTITY}` }).from(metricPoints))
+    .orderBy(sql`1`)
+    .execute()) as Array<{ user: string }>;
+  const models = (await db
+    .select({ model: metricRollup.model })
+    .from(metricRollup)
+    .where(ne(metricRollup.model, ""))
+    .union(
+      db
+        .select({ model: sql<string>`${metricPoints.model}` })
+        .from(metricPoints)
+        .where(and(isNotNull(metricPoints.model), ne(metricPoints.model, "")))
+    )
+    .orderBy(sql`1`)
+    .execute()) as Array<{ model: string }>;
   return { sources: sources.map((r) => r.source), users: userOpts.map((r) => r.user), models: models.map((r) => r.model) };
 }
 
 // Grouped inspection view of captured log records: one row per distinct event name with a count,
 // the latest timestamp, and a single sample (most recent) so we can see what Codex actually emits.
-export function getLogEventSummary(db: DrizzleDb): LogEventSummary[] {
+export async function getLogEventSummary(db: DrizzleDb): Promise<LogEventSummary[]> {
+  // Raw `db.all(sql)` (node-sqlite's synchronous raw exec — no portable `db.execute(sql)`): kept sync
+  // inside this async fn; the correlated self-join subqueries are a dialect seam to revisit for Postgres.
   const rows = db.all<{ eventName: string; count: number; lastSeenAt: number; sampleAttributes: string | null; sampleBody: string | null }>(
     sql`SELECT
         COALESCE(event_name, '(unnamed)') AS eventName,

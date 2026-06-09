@@ -7,9 +7,10 @@
 // (timestamp/bucket/*_at/effective_date) are plain `integer` (NOT timestamp mode); value/price
 // columns are `real`; 0/1 flags are `integer`.
 //
-// NOTE: metric_rollup and model_prices are WITHOUT ROWID in migrate(). The sqlite-core schema API
-// can't express WITHOUT ROWID, so the generated baseline .sql is hand-edited to add it; this file
-// only declares the composite primary key (whose column order matches the ON CONFLICT targets).
+// Migrations are 100% drizzle-kit-generated and never hand-edited: change this file, then
+// `npm run db:generate`. metric_rollup and model_prices are plain composite-PK tables (their column
+// order matches the ON CONFLICT targets) — WITHOUT ROWID was dropped because the sqlite-core schema
+// API can't express it and it's SQLite-only (it would force a hand-edit and block the Postgres path).
 
 import { foreignKey, index, integer, primaryKey, real, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 
@@ -52,7 +53,7 @@ export const sessions = sqliteTable(
     userId: text("user_id"),
     userEmail: text("user_email"),
     userAccountId: text("user_account_id"),
-    // FK into users(id) — set on ingest. Added via ensureColumn ALTER on legacy DBs.
+    // FK into users(id) — set on ingest.
     userRowId: integer("user_row_id"),
     hasOtel: integer("has_otel").notNull().default(0),
     hasJsonl: integer("has_jsonl").notNull().default(0),
@@ -149,7 +150,6 @@ export const authTokens = sqliteTable(
     createdAt: integer("created_at").notNull(),
     lastUsedAt: integer("last_used_at"),
     revoked: integer("revoked").notNull().default(0),
-    // Added via ensureColumn ALTER on legacy DBs.
     userRowId: integer("user_row_id")
   },
   (t) => [

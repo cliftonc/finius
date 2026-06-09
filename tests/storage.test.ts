@@ -1,9 +1,40 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { DrizzleStorageAdapter } from "../src/server/storage/adapter";
-import { copilotTraceBatch, copilotVsCodeTraceBatch, copilotVsCodeTranscript, jsonlTranscript, otlpLogBatch, otlpMetricBatch } from "./fixtures";
+import { copilotTraceBatch, copilotVsCodeTraceBatch, copilotVsCodeTranscript, jsonlTranscript, modelPrices, otlpLogBatch, otlpMetricBatch } from "./fixtures";
+
+// An OTLP/JSON metrics batch carrying ONLY a telemetry-only metric (no token/cost) for a session — the
+// shape Claude Code emits for a session that never made an API call. Used to assert such sessions do
+// NOT create a "ghost" row.
+function activeTimeOnlyBatch(sessionId: string) {
+  return {
+    resourceMetrics: [
+      {
+        resource: {
+          attributes: [
+            { key: "service.name", value: { stringValue: "claude-code" } },
+            { key: "session.id", value: { stringValue: sessionId } },
+            { key: "user.email", value: { stringValue: "dev@example.com" } }
+          ]
+        },
+        scopeMetrics: [
+          {
+            metrics: [
+              {
+                name: "claude_code.active_time.total",
+                unit: "s",
+                sum: { dataPoints: [{ timeUnixNano: "1760000000000000000", asDouble: 4.2, attributes: [{ key: "type", value: { stringValue: "cli" } }] }] }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  };
+}
 
 function tmpDbPath() {
   return join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite");
@@ -427,5 +458,106 @@ describe("SQLite storage adapter", () => {
 
     // getSession resolves by id directly (not capped to the recent-100 list).
     expect((await storage.getSession(both.id))?.sessionId).toBe("both");
+  });
+
+  it("rebuildIsPrimary re-promotes a no-OTel transcript's token points corrupted to is_primary=0", async () => {
+    const path = tmpDbPath();
+    storage = new DrizzleStorageAdapter(path);
+    await storage.importPricing(modelPrices());
+    // JSONL-only Claude session: tokens (and cost) are the fallback-primary (no OTel to shadow them).
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "solo" }, jsonlTranscript("solo", { input_tokens: 40, output_tokens: 7 }, 0.01));
+
+    // Corrupt exactly the historical scar: force the JSONL token points to is_primary=0 (cost left 1).
+    const raw = new DatabaseSync(path);
+    raw.exec("UPDATE metric_points SET is_primary = 0 WHERE kind = 'tokens' AND signal = 'jsonl'");
+    raw.close();
+
+    // The corruption produced the ghost: the session reads as 0 tokens before repair.
+    const beforeId = (await storage.listSessions({})).find((s) => s.sessionId === "solo")!.id;
+    expect((await storage.getSession(beforeId))!.totalTokens).toBe(0);
+
+    await storage.rebuildIsPrimary();
+
+    const solo = (await storage.listSessions({})).find((s) => s.sessionId === "solo")!;
+    expect(solo.totalTokens).toBe(47);
+    expect(solo.inputTokens).toBe(40);
+    expect(solo.outputTokens).toBe(7);
+    // The rollup-served summary is rebuilt to match (rebuildIsPrimary + rebuildRollup are consistent).
+    const summary = await storage.getSummary({});
+    expect(summary.inputTokens).toBe(40);
+    expect(summary.totalTokens).toBe(47);
+  });
+
+  it("rebuildIsPrimary keeps a session's JSONL shadowed when OTel is also present (idempotent)", async () => {
+    storage = new DrizzleStorageAdapter(tmpDbPath());
+    await storage.ingestOtelMetrics(otlpMetricBatch("both")); // OTel: 1200 in / 350 out
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "both" }, jsonlTranscript("both", { input_tokens: 999, output_tokens: 111 }, 0.5)); // shadowed
+
+    await storage.rebuildIsPrimary(); // must NOT promote the shadowed transcript
+
+    const both = (await storage.listSessions({})).find((s) => s.sessionId === "both")!;
+    expect(both.inputTokens).toBe(1200); // OTel, not the 999 from JSONL
+    expect(both.outputTokens).toBe(350);
+    const summary = await storage.getSummary({});
+    expect(summary.inputTokens).toBe(1200);
+    expect(summary.sessionCount).toBe(1);
+    // Points are retained (only is_primary=0), so the comparison view still sees the raw transcript.
+    expect((await storage.getSummary({ source: "claude-code-jsonl" })).inputTokens).toBe(999);
+  });
+
+  it("rebuildIsPrimary does not demote a Claude transcript shadowed only by a cross-provider JSONL source", async () => {
+    // A single session_id carrying two JSONL sources of DIFFERENT providers: claude-code-jsonl (claude,
+    // prefers otlp_metrics → shadowable) and manual-jsonl (manual, prefers jsonl → its own primary). The
+    // session has NO OTel, so the live rule keeps BOTH primary. rebuildIsPrimary must agree — the old
+    // "any non-shadowable source in the session" predicate wrongly demoted the claude transcript because
+    // manual-jsonl is non-shadowable, dropping the default total (the reviewer's 45 → 5).
+    storage = new DrizzleStorageAdapter(tmpDbPath());
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "x" }, jsonlTranscript("x", { input_tokens: 40, output_tokens: 7 }));
+    await storage.importJsonl("manual-jsonl", { sessionId: "x" }, jsonlTranscript("x", { input_tokens: 5, output_tokens: 3 }));
+
+    const before = await storage.getSummary({});
+    expect(before.inputTokens).toBe(45); // 40 (claude jsonl) + 5 (manual jsonl), both fallback-primary
+
+    await storage.rebuildIsPrimary(); // must be a no-op on already-correct data, not a demotion
+
+    const after = await storage.getSummary({});
+    expect(after.inputTokens).toBe(before.inputTokens); // still 45, not 5
+    expect(after.outputTokens).toBe(before.outputTokens);
+  });
+
+  it("recomputeComputedCost preserves a shadowed JSONL transcript's synthesized comparison cost", async () => {
+    // A session with OTel cost AND a Claude transcript (no cost in the transcript → cost is synthesized,
+    // is_primary=0 because OTel shadows it). recompute must regenerate that shadowed JSONL cost so the
+    // comparison/source-filtered view still shows it — the old skip keyed on ANY remaining cost row
+    // (incl. OTel), deleting it and reading 0.004662 → 0.
+    storage = new DrizzleStorageAdapter(tmpDbPath());
+    await storage.importPricing(modelPrices());
+    await storage.ingestOtelMetrics(otlpMetricBatch("s")); // OTel cost 0.024, tokens 1200/350
+    await storage.importJsonl("claude-code-jsonl", { sessionId: "s" }, jsonlTranscript("s", { input_tokens: 999, output_tokens: 111 })); // no cost → synthesized, shadowed
+
+    const comparisonBefore = (await storage.getSummary({ source: "claude-code-jsonl" })).totalCost;
+    expect(comparisonBefore).toBeCloseTo(0.004662, 6); // 999*3e-6 + 111*15e-6
+
+    await storage.recomputeComputedCost();
+
+    expect((await storage.getSummary({ source: "claude-code-jsonl" })).totalCost).toBeCloseTo(comparisonBefore, 6);
+    // Default (primary) cost stays the OTel figure — the regenerated JSONL cost is shadowed, not summed.
+    expect((await storage.getSummary({})).totalCost).toBeCloseTo(0.024, 6);
+  });
+
+  it("does not create ghost session rows for telemetry-only OTel metrics (no tokens/cost)", async () => {
+    storage = new DrizzleStorageAdapter(tmpDbPath());
+
+    // A session that only ever emits active_time (never made an API call) creates NO session row.
+    await storage.ingestOtelMetrics(activeTimeOnlyBatch("ghost"));
+    expect((await storage.listSessions({})).find((s) => s.sessionId === "ghost")).toBeUndefined();
+
+    // A real session's active_time IS kept (it rides in a batch that also carries token usage), and
+    // the session row exists with its tokens.
+    await storage.ingestOtelMetrics(otlpMetricBatch("real")); // tokens + cost + (no active_time here)
+    await storage.ingestOtelMetrics(activeTimeOnlyBatch("real")); // session already exists -> kept
+    const real = (await storage.listSessions({})).find((s) => s.sessionId === "real")!;
+    expect(real).toBeDefined();
+    expect(real.inputTokens).toBe(1200);
   });
 });

@@ -82,11 +82,10 @@ const SNAPSHOT_PATH = fileURLToPath(new URL("./fixtures/schema-snapshot.json", i
 
 describe("schema guard: Drizzle migration matches the committed schema snapshot", () => {
   it("produces the frozen normalized schema structure", () => {
-    // Build a fresh DB through the same migrator the adapter uses (no-op data hooks: this only
-    // exercises the schema, and a fresh DB never hits the legacy backfill path).
+    // Build a fresh DB through the same migrator the adapter uses.
     const path = join(dir, "fresh.sqlite");
     const { db, sqlite } = connect(path);
-    runMigrations(sqlite, db, { rebuildRollup: () => {}, migrateUsers: () => {} });
+    runMigrations(db);
 
     const actual = describeSchema(sqlite);
     const expected = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8")) as ReturnType<typeof describeSchema>;

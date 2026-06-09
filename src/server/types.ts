@@ -159,6 +159,9 @@ export interface StorageAdapter {
   getPricing(): Promise<ModelPrice[]>;
   importPricing(prices: ModelPrice[]): Promise<{ imported: number }>;
   recomputeComputedCost(): Promise<{ costPoints: number }>;
+  // Re-materialize is_primary (the OTel↔JSONL precedence flag) for the whole table from the registry
+  // rule and rebuild the rollup. Idempotent repair for any drift in the stored flag.
+  rebuildIsPrimary(): Promise<void>;
   // Synchronous import (parse + process inline), returning the full result. Used by tests / CLI-direct.
   importJsonl(
     source: string,

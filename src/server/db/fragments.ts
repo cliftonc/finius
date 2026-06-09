@@ -7,7 +7,7 @@
 //
 // `rollupWhere`/`pointWhere` reference the typed schema columns so a column rename is a compile error.
 
-import { type SQL, and, sql } from "drizzle-orm";
+import { type SQL, type SQLWrapper, and, eq, gte, lte, or, sql } from "drizzle-orm";
 import { metricPoints, metricRollup, sessions } from "./schema.js";
 import type { Granularity, SummaryFilters } from "../types.js";
 
@@ -41,12 +41,12 @@ export function canUseRollup(filters: SummaryFilters, granularity?: Granularity)
 // WHERE predicate over metric_rollup rows. Returns undefined when no filter applies (→ no WHERE).
 export function rollupWhere(filters: SummaryFilters): SQL | undefined {
   const clauses: SQL[] = [];
-  if (filters.from) clauses.push(sql`${metricRollup.bucket} >= ${filters.from}`);
-  if (filters.to) clauses.push(sql`${metricRollup.bucket} <= ${filters.to}`);
-  if (filters.user) clauses.push(sql`${metricRollup.userIdentity} = ${filters.user}`);
+  if (filters.from) clauses.push(gte(metricRollup.bucket, filters.from));
+  if (filters.to) clauses.push(lte(metricRollup.bucket, filters.to));
+  if (filters.user) clauses.push(eq(metricRollup.userIdentity, filters.user));
   if (filters.userRowId != null) clauses.push(sql`1 = 0`);
-  if (filters.model) clauses.push(sql`${metricRollup.model} = ${filters.model}`);
-  if (filters.source) clauses.push(sql`${metricRollup.source} = ${filters.source}`);
+  if (filters.model) clauses.push(eq(metricRollup.model, filters.model));
+  if (filters.source) clauses.push(eq(metricRollup.source, filters.source));
   return and(...clauses);
 }
 
@@ -55,36 +55,41 @@ export function rollupWhere(filters: SummaryFilters): SQL | undefined {
 // filter means "show that source raw" (OTel-vs-JSONL comparison), so it skips is_primary.
 export function pointWhere(filters: SummaryFilters, opts: { dedupe?: boolean } = {}): SQL | undefined {
   const clauses: SQL[] = [];
-  if (filters.from) clauses.push(sql`${metricPoints.timestamp} >= ${filters.from}`);
-  if (filters.to) clauses.push(sql`${metricPoints.timestamp} <= ${filters.to}`);
-  if (filters.user) clauses.push(sql`${POINT_IDENTITY} = ${filters.user}`);
+  if (filters.from) clauses.push(gte(metricPoints.timestamp, filters.from));
+  if (filters.to) clauses.push(lte(metricPoints.timestamp, filters.to));
+  if (filters.user) clauses.push(eq(POINT_IDENTITY, filters.user));
   if (filters.userRowId != null) {
+    // Kept as `sql` IN-subqueries (portable ANSI): pointWhere takes no db handle to thread a
+    // builder subquery, and the email arm joins on the COALESCE identity expression anyway.
     const ors: SQL[] = [sql`${metricPoints.sessionRowId} IN (SELECT ${sessions.id} FROM ${sessions} WHERE ${sessions.userRowId} = ${filters.userRowId})`];
     if (filters.userRowIdEmail) {
       ors.push(
         sql`${metricPoints.sessionRowId} IN (SELECT ${sessions.id} FROM ${sessions} WHERE COALESCE(${sessions.userEmail}, ${sessions.userAccountId}, ${sessions.userId}, 'unknown') = ${filters.userRowIdEmail})`
       );
     }
-    clauses.push(sql`(${sql.join(ors, sql` OR `)})`);
+    const ored = or(...ors);
+    if (ored) clauses.push(ored);
   }
-  if (filters.model) clauses.push(sql`${metricPoints.model} = ${filters.model}`);
-  if (filters.source) clauses.push(sql`${metricPoints.source} = ${filters.source}`);
-  if (filters.session) clauses.push(sql`${metricPoints.sessionRowId} = ${filters.session}`);
-  if (opts.dedupe && !filters.source) clauses.push(sql`${metricPoints.isPrimary} = 1`);
+  if (filters.model) clauses.push(eq(metricPoints.model, filters.model));
+  if (filters.source) clauses.push(eq(metricPoints.source, filters.source));
+  if (filters.session) clauses.push(eq(metricPoints.sessionRowId, filters.session));
+  if (opts.dedupe && !filters.source) clauses.push(eq(metricPoints.isPrimary, 1));
   return and(...clauses);
 }
 
-// Render a predicate as a `WHERE …` clause, or empty SQL when there's no predicate. Splice into a
-// query as `${whereClause(frag)}`.
-export function whereClause(predicate: SQL | undefined): SQL {
-  return predicate ? sql`WHERE ${predicate}` : sql``;
+// Conditional aggregate: COALESCE(SUM(CASE WHEN <cond> THEN <col> ELSE 0 END), 0), typed as a number.
+// Drizzle has no portable conditional-sum, so this is the documented `sql` idiom — wrapped once so the
+// read queries read as `sumWhen(eq(col, 'cost'), value)`. The body is ANSI SQL (portable to Postgres),
+// so it lives here and not in the dialect seam; `col`/`cond` are core SQLWrapper types (no dialect
+// coupling) so the typed columns still quote correctly under a future Postgres handle.
+export function sumWhen(cond: SQLWrapper, col: SQLWrapper): SQL<number> {
+  return sql<number>`COALESCE(SUM(CASE WHEN ${cond} THEN ${col} ELSE 0 END), 0)`;
 }
 
-// Combine a WHERE predicate with additional always-applied scoping (e.g. `kind IN ('tokens','cost')`)
-// and render the `WHERE …` clause. Mirrors the old `where ? \`${where} AND <extra>\` : \`WHERE <extra>\``.
-export function whereClauseAnd(predicate: SQL | undefined, ...extra: SQL[]): SQL {
-  const combined = and(predicate, ...extra);
-  return combined ? sql`WHERE ${combined}` : sql``;
+// Render a predicate as a `WHERE …` clause, or empty SQL when there's no predicate. Splice into a
+// query as `${whereClause(frag)}`. Still used by the raw `sessions.ts` builder.
+export function whereClause(predicate: SQL | undefined): SQL {
+  return predicate ? sql`WHERE ${predicate}` : sql``;
 }
 
 function hourAligned(t?: number) {
