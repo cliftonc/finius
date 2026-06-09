@@ -54,6 +54,10 @@ export type FiniusConfig = {
       };
     };
   };
+  // Storage backend for `finius serve`. Absent ⇒ the default local SQLite file under ~/.finius/data
+  // (zero-config, the local-first default). Set to a Postgres connection at `finius setup` for a
+  // server-mode deployment. The connection URL can also come from FINIUS_DATABASE_URL (which wins).
+  database?: { backend: "postgres"; url: string };
 };
 
 export function configExists(): boolean {
@@ -77,6 +81,15 @@ export function loadConfig(): FiniusConfig | null {
 // endpoints; the master password is accepted solely by /api/auth/login.
 export function resolveAuthToken(config: FiniusConfig | null): string | undefined {
   return config?.authToken ?? undefined;
+}
+
+// The Postgres connection for `finius serve` (env override → saved config), or null when the default
+// local-SQLite backend applies.
+export function resolvePostgresUrl(config: FiniusConfig | null): string | null {
+  const env = (process.env.FINIUS_DATABASE_URL ?? "").trim();
+  if (env) return env;
+  if (config?.database?.backend === "postgres" && config.database.url) return config.database.url.trim();
+  return null;
 }
 
 export function saveConfig(config: FiniusConfig): void {

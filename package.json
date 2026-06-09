@@ -36,8 +36,9 @@
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
     "build": "tsc -p tsconfig.build.json && npm run copy:migrations && vite build",
-    "copy:migrations": "node -e \"const fs=require('node:fs');fs.rmSync('dist/server/db/migrations',{recursive:true,force:true});fs.cpSync('src/server/db/migrations','dist/server/db/migrations',{recursive:true})\"",
+    "copy:migrations": "node -e \"const fs=require('node:fs');for(const d of ['migrations','migrations-pg']){fs.rmSync('dist/server/db/'+d,{recursive:true,force:true});fs.cpSync('src/server/db/'+d,'dist/server/db/'+d,{recursive:true})}\"",
     "db:generate": "drizzle-kit generate",
+    "db:generate:pg": "drizzle-kit generate --config drizzle.config.pg.ts",
     "build-link": "npm run build && npm install -g .",
     "start": "node dist/server/index.js",
     "cli": "tsx src/cli/index.ts",
@@ -45,7 +46,10 @@
     "lint:fix": "eslint 'src/**/*.{ts,tsx}' 'tests/**/*.ts' --fix",
     "prepublishOnly": "npm run lint && npm run typecheck && npm run build",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pg:up": "docker run -d --rm --name finius-pg -e POSTGRES_PASSWORD=finius -e POSTGRES_DB=finius -p 55432:5432 postgres:16-alpine >/dev/null && for i in $(seq 1 60); do docker exec finius-pg pg_isready -U postgres >/dev/null 2>&1 && break || sleep 0.5; done && echo 'Postgres ready → postgres://postgres:finius@localhost:55432/finius (run: npm run test:pg)'",
+    "pg:down": "docker rm -f finius-pg >/dev/null 2>&1 || true",
+    "test:pg": "FINIUS_TEST_DATABASE_URL=postgres://postgres:finius@localhost:55432/finius vitest run"
   },
   "dependencies": {
     "@clack/prompts": "^1.5.0",
@@ -70,7 +74,16 @@
     "react-dom": "^18.3.1",
     "unique-names-generator": "^4.7.1"
   },
+  "peerDependencies": {
+    "pg": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@types/pg": "^8.11.10",
     "@eslint/js": "^10.0.1",
     "@types/dompurify": "^3.0.5",
     "@types/node": "^24.10.1",
@@ -86,6 +99,7 @@
     "eslint": "^10.4.1",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.6.0",
+    "pg": "^8.13.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "tsx": "^4.20.6",

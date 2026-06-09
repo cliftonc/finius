@@ -56,9 +56,9 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
   // Single pluggable auth gate. In open mode it's a no-op; in Secure Mode it admits only
   // minted+non-revoked session tokens. The master password is a bootstrap secret for /api/auth/login
   // and is never accepted as a runtime API credential.
-  const authForCredential = (cred: string): { tokenId: number; userRowId: number | null } | null => {
+  const authForCredential = async (cred: string): Promise<{ tokenId: number; userRowId: number | null } | null> => {
     if (!cred) return null;
-    const row = storage.findAuthToken(sha256(cred));
+    const row = await storage.findAuthToken(sha256(cred));
     return row && row.revoked === 0 ? { tokenId: row.id, userRowId: row.userRowId } : null;
   };
 
@@ -66,7 +66,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
     if (!secure) return next();
     if (!isProtectedPath(c.req.path)) return next();
     const cred = bearerToken(c.req.header("authorization")) || cookieValue(c.req.header("cookie"), "finius_auth") || eventSourceToken(c) || "";
-    if (authForCredential(cred)) return next();
+    if (await authForCredential(cred)) return next();
     return c.json({ error: "unauthorized" }, 401);
   });
 
@@ -87,10 +87,10 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
     })
   );
 
-  app.get("/api/auth/me", (c) => {
-    const auth = currentAuth(c, storage);
+  app.get("/api/auth/me", async (c) => {
+    const auth = await currentAuth(c, storage);
     if (!auth?.userRowId) return c.json({ user: null });
-    const user = storage.getUserById(auth.userRowId);
+    const user = await storage.getUserById(auth.userRowId);
     return c.json({ user });
   });
 
@@ -111,17 +111,17 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
     }
     const token = randomBytes(32).toString("hex");
     const label = typeof body.label === "string" && body.label.trim() ? body.label.trim().slice(0, 200) : "client";
-    storage.createAuthToken(sha256(token), label, Date.now());
+    await storage.createAuthToken(sha256(token), label, Date.now());
     return c.json({ token });
   });
 
   // Revoke the presented session token and clear the cookie. Public: it only ever invalidates the
   // caller's own credential, and the cookie is HttpOnly so the browser can't clear it on its own.
-  app.post("/api/auth/logout", (c) => {
+  app.post("/api/auth/logout", async (c) => {
     const cred = bearerToken(c.req.header("authorization")) || cookieValue(c.req.header("cookie"), "finius_auth") || "";
     if (cred) {
-      const row = storage.findAuthToken(sha256(cred));
-      if (row) storage.revokeAuthToken(row.id);
+      const row = await storage.findAuthToken(sha256(cred));
+      if (row) await storage.revokeAuthToken(row.id);
     }
     c.header("set-cookie", clearAuthCookie());
     return c.json({ ok: true });
@@ -170,7 +170,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
         return c.json({ error: "github organization membership required" }, 403);
       }
 
-      const user = storage.upsertOAuthUser(
+      const user = await storage.upsertOAuthUser(
         {
           provider: "github",
           providerUserId: String(profile.id),
@@ -184,7 +184,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
         Date.now()
       );
       const browserToken = randomBytes(32).toString("hex");
-      storage.createAuthToken(sha256(browserToken), `github:${profile.login}`, Date.now(), user.id);
+      await storage.createAuthToken(sha256(browserToken), `github:${profile.login}`, Date.now(), user.id);
       // CLI loopback flow: the local listener has no cookie jar, so hand it the token via the URL.
       if (stateResult.returnTo) return c.redirect(appendToken(stateResult.returnTo, browserToken));
       // Browser flow: keep the token out of the URL/history. Set it as an HttpOnly cookie and bounce
@@ -214,7 +214,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
   app.post("/otlp/v1/metrics", async (c) => {
     const body = await readOtlpBody(c, "metrics");
     if (body instanceof OtlpDecodeError) return c.json({ error: body.message }, body.status as 400 | 415);
-    const result = await storage.ingestOtelMetrics(body, telemetryIdentity(c, storage));
+    const result = await storage.ingestOtelMetrics(body, await telemetryIdentity(c, storage));
     if (!result.duplicate) events.publish("ingest", { signal: "metrics", ...result });
     return c.json(result);
   });
@@ -230,7 +230,7 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
   app.post("/otlp/v1/traces", async (c) => {
     const body = await readOtlpBody(c, "traces");
     if (body instanceof OtlpDecodeError) return c.json({ error: body.message }, body.status as 400 | 415);
-    const result = await storage.ingestOtelTraces(body, telemetryIdentity(c, storage));
+    const result = await storage.ingestOtelTraces(body, await telemetryIdentity(c, storage));
     if (!result.duplicate) events.publish("ingest", { signal: "traces", ...result });
     return c.json(result);
   });
@@ -264,23 +264,23 @@ export function createApp({ storage, events, cronToken, rawRetentionDays = 7, au
   // The model pricing currently loaded (for debugging cost computation).
   app.get("/api/pricing", async (c) => c.json(await storage.getPricing()));
 
-  app.get("/api/metrics/summary", async (c) => c.json(await storage.getSummary(readFilters(c.req.query(), meFilter(c, storage)))));
+  app.get("/api/metrics/summary", async (c) => c.json(await storage.getSummary(readFilters(c.req.query(), await meFilter(c, storage)))));
 
   app.get("/api/metrics/timeseries", async (c) => {
     const query = c.req.query();
-    return c.json(await storage.getTimeseries({ ...readFilters(query, meFilter(c, storage)), granularity: readGranularity(query.granularity) }));
+    return c.json(await storage.getTimeseries({ ...readFilters(query, await meFilter(c, storage)), granularity: readGranularity(query.granularity) }));
   });
 
   app.get("/api/metrics/timeseries/by-model", async (c) => {
     const query = c.req.query();
-    return c.json(await storage.getModelTimeseries({ ...readFilters(query, meFilter(c, storage)), granularity: readGranularity(query.granularity) }));
+    return c.json(await storage.getModelTimeseries({ ...readFilters(query, await meFilter(c, storage)), granularity: readGranularity(query.granularity) }));
   });
 
-  app.get("/api/sessions", async (c) => c.json(await storage.listSessions(readFilters(c.req.query(), meFilter(c, storage)))));
+  app.get("/api/sessions", async (c) => c.json(await storage.listSessions(readFilters(c.req.query(), await meFilter(c, storage)))));
 
-  app.get("/api/people", async (c) => c.json(await storage.listPeople(readFilters(c.req.query(), meFilter(c, storage)))));
+  app.get("/api/people", async (c) => c.json(await storage.listPeople(readFilters(c.req.query(), await meFilter(c, storage)))));
 
-  app.get("/api/models", async (c) => c.json(await storage.listModels(readFilters(c.req.query(), meFilter(c, storage)))));
+  app.get("/api/models", async (c) => c.json(await storage.listModels(readFilters(c.req.query(), await meFilter(c, storage)))));
 
   app.get("/api/meta", async (c) => c.json(await storage.getFilterOptions()));
 
@@ -409,10 +409,10 @@ type CurrentUser = { userRowId: number | null; email: string | null };
 
 // Resolve the signed-in user (row id + email) for "mine" filtering. Null when unauthenticated or the
 // token isn't linked to a user (e.g. a password/owner token).
-function meFilter(c: Context, storage: StorageAdapter): CurrentUser | undefined {
-  const auth = currentAuth(c, storage);
+async function meFilter(c: Context, storage: StorageAdapter): Promise<CurrentUser | undefined> {
+  const auth = await currentAuth(c, storage);
   if (!auth) return undefined;
-  const user = auth.userRowId ? storage.getUserById(auth.userRowId) : null;
+  const user = auth.userRowId ? await storage.getUserById(auth.userRowId) : null;
   return { userRowId: auth.userRowId, email: user?.email ?? null };
 }
 
@@ -460,14 +460,14 @@ function eventSourceToken(c: Context) {
   return c.req.path === "/events" ? (c.req.query("token") ?? "") : "";
 }
 
-function currentAuth(c: Context, storage: StorageAdapter): { tokenId: number; userRowId: number | null } | null {
+async function currentAuth(c: Context, storage: StorageAdapter): Promise<{ tokenId: number; userRowId: number | null } | null> {
   const cred = bearerToken(c.req.header("authorization")) || cookieValue(c.req.header("cookie"), "finius_auth") || eventSourceToken(c);
   if (!cred) return null;
-  const row = storage.findAuthToken(sha256(cred));
+  const row = await storage.findAuthToken(sha256(cred));
   return row && row.revoked === 0 ? { tokenId: row.id, userRowId: row.userRowId } : null;
 }
 
-function telemetryIdentity(c: Context, storage: StorageAdapter): TelemetryIdentity | undefined {
+async function telemetryIdentity(c: Context, storage: StorageAdapter): Promise<TelemetryIdentity | undefined> {
   const fromHeaders: TelemetryIdentity = {
     userEmail: decodedHeader(c, "x-finius-user-email"),
     userId: decodedHeader(c, "x-finius-user-id"),
@@ -477,8 +477,8 @@ function telemetryIdentity(c: Context, storage: StorageAdapter): TelemetryIdenti
   };
   if (Object.values(fromHeaders).some(Boolean)) return fromHeaders;
 
-  const auth = currentAuth(c, storage);
-  const user = auth?.userRowId ? storage.getUserById(auth.userRowId) : null;
+  const auth = await currentAuth(c, storage);
+  const user = auth?.userRowId ? await storage.getUserById(auth.userRowId) : null;
   if (!user) return undefined;
   return {
     userEmail: user.email,

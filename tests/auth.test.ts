@@ -16,13 +16,13 @@ const sha256 = (value: string) => createHash("sha256").update(value).digest("hex
 
 let storage: DrizzleStorageAdapter | null = null;
 
-function makeApp(authSecret?: string) {
-  storage = new DrizzleStorageAdapter(tmpDbPath());
+async function makeApp(authSecret?: string) {
+  storage = await DrizzleStorageAdapter.open(tmpDbPath());
   return createApp({ storage, events: new EventBus(), authSecret });
 }
 
-function makeGithubApp(authSecret = "secret") {
-  storage = new DrizzleStorageAdapter(tmpDbPath());
+async function makeGithubApp(authSecret = "secret") {
+  storage = await DrizzleStorageAdapter.open(tmpDbPath());
   return createApp({
     storage,
     events: new EventBus(),
@@ -46,7 +46,7 @@ afterEach(() => {
 
 describe("auth — open mode", () => {
   it("leaves every endpoint open when no password is configured", async () => {
-    const app = makeApp();
+    const app = await makeApp();
     expect((await app.request("/api/meta")).status).toBe(200);
     expect((await app.request("/api/metrics/summary")).status).toBe(200);
 
@@ -67,13 +67,13 @@ describe("auth — secure mode", () => {
   const PASSWORD = "blue-happy-otter";
 
   it("reports secure mode on the public health endpoint", async () => {
-    const app = makeApp(PASSWORD);
+    const app = await makeApp(PASSWORD);
     const health = await (await app.request("/api/health")).json();
     expect(health.secure).toBe(true);
   });
 
   it("401s protected endpoints without a credential", async () => {
-    const app = makeApp(PASSWORD);
+    const app = await makeApp(PASSWORD);
     expect((await app.request("/api/meta")).status).toBe(401);
     expect((await app.request("/api/metrics/summary")).status).toBe(401);
     expect((await app.request("/otlp/v1/metrics", { method: "POST", body: "{}" })).status).toBe(401);
@@ -81,7 +81,7 @@ describe("auth — secure mode", () => {
   });
 
   it("keeps health and login public", async () => {
-    const app = makeApp(PASSWORD);
+    const app = await makeApp(PASSWORD);
     expect((await app.request("/api/health")).status).toBe(200);
     // login is reachable (wrong password still returns a 401 from the handler, not the gate)
     const res = await app.request("/api/auth/login", {
@@ -93,7 +93,7 @@ describe("auth — secure mode", () => {
   });
 
   it("rejects a wrong password and mints a token for the right one", async () => {
-    const app = makeApp(PASSWORD);
+    const app = await makeApp(PASSWORD);
 
     const bad = await app.request("/api/auth/login", {
       method: "POST",
@@ -113,13 +113,13 @@ describe("auth — secure mode", () => {
     expect(good.headers.get("set-cookie")).toBeNull();
 
     // The minted token is recorded (hashed) for the admin GUI to list/revoke.
-    const tokens = storage!.listAuthTokens();
+    const tokens = await storage!.listAuthTokens();
     expect(tokens).toHaveLength(1);
     expect(tokens[0].label).toBe("test-host");
   });
 
   it("only accepts minted tokens on protected endpoints", async () => {
-    const app = makeApp(PASSWORD);
+    const app = await makeApp(PASSWORD);
 
     // The master password is only accepted by /api/auth/login, never as a runtime API credential.
     expect(
@@ -145,7 +145,7 @@ describe("auth — secure mode", () => {
   });
 
   it("401s a revoked token", async () => {
-    const app = makeApp(PASSWORD);
+    const app = await makeApp(PASSWORD);
     const token = (
       await (
         await app.request("/api/auth/login", {
@@ -156,9 +156,9 @@ describe("auth — secure mode", () => {
       ).json()
     ).token as string;
 
-    const row = storage!.findAuthToken(sha256(token));
+    const row = await storage!.findAuthToken(sha256(token));
     expect(row).not.toBeNull();
-    storage!.revokeAuthToken(row!.id);
+    await storage!.revokeAuthToken(row!.id);
 
     expect((await app.request("/api/meta", { headers: { authorization: `Bearer ${token}` } })).status).toBe(401);
   });
@@ -172,14 +172,14 @@ describe("auth — github oauth", () => {
   });
 
   it("lists GitHub only when OAuth config is complete", async () => {
-    const open = makeApp("secret");
+    const open = await makeApp("secret");
     expect(await (await open.request("/api/auth/providers")).json()).toMatchObject({
       password: { enabled: true },
       github: { enabled: false }
     });
     storage?.close();
 
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     const providers = await (await app.request("/api/auth/providers")).json();
     expect(providers).toMatchObject({
       password: { enabled: false },
@@ -188,7 +188,7 @@ describe("auth — github oauth", () => {
   });
 
   it("disables browser password login when GitHub OAuth is enabled but keeps non-browser token exchange", async () => {
-    const app = makeGithubApp("secret");
+    const app = await makeGithubApp("secret");
     const browser = await app.request("/api/auth/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -205,7 +205,7 @@ describe("auth — github oauth", () => {
   });
 
   it("redirects to GitHub and sets a state cookie", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     const res = await app.request("/api/auth/github", { redirect: "manual" });
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toContain("https://github.com/login/oauth/authorize?");
@@ -214,13 +214,13 @@ describe("auth — github oauth", () => {
   });
 
   it("rejects callback requests with missing or invalid state", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     expect((await app.request("/api/auth/github/callback?code=abc&state=bad")).status).toBe(400);
     expect((await app.request("/api/auth/github/callback?code=abc&state=bad", { headers: { cookie: "finius_oauth_state=other" } })).status).toBe(400);
   });
 
   it("explains GitHub App installation callbacks are not OAuth login callbacks", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     const res = await app.request("/api/auth/github/callback?code=abc&installation_id=123&setup_action=install");
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({
@@ -229,7 +229,7 @@ describe("auth — github oauth", () => {
   });
 
   it("accepts callback state even when the browser drops the state cookie across localhost aliases", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     mockGithub(true);
     const start = await app.request("/api/auth/github", { redirect: "manual" });
     const state = new URL(start.headers.get("location")!).searchParams.get("state");
@@ -245,7 +245,7 @@ describe("auth — github oauth", () => {
   });
 
   it("preserves the CLI return URL from GitHub state when the state cookie is present", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     mockGithub(true);
     const returnTo = "http://127.0.0.1:49152/callback";
     const start = await app.request(`/api/auth/github?return_to=${encodeURIComponent(returnTo)}`, { redirect: "manual" });
@@ -262,7 +262,7 @@ describe("auth — github oauth", () => {
   });
 
   it("rejects GitHub users outside the required organization", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     mockGithub(false);
     const state = await startGithubLogin(app);
     const res = await app.request(`/api/auth/github/callback?code=abc&state=${encodeURIComponent(state)}`, {
@@ -272,7 +272,7 @@ describe("auth — github oauth", () => {
   });
 
   it("links a GitHub org member to a user, mints a user token, and returns /me", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     await storage!.importJsonl("claude-code-jsonl", { sessionId: "s1", userEmail: "octo@example.com" }, jsonlTranscript("s1"));
     await storage!.importJsonl("claude-code-jsonl", { sessionId: "s2", userEmail: "other@example.com" }, jsonlTranscript("s2"));
     mockGithub(true);
@@ -292,7 +292,7 @@ describe("auth — github oauth", () => {
     ).json();
     expect(me.user).toMatchObject({ email: "octo@example.com", githubLogin: "octocat", displayName: "Octo Cat" });
 
-    const tokenRow = storage!.findAuthToken(sha256(token));
+    const tokenRow = await storage!.findAuthToken(sha256(token));
     expect(tokenRow?.userRowId).toBe(me.user.id);
 
     // The cookie alone (no Authorization header) authenticates subsequent requests.
@@ -303,7 +303,7 @@ describe("auth — github oauth", () => {
   });
 
   it("accepts private org membership from the authenticated-user endpoint", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     mockGithub(true, { selfMembership: true });
     const start = await app.request("/api/auth/github", { redirect: "manual" });
     const state = new URL(start.headers.get("location")!).searchParams.get("state")!;
@@ -315,7 +315,7 @@ describe("auth — github oauth", () => {
   });
 
   it("secures the server with GitHub OAuth even when no master password is set", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     const app = createApp({
       storage,
       events: new EventBus(),
@@ -343,7 +343,7 @@ describe("auth — github oauth", () => {
   });
 
   it("links sessions to the GitHub user by a verified secondary email when the primary differs", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     await storage!.importJsonl("claude-code-jsonl", { sessionId: "s1", userEmail: "work@example.com" }, jsonlTranscript("s1"));
     await storage!.importJsonl("claude-code-jsonl", { sessionId: "s2", userEmail: "stranger@example.com" }, jsonlTranscript("s2"));
     // GitHub primary is personal@…, but work@example.com is also verified — so the login should link
@@ -368,7 +368,7 @@ describe("auth — github oauth", () => {
   });
 
   it("logout revokes the session token and clears the cookie", async () => {
-    const app = makeGithubApp();
+    const app = await makeGithubApp();
     mockGithub(true);
     const state = await startGithubLogin(app);
     const cb = await app.request(`/api/auth/github/callback?code=abc&state=${encodeURIComponent(state)}`, {

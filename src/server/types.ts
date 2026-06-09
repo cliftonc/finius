@@ -190,11 +190,11 @@ export interface StorageAdapter {
   listModels(filters: SummaryFilters): Promise<ModelSummary[]>;
   getFilterOptions(): Promise<FilterOptions>;
   pruneRawBatches(beforeTimestampMs: number): Promise<{ deleted: number }>;
-  createAuthToken(tokenHash: string, label: string, now: number, userRowId?: number | null): void;
-  findAuthToken(tokenHash: string): { id: number; revoked: number; userRowId: number | null } | null;
-  listAuthTokens(): AuthTokenRecord[];
-  revokeAuthToken(id: number): void;
-  getUserById(id: number): AuthUser | null;
-  upsertOAuthUser(input: OAuthUserInput, now: number): AuthUser;
-  close(): void;
+  createAuthToken(tokenHash: string, label: string, now: number, userRowId?: number | null): Promise<void>;
+  findAuthToken(tokenHash: string): Promise<{ id: number; revoked: number; userRowId: number | null } | null>;
+  listAuthTokens(): Promise<AuthTokenRecord[]>;
+  revokeAuthToken(id: number): Promise<void>;
+  getUserById(id: number): Promise<AuthUser | null>;
+  upsertOAuthUser(input: OAuthUserInput, now: number): Promise<AuthUser>;
+  close(): Promise<void> | void;
 }

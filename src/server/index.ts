@@ -23,6 +23,9 @@ export type StartServerOptions = {
   // host (0.0.0.0) isn't itself something you'd open in a browser. Defaults to http://<hostname>:<port>.
   displayUrl?: string;
   dbPath?: string;
+  // Postgres backend (server-mode). When set, the adapter opens this instead of the sqlite dbPath. Also
+  // honored via FINIUS_DATABASE_URL for a direct `node dist/server/index.js` run.
+  database?: { backend: "postgres"; url: string };
   blobDir?: string;
   storeRawPayloads?: boolean;
   rawRetentionDays?: number;
@@ -48,7 +51,7 @@ export type RunningServer = {
   port: number;
 };
 
-export function startServer(options: StartServerOptions = {}): RunningServer {
+export async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
   const port = options.port ?? Number(process.env.PORT ?? 8787);
   const hostname = options.hostname ?? process.env.FINIUS_HOST ?? "127.0.0.1";
   const dbPath = options.dbPath ?? process.env.FINIUS_DB_PATH ?? "data/finius.sqlite";
@@ -64,10 +67,13 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   const g = options.oauth?.github;
   const githubEnabled = !!(g?.enabled && g.clientId && g.clientSecret && g.requiredOrg && g.callbackUrl);
 
-  const storage = new DrizzleStorageAdapter(resolve(dbPath), { storeRawPayloads, blob });
+  // Postgres when a URL is provided (option or FINIUS_DATABASE_URL), else the local sqlite file.
+  const postgresUrl = options.database?.url ?? (process.env.FINIUS_DATABASE_URL || undefined);
+  const target = postgresUrl ? ({ backend: "postgres", url: postgresUrl } as const) : resolve(dbPath);
+  const storage = await DrizzleStorageAdapter.open(target, { storeRawPayloads, blob });
   // Seed the owner token whenever the server is secured by EITHER method, so the local CLI (hook/OTEL)
   // has a credential even in GitHub-only mode where there's no master password to exchange.
-  if ((authSecret || githubEnabled) && initialAuthToken) seedInitialAuthToken(storage, initialAuthToken);
+  if ((authSecret || githubEnabled) && initialAuthToken) await seedInitialAuthToken(storage, initialAuthToken);
   const events = new EventBus();
   const app = createApp({ storage, events, cronToken, rawRetentionDays, authSecret, oauth: options.oauth });
 
@@ -90,9 +96,12 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   }
 
   // Effective transcript location: the explicit blob dir, else the adapter's default of
-  // <db-dir>/transcripts. Computed here only so we can report it on startup.
+  // <db-dir>/transcripts. Computed here only so we can report it on startup. Under Postgres there's no
+  // local DB file, so transcripts fall back to a cwd-relative dir unless blobDir is set (serve sets it).
   const resolvedDb = resolve(dbPath);
   const transcriptsDir = blobDir ? resolve(blobDir) : join(dirname(resolvedDb), "transcripts");
+  // What to show on the "Database" banner line: the redacted Postgres origin, or the sqlite file path.
+  const databaseLine = postgresUrl ? redactPostgresUrl(postgresUrl) : resolvedDb;
 
   serve({ fetch: app.fetch, hostname, port }, (info) => {
     const url = options.displayUrl ?? `http://${hostname}:${info.port}`;
@@ -102,7 +111,7 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
       `${panel([
         ["Dashboard", clientDist ? pc.cyan(url) : pc.yellow("not built — run `npm run build` to serve the UI")],
         ["API", `${url}/api`],
-        ["Database", pc.dim(resolvedDb)],
+        ["Database", pc.dim(databaseLine)],
         ["Transcripts", pc.dim(transcriptsDir)],
         ["Raw payloads", storeRawPayloads ? `retained, pruned after ${rawRetentionDays}d` : pc.dim("off")],
         ["Auth", authLine(authSecret, githubEnabled, g?.requiredOrg)]
@@ -125,7 +134,7 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
   const shutdown = async () => {
     const timeout = new Promise<void>((resolve) => windowlessSetTimeout(resolve, 5_000));
     await Promise.race([storage.settleIngest(), timeout]);
-    storage.close();
+    await storage.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -136,6 +145,17 @@ export function startServer(options: StartServerOptions = {}): RunningServer {
 
 function windowlessSetTimeout(callback: () => void, delay: number) {
   return globalThis.setTimeout(callback, delay);
+}
+
+// Postgres connection string with the password stripped, for the startup banner / diagnostics.
+function redactPostgresUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.password) u.password = "***";
+    return u.toString();
+  } catch {
+    return "postgres (configured)";
+  }
 }
 
 async function syncPricing(storage: DrizzleStorageAdapter) {
@@ -172,13 +192,13 @@ function authLine(authSecret: string | undefined, githubEnabled: boolean, requir
   return pc.dim("open (no auth)");
 }
 
-function seedInitialAuthToken(storage: DrizzleStorageAdapter, token: string) {
+async function seedInitialAuthToken(storage: DrizzleStorageAdapter, token: string) {
   const tokenHash = createHash("sha256").update(token).digest("hex");
-  if (storage.findAuthToken(tokenHash)) return;
-  storage.createAuthToken(tokenHash, "owner", Date.now());
+  if (await storage.findAuthToken(tokenHash)) return;
+  await storage.createAuthToken(tokenHash, "owner", Date.now());
 }
 
 // Auto-start when executed directly (`node dist/server/index.js`), but not when this module is
 // imported by the CLI's `serve` command.
 const invokedDirectly = !!process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (invokedDirectly) startServer();
+if (invokedDirectly) void startServer();

@@ -115,18 +115,20 @@ Source: https://code.claude.com/docs/en/monitoring-usage (verified against real 
   (independent of the join and the model/source filters) so the UI can show the delta when both signals
   exist; they routinely disagree (OTel often misses requests the transcript captured). Distinct counts
   (sessions/users) always come from `metric_points` — they can't be summed across rollup buckets.
-- **Schema & migrations (Drizzle).** The schema is a Drizzle definition (`db/schema.ts`); the
-  drizzle-kit-generated migrations under `db/migrations/` are the **single source of truth**, applied
-  verbatim at startup by `db/client.ts`'s `runMigrations` (just `migrate(db, …)`, called from the adapter
-  constructor) — the migrator creates everything on a fresh DB and is a no-op once recorded in
-  `__drizzle_migrations`. The DB is assumed re-creatable, so there is **no legacy-adoption shim** and
-  migrations are **never hand-edited**: schema changes flow `schema.ts` → `npm run db:generate` → commit
-  the new `db/migrations/<ts>_<name>/` (no manual SQL, no `IF NOT EXISTS`, no `WITHOUT ROWID` — the last
-  was dropped because drizzle-orm can't emit it and it's SQLite-only, which also unblocks Postgres). Uses
-  `drizzle-orm@1.0.0-rc.3`'s `drizzle-orm/node-sqlite` driver over the built-in `DatabaseSync` (zero
-  native deps). `tests/schema-parity.test.ts` guards the physical schema against the committed
-  `tests/fixtures/schema-snapshot.json` snapshot. The old per-source session rows and the `raw_events`
-  audit table are gone.
+- **Schema & migrations (Drizzle, dual-dialect).** There are TWO schema definitions kept structurally
+  identical: `db/schema.ts` (SQLite, `sqliteTable`) and `db/schema.pg.ts` (Postgres, `pgTable`). Both are
+  needed because Drizzle's builders are dialect-bound. The `db/schema-active.ts` **barrel** re-exports
+  whichever the active backend selected (one `as` cast per table) so every `db/*.ts` file imports tables
+  from the barrel and stays typed against ONE shape. Their structural parity (table/column names, PK/
+  index/FK/unique) is guarded by `tests/schema-cross-parity.test.ts`; the SQLite *physical* schema is
+  guarded by `tests/schema-parity.test.ts` against `tests/fixtures/schema-snapshot.json`. The drizzle-kit
+  migrations are the **single source of truth**, applied at startup by the connection's `runMigrations`
+  (the migrator; no-op once recorded). Two folders: `db/migrations/` (sqlite) + `db/migrations-pg/`
+  (postgres). The DB is re-creatable (**no legacy-adoption shim**); migrations are **never hand-edited**:
+  edit BOTH schemas → `npm run db:generate` AND `npm run db:generate:pg` → commit both folders. PG column
+  mapping: epoch-ms `integer`→`bigint({mode:"number"})`, `real`→`doublePrecision`, autoincrement→identity,
+  0/1 flags stay `integer` (so the raw SQL stays shared). The build's `copy:migrations` ships both folders
+  to `dist`. The old per-source session rows and the `raw_events` audit table are gone.
 - Maintenance (all bearer `FINIUS_CRON_TOKEN`, fail closed): `POST /api/maintenance/prune-raw-batches`
   deletes `raw_batches` older than `FINIUS_RAW_RETENTION_DAYS` (default 7); `POST
   /api/maintenance/recompute-cost` rebuilds the synthesized cost points; `POST
@@ -144,28 +146,35 @@ Source: https://code.claude.com/docs/en/monitoring-usage (verified against real 
 - **The storage adapter is a thin DB-neutral facade.** `DrizzleStorageAdapter` (`storage/adapter.ts`,
   the blob store is `storage/blob.ts`) owns only ingest orchestration, pricing, and the in-memory state
   (price index, blob, the `SerialQueue`, the in-flight dedup set); every DB access is a free function in
-  the `db/` layer that it delegates to. SQLite is the only concrete binding (`db/client.ts`'s `connect` +
-  `runMigrations`, and the `db/dialect.ts` SQL seam); the orchestration is otherwise database-neutral over
-  the Drizzle handle, so a future Postgres backing is a new connect path + PG dialect, not an adapter
-  rewrite. The `db/` modules (all free functions taking the Drizzle handle first): `ingest.ts`
+  the `db/` layer that it delegates to. It opens via the static async `DrizzleStorageAdapter.open(target,
+  options)` factory (NOT the bare constructor) — `target` is a sqlite path string or a `DbDescriptor`
+  (`{backend:"postgres",url}`). `db/client.ts`'s `connect(descriptor)` picks the binding: sqlite
+  (node:sqlite, sync underneath) or postgres (`pg`, lazily imported, async). The orchestration is
+  backend-neutral over the Drizzle handle (the PG handle is cast to the canonical sqlite `DrizzleDb`
+  type); SQL differences live in `db/dialect.ts` and the raw-SQL seam `db/raw.ts`. The `db/` modules (all
+  free functions taking the Drizzle handle first): `ingest.ts`
   (`insertMetricPoint`/`upsertSession`/`upsertRollup`/`rebuildRollup`/`ingestMetricPoints` + raw-batch,
   log, source-file, prune helpers — the write side), `pricing-store.ts` (`model_prices` access +
   `recomputeComputedCost`), `metrics.ts` (summary/timeseries/breakdowns), `sessions.ts` (`buildSessions`),
   `people.ts` (people/models/filter options/log events), `users.ts` (the identity registry), `auth.ts`,
-  with `db/fragments.ts` (composable `sql` WHERE fragments) and `db/dialect.ts` (the Postgres seam:
-  `GROUP_CONCAT`/`json_extract`/time-bucketing live there, so a future Postgres dialect swaps one file).
-- **Reads are async (portable `.execute()`); writes/transactions are sync (deliberate).** The `db/` read
-  functions (`metrics.ts`, `people.ts`, `sessions.ts`, plus `userDirectory`/`enrichUsers`) are `async` and
-  execute via `await builder.execute()` — NOT the SQLite-only `.all()/.get()/.run()` — so the same query
-  code runs unchanged on a future async Postgres driver. (The `StorageAdapter` boundary was already
-  `Promise`-returning, so this just aligns the internals.) The **write/transaction layer stays
-  synchronous**: `drizzle-orm/node-sqlite`'s `db.transaction(async cb)` does NOT await an async callback —
-  a throw inside it leaves rows COMMITTED instead of rolled back — so the ingest transactions
-  (`this.orm.transaction(() => …)`) and their write primitives must keep sync callbacks to preserve
-  atomicity (the no-double-count invariant). `getUserById` also stays sync (called inside
-  `upsertOAuthUser`'s transaction and exposed as a sync adapter method). The write core becomes async only
-  when an async driver is actually adopted. Two raw `db.all(sql)` reads (`buildSessions`,
-  `getLogEventSummary`) stay sync — node:sqlite has no portable `db.execute(sql)` — a dialect seam.
+  with `db/fragments.ts` (composable `sql` WHERE fragments) and `db/dialect.ts` (the dialect seam:
+  `groupConcatDistinct`/`jsonExtract`/`bucket`/`least`/`greatest` — `string_agg`/`->>'jsonb'`/`floor` on PG).
+- **The whole DB layer is async; there are NO transactions.** Every `db/*.ts` function is `async` and runs
+  via `await builder.execute()` (or the raw-SQL seam `db/raw.ts`: `rawAll`/`rawGet`/`rawRun`/`affectedRows`/
+  `isUniqueViolation`, which feature-detect sqlite's `db.all/get/run` vs pg's `db.execute`). **Transactions
+  were removed deliberately** (this is metrics reporting, not mission-critical): node:sqlite's
+  `db.transaction(async cb)` doesn't await, which was the only reason writes were pinned to sync — drop
+  transactions and the same async code runs identically on sqlite (sync underneath) and pg (async). The
+  derived `metric_rollup`/`is_primary` are rebuildable (`rebuildRollup`/`rebuildIsPrimary` /
+  `POST /api/maintenance/rebuild-primary`), so a partial-failure leaves at worst a transient under-count
+  that the maintenance endpoints repair. The ONE invariant protected without a transaction —
+  no-double-count on a transcript re-import — is preserved by `processImport` writing the `source_files`
+  content-hash dedup marker FIRST (before the points), so a retry short-circuits in `isDuplicateUpload`
+  (then `linkSourceFileSession` backfills the marker's `session_row_id` once the points create the
+  session). PG specifics handled: dedup via SQLSTATE 23505 (drizzle wraps the driver error; `isUniqueViolation`
+  walks `.cause`); the `pg` int8 type parser is set to Number so raw-SQL bigint/COUNT come back numeric;
+  raw-SQL aliases are double-quoted (PG folds unquoted identifiers to lowercase); `getLogEventSummary` uses
+  window functions (PG rejects the correlated-subquery-on-grouped-column SQLite tolerates).
 
 ## Temporality (important)
 

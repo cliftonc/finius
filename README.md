@@ -8,7 +8,7 @@
 
 A [Hono](https://hono.dev) server ingests OTLP HTTP/JSON metrics & logs (and JSONL/rollout
 transcripts from Claude Code, Codex, and GitHub Copilot — both the `copilot` CLI and VS Code Copilot
-Chat) into SQLite; a React + Vite dashboard renders cost, token, session, person, and model
+Chat) into SQLite — or PostgreSQL for a team server; a React + Vite dashboard renders cost, token, session, person, and model
 breakdowns with live SSE updates. Everything runs on your machine — no data leaves your laptop
 (unless you choose to deploy it on a server for your team!).
 
@@ -136,6 +136,29 @@ The original transcript is stored as a file and can be viewed from the session d
 Data is stored in `data/finius.sqlite` by default. Override with `FINIUS_DB_PATH=/path/to/db.sqlite`.
 Override the API port with `PORT`. Imported transcript files live under `<db-dir>/transcripts`
 (override with `FINIUS_BLOB_DIR`).
+
+### PostgreSQL (server mode)
+
+For a self-hosted / team server you can back `finius serve` with **PostgreSQL** instead of the local
+SQLite file. Choose it during `finius setup` and you get two paths:
+
+- **Spin up a local Postgres in Docker** — if setup detects a running Docker daemon, it offers to
+  provision a managed container for you: a persistent `finius-postgres` (`postgres:16-alpine`) with a
+  named volume and `--restart unless-stopped`, a generated password, and the resulting connection URL
+  saved to `~/.finius/config.json`. Nothing else to configure — `finius serve` just uses it. (The host
+  port defaults to **55432** so it won't collide with a system Postgres on 5432.)
+- **Connect to an existing Postgres** — point setup at any server by URL (the only option when Docker
+  isn't available).
+
+Either way the URL is persisted to config; you can also bypass setup entirely with
+`FINIUS_DATABASE_URL=postgres://user:pass@host:5432/finius`. Postgres uses the `pg` driver, which is an
+**optional peer dependency** — install it alongside finius (`npm i -g pg`) since it isn't bundled.
+Migrations run automatically at startup; `finius doctor` reports Postgres reachability. Switching
+backends starts from an empty database (there's no cross-backend data migration). SQLite remains the
+zero-config default for local use.
+
+To try Postgres against the **test** suite (requires Docker): `npm run pg:up` starts a throwaway
+instance, `npm run test:pg` runs the suite against it, and `npm run pg:down` tears it down.
 
 Dashboard reads are served from a pre-aggregated hourly `metric_rollup`; raw `metric_points` keep
 the full-resolution data for the live view and drill-downs.

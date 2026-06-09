@@ -22,7 +22,7 @@ const CODEX_COST = 800 * 0.00000125 + 200 * 0.000000125 + 300 * 0.00001; // 0.00
 
 describe("computed cost (pricing synthesis)", () => {
   it("synthesizes cost for a Codex transcript that reports none", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
 
     // Without pricing loaded, Codex usage has no cost (default, pre-feature behavior).
     await storage.importJsonl("codex-cli-jsonl", { sessionId: "codex-session-1" }, codexRollout(), "codex");
@@ -39,7 +39,7 @@ describe("computed cost (pricing synthesis)", () => {
   });
 
   it("computes cost on import once pricing is already loaded", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     await storage.importPricing(modelPrices());
     await storage.importJsonl("codex-cli-jsonl", { sessionId: "codex-session-1" }, codexRollout(), "codex");
 
@@ -47,7 +47,7 @@ describe("computed cost (pricing synthesis)", () => {
   });
 
   it("does not stack computed cost on a session that already has authoritative OTel cost", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     await storage.importPricing(modelPrices());
 
     // OTel session-a reports a real cost (0.024). Its transcript reports NO cost -> we'd synthesize,
@@ -64,7 +64,7 @@ describe("computed cost (pricing synthesis)", () => {
   });
 
   it("recomputeComputedCost is idempotent", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     await storage.importPricing(modelPrices());
     await storage.importJsonl("codex-cli-jsonl", { sessionId: "codex-session-1" }, codexRollout(), "codex");
 
@@ -76,12 +76,12 @@ describe("computed cost (pricing synthesis)", () => {
 
   it("survives a restart: pricing persists and reloads from the DB", async () => {
     const path = tmpDbPath();
-    storage = new DrizzleStorageAdapter(path);
+    storage = await DrizzleStorageAdapter.open(path);
     await storage.importPricing(modelPrices());
     storage.close();
 
     // Reopen the same DB; pricing is loaded from model_prices in the constructor.
-    storage = new DrizzleStorageAdapter(path);
+    storage = await DrizzleStorageAdapter.open(path);
     expect((await storage.getPricing()).length).toBe(modelPrices().length);
     await storage.importJsonl("codex-cli-jsonl", { sessionId: "codex-session-1" }, codexRollout(), "codex");
     expect((await storage.getSummary({})).totalCost).toBeCloseTo(CODEX_COST, 9);
@@ -90,7 +90,7 @@ describe("computed cost (pricing synthesis)", () => {
 
 describe("queued JSONL processing", () => {
   it("enqueues uploads, processes them on the queue, and surfaces data after settle", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     await storage.importPricing(modelPrices());
 
     const queued = await storage.enqueueImport("codex-cli-jsonl", { sessionId: "codex-session-1" }, codexRollout(), "codex");
@@ -101,7 +101,7 @@ describe("queued JSONL processing", () => {
   });
 
   it("dedupes a re-upload (in-flight and once persisted)", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     await storage.enqueueImport("codex-cli-jsonl", { sessionId: "codex-session-1" }, codexRollout(), "codex");
     await storage.settleIngest();
     // Same content again -> deduped on the persisted source_files hash.
@@ -114,7 +114,7 @@ describe("queued JSONL processing", () => {
 
 describe("historical pricing backfill", () => {
   it("fetches the price in effect on a past usage date and prices it with that rate", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     // Current pricing is effective 2026-06-15; the Codex usage is on 2026-05-31 (before it).
     await storage.importPricing([
       { model: "gpt-5.1-codex", provider: "openai", inputPerToken: 0.00000125, outputPerToken: 0.00001, cacheReadPerToken: 0.000000125, cacheCreationPerToken: 0.00000125, effectiveDate: Date.parse("2026-06-15") }
@@ -137,7 +137,7 @@ describe("historical pricing backfill", () => {
   });
 
   it("fetches each missing day at most once across imports", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
     await storage.importPricing([
       { model: "gpt-5.1-codex", provider: "openai", inputPerToken: 0.00000125, outputPerToken: 0.00001, cacheReadPerToken: 0.000000125, cacheCreationPerToken: 0.00000125, effectiveDate: Date.parse("2026-06-15") }
     ]);
@@ -156,7 +156,7 @@ describe("historical pricing backfill", () => {
 
 describe("OTLP log capture", () => {
   it("indexes log records by the event.name attribute (not Codex's source-location eventName), without creating metric points", async () => {
-    storage = new DrizzleStorageAdapter(tmpDbPath());
+    storage = await DrizzleStorageAdapter.open(tmpDbPath());
 
     expect(await storage.ingestOtelLogs(codexLogBatch())).toEqual({ duplicate: false, events: 3 });
     // Re-ingesting the identical batch dedupes on the raw_batches hash.

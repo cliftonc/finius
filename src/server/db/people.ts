@@ -4,9 +4,10 @@
 
 import { type DrizzleDb } from "./client.js";
 import { and, countDistinct, desc, eq, inArray, isNotNull, max, ne, sql } from "drizzle-orm";
-import { logEvents, metricPoints, metricRollup } from "./schema.js";
+import { logEvents, metricPoints, metricRollup } from "./schema-active.js";
 import { POINT_IDENTITY, pointWhere, sumWhen } from "./fragments.js";
 import { dialect } from "./dialect.js";
+import { rawAll } from "./raw.js";
 import { enrichUsers } from "./users.js";
 import type { SummaryFilters, PersonSummary, ModelSummary, FilterOptions, LogEventSummary } from "../types.js";
 
@@ -109,22 +110,24 @@ export async function getFilterOptions(db: DrizzleDb): Promise<FilterOptions> {
 // Grouped inspection view of captured log records: one row per distinct event name with a count,
 // the latest timestamp, and a single sample (most recent) so we can see what Codex actually emits.
 export async function getLogEventSummary(db: DrizzleDb): Promise<LogEventSummary[]> {
-  // Raw `db.all(sql)` (node-sqlite's synchronous raw exec — no portable `db.execute(sql)`): kept sync
-  // inside this async fn; the correlated self-join subqueries are a dialect seam to revisit for Postgres.
-  const rows = db.all<{ eventName: string; count: number; lastSeenAt: number; sampleAttributes: string | null; sampleBody: string | null }>(
-    sql`SELECT
-        COALESCE(event_name, '(unnamed)') AS eventName,
-        COUNT(*) AS count,
-        MAX(timestamp) AS lastSeenAt,
-        (SELECT attributes_json FROM ${logEvents} e2
-           WHERE COALESCE(e2.event_name, '(unnamed)') = COALESCE(e1.event_name, '(unnamed)')
-           ORDER BY e2.timestamp DESC LIMIT 1) AS sampleAttributes,
-        (SELECT body_json FROM ${logEvents} e2
-           WHERE COALESCE(e2.event_name, '(unnamed)') = COALESCE(e1.event_name, '(unnamed)')
-           ORDER BY e2.timestamp DESC LIMIT 1) AS sampleBody
-      FROM ${logEvents} e1
-      GROUP BY COALESCE(event_name, '(unnamed)')
-      ORDER BY count DESC`
+  // Raw SQL via the cross-dialect seam (rawAll → db.all on sqlite, db.execute on pg). One row per event
+  // name with a count, latest timestamp, and the most-recent sample. Uses window functions (PARTITION BY
+  // + ROW_NUMBER) rather than correlated subqueries on the grouped column — Postgres rejects the latter
+  // ("ungrouped column") where SQLite tolerates it; windowing is portable to both (SQLite ≥ 3.25).
+  const rows = await rawAll<{ eventName: string; count: number; lastSeenAt: number; sampleAttributes: string | null; sampleBody: string | null }>(
+    db,
+    sql`SELECT "eventName", "count", "lastSeenAt", "sampleAttributes", "sampleBody" FROM (
+        SELECT
+          COALESCE(event_name, '(unnamed)') AS "eventName",
+          COUNT(*) OVER (PARTITION BY COALESCE(event_name, '(unnamed)')) AS "count",
+          MAX(timestamp) OVER (PARTITION BY COALESCE(event_name, '(unnamed)')) AS "lastSeenAt",
+          attributes_json AS "sampleAttributes",
+          body_json AS "sampleBody",
+          ROW_NUMBER() OVER (PARTITION BY COALESCE(event_name, '(unnamed)') ORDER BY timestamp DESC) AS rn
+        FROM ${logEvents}
+      ) ranked
+      WHERE rn = 1
+      ORDER BY "count" DESC`
   );
   return rows.map((row) => ({
     eventName: row.eventName,

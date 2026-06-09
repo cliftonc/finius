@@ -13,8 +13,14 @@ npm run dev:server # API only — http://127.0.0.1:8787
 npm run dev:client # UI only  — http://127.0.0.1:5173 (proxies /api, /otlp, /events to :8787)
 npm run build      # tsc -p tsconfig.build.json -> dist + vite build -> dist/client
 npm start          # node dist/server/index.js (serves built client if dist/client exists)
-npm test           # vitest run
+npm test           # vitest run (sqlite; the Postgres suite is skipped unless FINIUS_TEST_DATABASE_URL is set)
 npm run typecheck  # tsc --noEmit (strict; type-checks src + tests + vite.config.ts)
+
+# Postgres backend (requires Docker):
+npm run pg:up      # start a throwaway postgres:16-alpine on :55432 (waits for readiness)
+npm run test:pg    # run the full suite incl. tests/postgres.test.ts against that container
+npm run pg:down    # stop + remove the container
+npm run db:generate:pg  # regenerate the Postgres migrations (after editing db/schema.pg.ts)
 ```
 
 ### CLI (`npx finius`)
@@ -57,9 +63,18 @@ stays the editor/typecheck config (wider `include`); don't point the build at it
 `dist/src`.
 
 Requires Node with the built-in `node:sqlite` module (Node 22.5+; developed on v24). Persistence is
-Drizzle ORM over that built-in driver (`drizzle-orm/node-sqlite`, currently the `1.0.0-rc` line — the
-only release with the `node:sqlite` driver) — no native build step, so `npx finius` still needs no
-compilation.
+Drizzle ORM, with two selectable backends: **SQLite** (default) over the built-in `node:sqlite` driver
+(`drizzle-orm/node-sqlite`, currently the `1.0.0-rc` line — the only release with that driver; no native
+build step, so `npx finius` still needs no compilation), or **PostgreSQL** (opt-in, server mode) over
+`pg` (node-postgres — a pure-JS **optional peer dependency**, lazily imported only when selected).
+Choose Postgres at `finius setup` (stored as `database` in config, or `FINIUS_DATABASE_URL`); `finius
+serve` reads it. When you pick Postgres, setup detects a running Docker daemon and offers either to
+**spin up a managed local container** (`src/cli/postgres.ts` — a persistent `finius-postgres` /
+`postgres:16-alpine` with a named volume + `--restart unless-stopped`, password generated, the
+connection URL persisted) or to **connect to an existing server by URL**; without Docker it goes
+straight to the URL prompt. The pure argv/URL builders (`renderDockerRunArgs`/`postgresUrl`) are
+unit-tested (`tests/postgres-docker.test.ts`); the `docker` shell-outs live in the IO helpers. The two
+backends share one async, transaction-free `db/` layer (see the dialect seam + dual schema below).
 
 ## Telemetry
 
@@ -119,22 +134,26 @@ marker rather than replacing it.
   fully open (default). The browser shows a `LoginScreen` (App.tsx) on any 401; the CLI hook + OTEL
   exporter send the token (the latter via `OTEL_EXPORTER_OTLP_HEADERS`).
 - `src/server/storage/adapter.ts` — `DrizzleStorageAdapter`, the `StorageAdapter` implementation backed
-  by **Drizzle ORM** (`drizzle-orm@1.0.0-rc.3`'s `drizzle-orm/node-sqlite` driver over the built-in
-  `DatabaseSync`; zero native deps). It's a **thin, DB-neutral facade**: it owns only ingest
-  orchestration, pricing, and the in-memory state (price index, blob, the `SerialQueue`, the in-flight
-  dedup set), holds both the Drizzle handle (`this.orm`) and the raw `DatabaseSync` (`this.db`, same
-  connection), and **delegates every DB access to free functions in `src/server/db/`** (reads, auth,
-  users, AND writes). The orchestration is database-neutral over the Drizzle handle; SQLite is the only
-  concrete binding (`db/client.ts` + `db/dialect.ts`), so the name is `Drizzle…`, not `Sqlite…`.
-  Batch-level idempotency is `raw_batches.hash` UNIQUE; the `{ duplicate: true }` short-circuit is preserved.
-- `src/server/db/` — the Drizzle data layer (free functions, Drizzle handle first arg). `schema.ts`
-  (table definitions). The drizzle-kit-generated migrations under `migrations/` are the **single source
-  of truth**, applied verbatim at startup by `client.ts`'s `runMigrations` (the drizzle migrator —
-  creates everything on a fresh DB, no-op once recorded in `__drizzle_migrations`); there is no
-  legacy-adoption shim and migrations are never hand-edited. `client.ts` (`connect`,
-  `runMigrations`, `DrizzleDb` type); `fragments.ts` (composable `sql` WHERE fragments + `canUseRollup`,
-  replacing the old `query-helpers.ts`); `dialect.ts` (the **Postgres seam** —
-  `GROUP_CONCAT`/`json_extract`/time-bucketing live here, so a future Postgres dialect swaps one file).
+  by **Drizzle ORM** over either node:sqlite or `pg` (chosen per process). Opened via the static async
+  factory `DrizzleStorageAdapter.open(target, options)` (NOT the bare constructor — opening + migrating is
+  async): `target` is a sqlite path string or a `DbDescriptor` (`{backend:"postgres",url}`). It's a
+  **thin, backend-neutral facade**: it owns only ingest orchestration, pricing, and the in-memory state
+  (price index, blob, the `SerialQueue`, the in-flight dedup set), holds the Drizzle handle (`this.orm`)
+  plus a backend-specific `closeConnection`, and **delegates every DB access to free functions in
+  `src/server/db/`** (reads, auth, users, AND writes). The orchestration is backend-neutral over the
+  Drizzle handle (the pg handle is cast to the canonical sqlite `DrizzleDb` type); the concrete bindings
+  live in `db/client.ts` + `db/dialect.ts` + `db/raw.ts`. Batch-level idempotency is `raw_batches.hash`
+  UNIQUE; the `{ duplicate: true }` short-circuit is preserved (across dialects via `isUniqueViolation`).
+- `src/server/db/` — the Drizzle data layer (free functions, Drizzle handle first arg; **all async, no
+  transactions** — see src/server/CLAUDE.md). **Dual schema**: `schema.ts` (sqlite `sqliteTable`) +
+  `schema.pg.ts` (postgres `pgTable`), kept structurally identical and re-exported by the
+  `schema-active.ts` **barrel** (selected per backend, one cast per table; every `db/*.ts` imports tables
+  from the barrel). drizzle-kit migrations are the **single source of truth** — `migrations/` (sqlite) +
+  `migrations-pg/` (postgres) — applied at startup by the connection's `runMigrations` (no legacy shim,
+  never hand-edited). `client.ts` (`connectSqlite`, async `connect(descriptor)` + `DbDescriptor`,
+  `DrizzleDb` type, `MIGRATIONS_DIR{,_PG}`); `raw.ts` (the raw-SQL/affected-rows/unique-violation seam);
+  `fragments.ts` (composable `sql` WHERE fragments + `canUseRollup`); `dialect.ts` (the **dialect seam** —
+  `groupConcatDistinct`/`jsonExtract`/`bucket`/`least`/`greatest`, with a `PG_DIALECT` for Postgres).
   **Write modules:** `ingest.ts` (the write side — `insertMetricPoint` with materialized `is_primary`,
   `upsertSession`, `upsertRollup`/`rebuildRollup`, the shared `ingestMetricPoints` loop, plus raw-batch,
   log-event, source-file, copilot-session-resolve, and prune helpers), `pricing-store.ts`
@@ -168,18 +187,23 @@ marker rather than replacing it.
   share one filter set, and clicking a session/person/model row (or a Home breakdown row) drills into
   the Home view by setting the matching filter — the drill-down page is just `HomeView` re-filtered.
 
-Data lives in `data/finius.sqlite` (override with `FINIUS_DB_PATH`); imported transcripts live under
+Data lives in `data/finius.sqlite` (override with `FINIUS_DB_PATH`) on the default SQLite backend, or in
+PostgreSQL when `FINIUS_DATABASE_URL` is set (or `config.database` from `finius setup`) — that switches
+`serve` to Postgres and is also read by `schema-active.ts`/`dialect.ts` to select the backend at module
+load (`serve` sets it before its dynamic import of the server). Imported transcripts live under
 `<db-dir>/transcripts` (override with `FINIUS_BLOB_DIR`). Env knobs: `FINIUS_RAW_PAYLOADS`
 (`retain`|`off`), `FINIUS_RAW_RETENTION_DAYS` (default 7), `FINIUS_CRON_TOKEN` (enables the prune
-endpoint), `FINIUS_AUTH_PASSWORD` (enables Secure Mode; normally set via `finius setup`'s `authPassword`).
+endpoint), `FINIUS_AUTH_PASSWORD` (enables Secure Mode; normally set via `finius setup`'s `authPassword`),
+`FINIUS_TEST_DATABASE_URL` (gates the Postgres test suite, `tests/postgres.test.ts`).
 
 ## Conventions
 
 - ESM throughout (`"type": "module"`); server imports use `.js` extensions on relative paths so the
   emitted JS resolves — keep this when adding files.
 - **Prefer functional style: free functions over classes.** The DB layer (`db/*.ts`) is free functions
-  taking the Drizzle handle (`db`) as the first arg — not methods on a class — so they compose inside the
-  adapter's transactions and are trivially unit-testable. `DrizzleStorageAdapter` is the one class, and
+  taking the Drizzle handle (`db`) as the first arg — not methods on a class — so they compose in the
+  adapter's ingest sequences (all async, no transactions) and are trivially unit-testable.
+  `DrizzleStorageAdapter` is the one class, and
   only because it holds genuinely stateful, long-lived resources (the Drizzle/raw connections, the price
   index, the `SerialQueue`, the in-flight set); it stays **thin**, delegating all DB work to the `db/`
   free functions. When adding behaviour, reach for a free function in the right module first; add to the
@@ -190,16 +214,18 @@ endpoint), `FINIUS_AUTH_PASSWORD` (enables Secure Mode; normally set via `finius
   `metrics`/`sessions`/`people`/`users`/`auth`, writes in `ingest`/`pricing-store`); the adapter keeps
   only the stateful ingest + pricing orchestration and delegates to them.
 - Schema changes ALWAYS go through **drizzle-kit migrations** — never hand-edit a generated migration
-  and never apply a schema change manually. The flow is: edit `db/schema.ts` → `npm run db:generate`
-  (`drizzle-kit generate`) → commit the new `db/migrations/<timestamp>_<name>/` folder → it is applied
-  automatically at startup by `runMigrations` (the build's `copy:migrations` step ships the `.sql` into
-  `dist` so the packaged/`npx` runtime migrates too). The generated SQL is the source of truth verbatim;
-  this is why `WITHOUT ROWID` was dropped (drizzle-orm can't emit it, and it's SQLite-only — keeping it
-  would force a manual post-edit and block the Postgres path). `tests/schema-parity.test.ts` guards the
-  physical schema against a committed snapshot (`tests/fixtures/schema-snapshot.json`); regenerate that
-  fixture deliberately (build a fresh DB via `connect` + `runMigrations` and dump the test's
-  `describeSchema`) only when a schema change is intentional. Keep dialect-specific SQL (`GROUP_CONCAT`,
-  `json_extract`, time-bucketing) behind `db/dialect.ts` so Postgres stays a one-file swap later.
+  and never apply a schema change manually. With **two backends there are two schema files** kept
+  structurally identical: the flow is edit `db/schema.ts` AND `db/schema.pg.ts` → `npm run db:generate`
+  AND `npm run db:generate:pg` → commit the new `db/migrations/<ts>_<name>/` AND
+  `db/migrations-pg/<ts>_<name>/` folders → applied at startup by the connection's `runMigrations` (the
+  build's `copy:migrations` ships both folders into `dist`). PG column mapping: epoch-ms `integer`→
+  `bigint({mode:"number"})`, `real`→`doublePrecision`, autoincrement→identity, 0/1 flags stay `integer`.
+  `WITHOUT ROWID` was dropped (drizzle-orm can't emit it; SQLite-only). `tests/schema-parity.test.ts`
+  guards the sqlite physical schema against a committed snapshot (`tests/fixtures/schema-snapshot.json`);
+  `tests/schema-cross-parity.test.ts` guards that the two schema files stay structurally identical (this
+  is what makes the `schema-active.ts` single-cast barrel sound) — add a column to one and forget the
+  other and it fails. Keep dialect-specific SQL (`string_agg`/`json_extract`/bucketing/`LEAST`-`GREATEST`)
+  behind `db/dialect.ts`, and raw-SQL execution / unique-violation / affected-rows behind `db/raw.ts`.
 - A new **source** for an existing agent is one entry in `src/shared/sources.ts` (`provider`, `signal`,
   `serviceNames`); its `is_primary`/precedence then follows from the provider's preferred signal
   automatically. A new **agent** is that entry plus a `src/server/providers/<agent>.ts` module (its

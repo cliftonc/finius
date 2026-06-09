@@ -1,7 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { FINIUS_HOME, loadConfig, saveConfig } from "./config.js";
-import { startServer } from "../server/index.js";
+import { FINIUS_HOME, loadConfig, resolvePostgresUrl, saveConfig } from "./config.js";
 import { generateAuthToken } from "./password.js";
 
 // `finius serve [--port N]` — start the single-process server (API + built dashboard). Data is kept
@@ -34,8 +33,22 @@ export async function runServe(argv: string[]): Promise<number> {
   if (port === undefined) port = config?.listen?.port ?? target.port;
   const hostname = host ?? process.env.FINIUS_HOST ?? config?.listen?.host ?? target.hostname;
 
+  // Storage backend. A configured/overridden Postgres URL switches `serve` to Postgres; otherwise the
+  // default local SQLite file under ~/.finius/data. The env vars are set BEFORE the dynamic import of
+  // the server below so the schema barrel (schema-active.ts) and dialect.ts resolve the right backend at
+  // module-load time.
+  const postgresUrl = resolvePostgresUrl(config);
+  if (postgresUrl) {
+    process.env.FINIUS_DATABASE_URL = postgresUrl;
+    process.env.FINIUS_DB_BACKEND = "postgres";
+  }
+
   const dataDir = join(FINIUS_HOME, "data");
   mkdirSync(dataDir, { recursive: true });
+
+  // Loaded only now (dynamic import) so the FINIUS_DB_BACKEND/FINIUS_DATABASE_URL env above is set
+  // before the server's DB modules evaluate.
+  const { startServer } = await import("../server/index.js");
 
   // Secure Mode: if `finius setup` saved a master password on this (owner) machine, run the server
   // locked. An explicit env var still wins (handy for one-off overrides).
@@ -52,13 +65,14 @@ export async function runServe(argv: string[]): Promise<number> {
     if (config) saveConfig({ ...config, authToken: initialAuthToken });
   }
 
-  startServer({
+  await startServer({
     port,
     hostname,
     // Show the configured URL in the banner (e.g. http://192.168.178.180:8787) rather than the bind
     // address (0.0.0.0), so the printed dashboard link is the one other machines can actually open.
     displayUrl: target.displayUrl,
     dbPath: process.env.FINIUS_DB_PATH ?? join(dataDir, "finius.sqlite"),
+    database: postgresUrl ? { backend: "postgres", url: postgresUrl } : undefined,
     blobDir: process.env.FINIUS_BLOB_DIR ?? join(FINIUS_HOME, "transcripts"),
     authSecret,
     initialAuthToken,

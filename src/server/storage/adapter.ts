@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { type BlobStore, LocalBlobStore } from "./blob.js";
 import { detectTranscriptFormat, parseTranscript, shouldReplaceBySession } from "../transcripts.js";
 import { parseOtelLogRecords, parseOtelMetricRecords, parseOtelTraceRecords, preferredIdentity, stableHash, warnIfCumulative } from "../otel.js";
@@ -11,7 +10,7 @@ import { computeCostPoints, type PriceIndex } from "../pricing.js";
 import type { SnapshotFetcher } from "../pricing-backfill.js";
 import { SerialQueue } from "../queue.js";
 import { GRANULARITY_MS } from "../db/fragments.js";
-import { type DrizzleDb, connect, runMigrations } from "../db/client.js";
+import { type DbDescriptor, type DrizzleDb, connect } from "../db/client.js";
 import * as auth from "../db/auth.js";
 import * as usersDb from "../db/users.js";
 import * as metrics from "../db/metrics.js";
@@ -43,8 +42,6 @@ import type {
   TranscriptInfo
 } from "../types.js";
 
-type Database = InstanceType<typeof DatabaseSync>;
-
 export type DrizzleStorageOptions = {
   // When false (FINIUS_RAW_PAYLOADS=off), raw_batches stores only the dedup hash, not the payload.
   // This disables replay/backfill of new metric kinds from history but keeps the DB lean.
@@ -53,11 +50,17 @@ export type DrizzleStorageOptions = {
   blob?: BlobStore;
 };
 
+// A bare string target is shorthand for a local sqlite file (tests, the default).
+export type StorageTarget = string | DbDescriptor;
+
+const toDescriptor = (target: StorageTarget): DbDescriptor => (typeof target === "string" ? { backend: "sqlite", path: target } : target);
+
 export class DrizzleStorageAdapter implements StorageAdapter {
-  // The raw node:sqlite handle. Only used for close(); all query work goes through this.orm.
-  private db: Database;
-  // The Drizzle handle wrapping the same connection.
-  private orm: DrizzleDb;
+  // The Drizzle handle (sqlite or postgres). All query work goes through it; assigned in init().
+  private orm!: DrizzleDb;
+  // Backend-specific connection teardown (sqlite close / pg pool.end), set in init().
+  private closeConnection: () => Promise<void> = async () => {};
+  private descriptor: DbDescriptor;
   private storeRawPayloads: boolean;
   private blob: BlobStore;
   // In-memory model→price lookup, loaded from model_prices at construction and refreshed on
@@ -78,23 +81,37 @@ export class DrizzleStorageAdapter implements StorageAdapter {
   // Notified when a queued import finishes, so the server can publish the SSE 'ingest' event.
   private processingListener?: (signal: string, result: ImportResult) => void;
 
-  constructor(path: string, options: DrizzleStorageOptions = {}) {
+  constructor(target: StorageTarget, options: DrizzleStorageOptions = {}) {
+    this.descriptor = toDescriptor(target);
     this.storeRawPayloads = options.storeRawPayloads ?? true;
-    this.blob = options.blob ?? new LocalBlobStore(join(dirname(path), "transcripts"));
-    // connect() opens the DB (creating the dir), applies the WAL + foreign_keys PRAGMAs, and wraps it
-    // with Drizzle. Keep the raw DatabaseSync as this.db for close(); all query work goes through this.orm.
-    const { db, sqlite } = connect(path);
-    this.db = sqlite;
-    this.orm = db;
-    // Build the schema via the drizzle-kit migrations (the generated migrations are the single source
-    // of truth; the migrator creates everything on a fresh DB and is a no-op once applied).
-    runMigrations(db);
-    this.loadPricing();
+    // Default the blob store under the sqlite DB dir; for postgres (no local path) callers pass blobDir
+    // explicitly (serve always does), falling back to a cwd-relative "transcripts".
+    const defaultBlobDir = this.descriptor.backend === "sqlite" ? join(dirname(this.descriptor.path), "transcripts") : "transcripts";
+    this.blob = options.blob ?? new LocalBlobStore(defaultBlobDir);
+  }
+
+  // Async factory + entry point (not the bare constructor): opens the connection (async on Postgres),
+  // runs migrations, and loads the in-memory price index. All callers (serve, tests) use this. A bare
+  // string target means a local sqlite file.
+  static async open(target: StorageTarget, options: DrizzleStorageOptions = {}): Promise<DrizzleStorageAdapter> {
+    const adapter = new DrizzleStorageAdapter(target, options);
+    await adapter.init();
+    return adapter;
+  }
+
+  // Open the connection, apply migrations (the generated migrations are the single source of truth — the
+  // migrator creates everything on a fresh DB and is a no-op once applied), and load pricing.
+  private async init(): Promise<void> {
+    const conn = await connect(this.descriptor);
+    this.orm = conn.db;
+    this.closeConnection = conn.close;
+    await conn.runMigrations();
+    await this.loadPricing();
   }
 
   async ingestOtelMetrics(batch: unknown, identity?: TelemetryIdentity) {
     const hash = stableHash("otlp_metrics", batch);
-    const rawBatchId = ingest.insertRawBatch(this.orm, "otlp_metrics", hash, batch, this.storeRawPayloads);
+    const rawBatchId = await ingest.insertRawBatch(this.orm, "otlp_metrics", hash, batch, this.storeRawPayloads);
     if (rawBatchId === null) return { duplicate: true, points: 0 };
 
     const points = parseOtelMetricPoints(batch).map((point) => withTelemetryIdentity(point, identity));
@@ -102,14 +119,14 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     warnIfCumulative(parseOtelMetricRecords(batch));
     debugOtelSignal("metrics", () => metricDebugEvents(points));
 
-    this.orm.transaction(() => ingest.ingestMetricPoints(this.orm, points, rawBatchId));
+    await ingest.ingestMetricPoints(this.orm, points, rawBatchId);
 
     return { duplicate: false, points: points.length };
   }
 
   async ingestOtelTraces(batch: unknown, identity?: TelemetryIdentity) {
     const hash = stableHash("otlp_traces", batch);
-    const rawBatchId = ingest.insertRawBatch(this.orm, "otlp_traces", hash, batch, this.storeRawPayloads);
+    const rawBatchId = await ingest.insertRawBatch(this.orm, "otlp_traces", hash, batch, this.storeRawPayloads);
     if (rawBatchId === null) return { duplicate: true, spans: 0, points: 0 };
 
     const spans = parseOtelTraceRecords(batch);
@@ -117,7 +134,7 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     debugOtelSignal("traces", () => traceDebugEvents(batch));
     const points = [...tokenPoints, ...computeCostPoints(tokenPoints, this.priceIndex)];
 
-    this.orm.transaction(() => ingest.ingestMetricPoints(this.orm, points, rawBatchId));
+    await ingest.ingestMetricPoints(this.orm, points, rawBatchId);
 
     void this.backfillHistoricalPricing(tokenPoints).catch((err) =>
       console.warn(`[finius] historical pricing backfill for OTLP traces failed: ${(err as Error).message}`)
@@ -127,7 +144,7 @@ export class DrizzleStorageAdapter implements StorageAdapter {
 
   async ingestOtelLogs(batch: unknown) {
     const hash = stableHash("otlp_logs", batch);
-    const rawBatchId = ingest.insertRawBatch(this.orm, "otlp_logs", hash, batch, this.storeRawPayloads);
+    const rawBatchId = await ingest.insertRawBatch(this.orm, "otlp_logs", hash, batch, this.storeRawPayloads);
     if (rawBatchId === null) return { duplicate: true, events: 0 };
 
     // Logs are indexed into log_events for inspection (GET /api/logs/events) but NOT aggregated into
@@ -137,7 +154,7 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     // visible as log_events only. raw_batches still holds the verbatim payload for replay.
     const records = parseOtelLogRecords(batch);
     debugOtelSignal("logs", () => logDebugEvents(records));
-    this.orm.transaction(() => ingest.insertLogEvents(this.orm, records, rawBatchId));
+    await ingest.insertLogEvents(this.orm, records, rawBatchId);
     return { duplicate: false, events: records.length };
   }
 
@@ -154,7 +171,7 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     format?: TranscriptFormat
   ): Promise<ImportResult> {
     const hash = createHash("sha256").update(content).digest("hex");
-    if (this.isDuplicateUpload(hash)) return { duplicate: true, importedLines: 0, malformedLines: 0, metricPoints: 0, rawEvents: 0 };
+    if (await this.isDuplicateUpload(hash)) return { duplicate: true, importedLines: 0, malformedLines: 0, metricPoints: 0, rawEvents: 0 };
     await this.blob.save(hash, content);
     return this.processImport(source, sessionHint, content, hash, format);
   }
@@ -169,7 +186,7 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     format?: TranscriptFormat
   ): Promise<{ duplicate: boolean; queued: boolean }> {
     const hash = createHash("sha256").update(content).digest("hex");
-    if (this.isDuplicateUpload(hash)) return { duplicate: true, queued: false };
+    if (await this.isDuplicateUpload(hash)) return { duplicate: true, queued: false };
     this.inFlight.add(hash);
     await this.blob.save(hash, content); // persisted immediately, before we return
     this.ingestQueue.enqueue(async () => {
@@ -199,7 +216,7 @@ export class DrizzleStorageAdapter implements StorageAdapter {
   }
 
   // Already-imported (persistent) or queued/in-flight (in-memory) — either way, don't re-process.
-  private isDuplicateUpload(hash: string): boolean {
+  private async isDuplicateUpload(hash: string): Promise<boolean> {
     if (this.inFlight.has(hash)) return true;
     return ingest.uploadExists(this.orm, hash);
   }
@@ -217,57 +234,58 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     const lines = content.split(/\r?\n/);
     // Pluggable per-agent parser: explicit format wins, else sniff (Claude vs Codex).
     const resolvedFormat = format ?? detectTranscriptFormat(lines);
-    const effectiveSessionHint =
-      resolvedFormat === "copilot"
-        ? { ...sessionHint, sessionId: ingest.resolveCopilotTranscriptSession(this.orm, sessionHint.sessionId) ?? sessionHint.sessionId }
-        : sessionHint;
+    const copilotSessionId = resolvedFormat === "copilot" ? await ingest.resolveCopilotTranscriptSession(this.orm, sessionHint.sessionId) : undefined;
+    const effectiveSessionHint = resolvedFormat === "copilot" ? { ...sessionHint, sessionId: copilotSessionId ?? sessionHint.sessionId } : sessionHint;
     const parsed = parseTranscript(resolvedFormat, source, effectiveSessionHint, lines);
 
     // If this transcript has usage on days we hold no price for, fetch the historical pricing now
-    // (serial, deduped) so the cost we synthesize below uses the rate in effect at the time.
+    // (serial, deduped) so the cost we synthesize below uses the rate in effect at the time. This MUST
+    // run before the writes below (it does network I/O); the writes themselves do no I/O between steps.
     await this.backfillHistoricalPricing(parsed.points);
 
-    this.orm.transaction(() => {
-      // Some agents (Codex) write ONE append-only file per session and re-upload it as it grows; for
-      // those, replace the session's prior points for this source so a longer re-upload doesn't
-      // double-count. (Identical re-uploads already short-circuited on the content hash.) A replaced
-      // source whose signal is its provider's preferred one (e.g. Codex JSONL) had its old points in the
-      // rollup, so we rebuild it below to restore the invariant.
-      const replacedPrimary = shouldReplaceBySession(resolvedFormat)
-        ? ingest.replaceSessionPoints(this.orm, source, [...new Set(parsed.points.map((p) => p.sessionId))])
-        : false;
-      // Synthesize cost when the transcript didn't carry it (Codex never does; Claude JSONL rarely
-      // does). The computed points copy their token point's source, so a primary-source transcript
-      // (Codex/manual) gets its computed cost into the rollup too, while a comparison-only transcript
-      // (claude-code-jsonl / copilot-vscode-jsonl) stays out of dashboards. When the transcript DID
-      // report a real cost point, we leave it as-is and synthesize nothing.
-      const hasReportedCost = parsed.points.some((p) => p.kind === "cost");
-      const pointsToInsert = hasReportedCost
-        ? parsed.points
-        : [...parsed.points, ...computeCostPoints(parsed.points, this.priceIndex)];
-      for (const point of pointsToInsert) {
-        const { isPrimary } = ingest.insertMetricPoint(this.orm, point, null);
-        // Feed the rollup from the point's DYNAMIC primacy. A transcript import never triggers a
-        // transition: for Claude/Copilot the transcript is the non-preferred signal (so it's primary
-        // only when the session has no OTel — fallback — and never demotes anything); for Codex/manual
-        // it IS the preferred signal and there's no other signal to demote. When a replace-by-session
-        // delete made the rollup stale, we skip incremental upserts and rebuild wholesale below.
-        if (isPrimary && !replacedPrimary) ingest.upsertRollup(this.orm, point);
-      }
-      // The replace-by-session delete left the rollup holding the now-deleted points; rebuild it from
-      // the surviving primary points so the rollup invariant (== aggregate of is_primary=1 points) holds.
-      if (replacedPrimary) ingest.rebuildRollup(this.orm);
-      // Link the file to the single session row for its UUID (inserting the points above already
-      // upserted it, recording has_jsonl). "View transcript" then surfaces on that one session.
-      const sessionId = effectiveSessionHint.sessionId ?? parsed.points[0]?.sessionId ?? null;
-      ingest.recordSourceFile(this.orm, {
-        source,
-        sessionId,
-        hash,
-        byteSize: Buffer.byteLength(content),
-        lineCount: parsed.result.importedLines
-      });
+    const sessionId = effectiveSessionHint.sessionId ?? parsed.points[0]?.sessionId ?? null;
+    // Transactions were removed (see ingest.ts header). To preserve the no-double-count invariant under
+    // a retry-after-partial-failure, write the content-hash dedup marker FIRST: a re-import then
+    // short-circuits in isDuplicateUpload (uploadExists) instead of re-inserting points. The marker's
+    // session_row_id is backfilled after the points create the session (linkSourceFileSession).
+    await ingest.recordSourceFile(this.orm, {
+      source,
+      sessionId,
+      hash,
+      byteSize: Buffer.byteLength(content),
+      lineCount: parsed.result.importedLines
     });
+
+    // Some agents (Codex) write ONE append-only file per session and re-upload it as it grows; for
+    // those, replace the session's prior points for this source so a longer re-upload doesn't
+    // double-count. (Identical re-uploads already short-circuited on the content hash.) A replaced
+    // source whose signal is its provider's preferred one (e.g. Codex JSONL) had its old points in the
+    // rollup, so we rebuild it below to restore the invariant.
+    const replacedPrimary = shouldReplaceBySession(resolvedFormat)
+      ? await ingest.replaceSessionPoints(this.orm, source, [...new Set(parsed.points.map((p) => p.sessionId))])
+      : false;
+    // Synthesize cost when the transcript didn't carry it (Codex never does; Claude JSONL rarely does).
+    // The computed points copy their token point's source, so a primary-source transcript (Codex/manual)
+    // gets its computed cost into the rollup too, while a comparison-only transcript (claude-code-jsonl /
+    // copilot-vscode-jsonl) stays out of dashboards. When the transcript DID report a real cost point, we
+    // leave it as-is and synthesize nothing.
+    const hasReportedCost = parsed.points.some((p) => p.kind === "cost");
+    const pointsToInsert = hasReportedCost ? parsed.points : [...parsed.points, ...computeCostPoints(parsed.points, this.priceIndex)];
+    for (const point of pointsToInsert) {
+      const { isPrimary } = await ingest.insertMetricPoint(this.orm, point, null);
+      // Feed the rollup from the point's DYNAMIC primacy. A transcript import never triggers a
+      // transition: for Claude/Copilot the transcript is the non-preferred signal (so it's primary only
+      // when the session has no OTel — fallback — and never demotes anything); for Codex/manual it IS the
+      // preferred signal and there's no other signal to demote. When a replace-by-session delete made the
+      // rollup stale, we skip incremental upserts and rebuild wholesale below.
+      if (isPrimary && !replacedPrimary) await ingest.upsertRollup(this.orm, point);
+    }
+    // The replace-by-session delete left the rollup holding the now-deleted points; rebuild it from the
+    // surviving primary points so the rollup invariant (== aggregate of is_primary=1 points) holds.
+    if (replacedPrimary) await ingest.rebuildRollup(this.orm);
+    // Backfill the dedup marker's session_row_id now that the points have created the session row, so
+    // "View transcript" surfaces on that session.
+    await ingest.linkSourceFileSession(this.orm, hash, sessionId);
 
     return parsed.result;
   }
@@ -305,7 +323,7 @@ export class DrizzleStorageAdapter implements StorageAdapter {
   }
 
   async getSessionTranscript(sessionRowId: number): Promise<{ content: string; source: string; importedAt: number } | null> {
-    const row = ingest.getSourceFileForSession(this.orm, sessionRowId);
+    const row = await ingest.getSourceFileForSession(this.orm, sessionRowId);
     if (!row) return null;
     const bytes = await this.blob.read(row.blobKey);
     if (!bytes) return null;
@@ -349,42 +367,42 @@ export class DrizzleStorageAdapter implements StorageAdapter {
     return people.getFilterOptions(this.orm);
   }
 
-  close() {
-    this.db.close();
+  async close() {
+    await this.closeConnection();
   }
 
   async pruneRawBatches(beforeTimestampMs: number): Promise<{ deleted: number }> {
     return ingest.pruneRawBatches(this.orm, beforeTimestampMs);
   }
 
-  createAuthToken(tokenHash: string, label: string, now: number, userRowId: number | null = null): void {
-    auth.createAuthToken(this.orm, tokenHash, label, now, userRowId);
+  async createAuthToken(tokenHash: string, label: string, now: number, userRowId: number | null = null): Promise<void> {
+    await auth.createAuthToken(this.orm, tokenHash, label, now, userRowId);
   }
 
-  findAuthToken(tokenHash: string): { id: number; revoked: number; userRowId: number | null } | null {
+  findAuthToken(tokenHash: string): Promise<{ id: number; revoked: number; userRowId: number | null } | null> {
     return auth.findAuthToken(this.orm, tokenHash);
   }
 
-  listAuthTokens(): AuthTokenRecord[] {
+  listAuthTokens(): Promise<AuthTokenRecord[]> {
     return auth.listAuthTokens(this.orm);
   }
 
-  revokeAuthToken(id: number): void {
-    auth.revokeAuthToken(this.orm, id);
+  async revokeAuthToken(id: number): Promise<void> {
+    await auth.revokeAuthToken(this.orm, id);
   }
 
-  getUserById(id: number): AuthUser | null {
+  getUserById(id: number): Promise<AuthUser | null> {
     return usersDb.getUserById(this.orm, id);
   }
 
-  upsertOAuthUser(input: OAuthUserInput, now: number): AuthUser {
+  upsertOAuthUser(input: OAuthUserInput, now: number): Promise<AuthUser> {
     return usersDb.upsertOAuthUser(this.orm, input, now);
   }
 
-  // Load model_prices into the in-memory index that cost synthesis reads. Called at construction and
-  // after every importPricing so the hot path never touches the DB.
-  private loadPricing() {
-    const { index, earliest } = pricingStore.loadPriceIndex(this.orm);
+  // Load model_prices into the in-memory index that cost synthesis reads. Called at open() and after
+  // every importPricing so the hot path never touches the DB.
+  private async loadPricing(): Promise<void> {
+    const { index, earliest } = await pricingStore.loadPriceIndex(this.orm);
     this.priceIndex = index;
     this.earliestPriceDate = earliest;
   }
@@ -395,8 +413,8 @@ export class DrizzleStorageAdapter implements StorageAdapter {
 
   // Upsert dated price rows (newer effective_date wins for a given model) and reload the index.
   async importPricing(prices: ModelPrice[]): Promise<{ imported: number }> {
-    const result = pricingStore.importPricing(this.orm, prices);
-    this.loadPricing();
+    const result = await pricingStore.importPricing(this.orm, prices);
+    await this.loadPricing();
     return result;
   }
 
@@ -409,10 +427,8 @@ export class DrizzleStorageAdapter implements StorageAdapter {
   // the stored flag (e.g. a bad historical backfill, a precedence-rule change). Exposed via the
   // cron-token-guarded /api/maintenance/rebuild-primary endpoint.
   async rebuildIsPrimary(): Promise<void> {
-    this.orm.transaction(() => {
-      ingest.rebuildIsPrimary(this.orm);
-      ingest.rebuildRollup(this.orm);
-    });
+    await ingest.rebuildIsPrimary(this.orm);
+    await ingest.rebuildRollup(this.orm);
   }
 
 }

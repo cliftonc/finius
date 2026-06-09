@@ -1,8 +1,8 @@
 # Finius quick-start
 
 Finius is a local-first Claude Code / Codex / GitHub Copilot usage tracker: a single process ingests
-OpenTelemetry metrics + JSONL transcripts into SQLite and serves a dashboard. This guide walks three
-setups:
+OpenTelemetry metrics + JSONL transcripts into SQLite (or PostgreSQL for a team server) and serves a
+dashboard. This guide walks three setups:
 
 1. [Local, single machine](#1-local-single-machine-no-auth) — no auth, fastest path.
 2. [Team deployment](#2-team-deployment-on-a-server) — a shared server behind a real domain + TLS.
@@ -130,6 +130,23 @@ npx @cliftonc/finius setup https://finius.example.com
 - **Require authentication?** → **Yes**. Setup generates and prints a password — **save it now**; it's
   how teammates and the dashboard log in.
 - The password is stored as `authPassword` in `~/.finius/config.json` on this (owner) machine.
+- **Use PostgreSQL for storage?** → for a team server, **Yes** is recommended (the default local
+  SQLite file is fine too). See the storage note below.
+
+> **Storage backend.** A shared/team server can be backed by **PostgreSQL** instead of the local SQLite
+> file. When you answer **Yes** to the storage prompt, setup gives you two paths:
+> - **Spin up a local Postgres in Docker** — if a Docker daemon is running, setup provisions a managed
+>   `finius-postgres` container (`postgres:16-alpine`, a persistent named volume, `--restart
+>   unless-stopped`, a generated password) and saves the connection URL to your config. The host port
+>   defaults to **55432** so it won't collide with a system Postgres on 5432.
+> - **Connect to an existing Postgres** — point setup at any server by URL (the only option when Docker
+>   isn't available).
+>
+> Either way the URL lands in `~/.finius/config.json` as `database` and `finius serve` uses it; you can
+> also bypass setup with `FINIUS_DATABASE_URL=postgres://user:pass@host:5432/finius`. The `pg` driver is
+> an **optional peer dependency** — `npm i -g pg` on the server, since it isn't bundled. Migrations run
+> automatically at startup, and `finius doctor` reports Postgres reachability. Switching backends starts
+> from an empty database (there's no cross-backend data migration).
 
 Then start the server, **binding to localhost** on a plain local port (the proxy reaches it; nothing
 else should). Because the public `serverUrl` carries no port, `finius serve` defaults the bind to

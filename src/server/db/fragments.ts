@@ -8,7 +8,7 @@
 // `rollupWhere`/`pointWhere` reference the typed schema columns so a column rename is a compile error.
 
 import { type SQL, type SQLWrapper, and, eq, gte, lte, or, sql } from "drizzle-orm";
-import { metricPoints, metricRollup, sessions } from "./schema.js";
+import { metricPoints, metricRollup, sessions } from "./schema-active.js";
 import type { Granularity, SummaryFilters } from "../types.js";
 
 export { CLAUDE_OTEL_SOURCE as OTEL_SOURCE } from "../../shared/sources.js";

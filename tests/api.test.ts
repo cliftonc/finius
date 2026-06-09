@@ -23,7 +23,7 @@ afterEach(() => {
 
 describe("API", () => {
   it("creates sessions and emits ingest events after OTLP metrics", async () => {
-    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = await DrizzleStorageAdapter.open(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     const events = new EventBus();
     const seen: unknown[] = [];
     events.subscribe((event, data) => seen.push({ event, data }));
@@ -44,7 +44,7 @@ describe("API", () => {
   });
 
   it("accepts OTLP/protobuf trace requests", async () => {
-    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = await DrizzleStorageAdapter.open(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     const app = createApp({ storage, events: new EventBus() });
     const proto = getExportRequestProto(ServiceClientType.SPANS);
     const body = Buffer.from(proto.encode(copilotTraceBatch()).finish());
@@ -62,7 +62,7 @@ describe("API", () => {
   });
 
   it("uses Finius identity headers when Copilot traces omit user identity", async () => {
-    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = await DrizzleStorageAdapter.open(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     const app = createApp({ storage, events: new EventBus() });
 
     const response = await app.request("/otlp/v1/traces", {
@@ -86,7 +86,7 @@ describe("API", () => {
   });
 
   it("returns stable empty dashboard responses", async () => {
-    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = await DrizzleStorageAdapter.open(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     const app = createApp({ storage, events: new EventBus() });
 
     const summary = await (await app.request("/api/metrics/summary")).json();
@@ -97,7 +97,7 @@ describe("API", () => {
   });
 
   it("imports a transcript file and serves it back over the API", async () => {
-    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = await DrizzleStorageAdapter.open(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     const app = createApp({ storage, events: new EventBus() });
     const content = '{"session_id":"s1","message":{"usage":{"input_tokens":10,"output_tokens":2}}}';
 
@@ -129,7 +129,7 @@ describe("API", () => {
   });
 
   it("guards the prune endpoint with a bearer token and fails closed without one", async () => {
-    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = await DrizzleStorageAdapter.open(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
 
     // No token configured -> endpoint disabled.
     const closed = createApp({ storage, events: new EventBus() });
@@ -152,7 +152,7 @@ describe("API", () => {
   });
 
   it("prunes only raw batches older than the cutoff", async () => {
-    storage = new DrizzleStorageAdapter(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
+    storage = await DrizzleStorageAdapter.open(join(mkdtempSync(join(tmpdir(), "finius-")), "test.sqlite"));
     await storage.ingestOtelMetrics(otlpMetricBatch("session-a"));
 
     // Nothing is older than 7 days, so a default prune deletes nothing.

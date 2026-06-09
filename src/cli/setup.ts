@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { confirm, intro, log, note, outro, password as passwordPrompt, spinner, text } from "@clack/prompts";
+import { confirm, intro, log, note, outro, password as passwordPrompt, select, spinner, text } from "@clack/prompts";
 import {
   type ClaudeSettings,
   TELEMETRY_HOOK_EVENTS,
@@ -18,6 +18,22 @@ import { type FiniusConfig, CONFIG_PATH, DEFAULT_SERVER_URL, loadConfig, normali
 import { readClaudeAccount, readCodexAccount, readGithub, readGitIdentity } from "./identity.js";
 import { installGlobally, isFiniusGloballyInstalled, isFiniusOnPath } from "./install.js";
 import { generateAuthToken, generatePassword } from "./password.js";
+import {
+  DEFAULT_PG_CONTAINER,
+  DEFAULT_PG_DATABASE,
+  DEFAULT_PG_IMAGE,
+  DEFAULT_PG_PORT,
+  DEFAULT_PG_USER,
+  DEFAULT_PG_VOLUME,
+  inspectContainer,
+  isDockerAvailable,
+  postgresUrl,
+  removeContainer,
+  removeVolume,
+  runContainer,
+  startContainer,
+  waitForPostgres
+} from "./postgres.js";
 import { ask, banner, pc } from "./ui.js";
 
 const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json");
@@ -61,6 +77,9 @@ export async function runSetup(args: string[] = []): Promise<number> {
   // Capture a user identity so uploaded transcripts are attributed to a person (and line up with
   // live OTEL metrics). Detected from the local Claude/Codex/GitHub/git state, confirmed by the user.
   const identity = await configureIdentity(current);
+  // Storage backend for the server this machine runs. Only relevant to the server owner, so skip it when
+  // we're joining an already-running server (health.reachable) — keep whatever was configured.
+  const database = health.reachable ? current?.database : await configureStorage(current);
   const oauth = health.reachable ? undefined : await configureOAuth(serverUrl, current);
   if (health.reachable) log.info("Connected to an existing server — skipping dashboard OAuth configuration.");
 
@@ -73,7 +92,7 @@ export async function runSetup(args: string[] = []): Promise<number> {
     log.info("GitHub-only secure mode — generated an owner token for this machine's uploads.");
   }
 
-  saveConfig({ serverUrl, authPassword: resolvedAuth.authPassword, authToken: resolvedAuth.authToken, identity, auth: oauth ? { oauth } : undefined });
+  saveConfig({ serverUrl, authPassword: resolvedAuth.authPassword, authToken: resolvedAuth.authToken, identity, database, auth: oauth ? { oauth } : undefined });
   log.success(`Saved config ${pc.dim(CONFIG_PATH)}`);
 
   // Install globally so the bare `finius` command works everywhere — including the hook, which then
@@ -436,6 +455,180 @@ async function configureIdentity(current: FiniusConfig | null): Promise<FiniusCo
   const label = displayName ?? email ?? githubLogin;
   log.success(`Attributing sessions to ${pc.cyan(String(label))}${githubLogin ? pc.dim(` (@${githubLogin})`) : ""}.`);
   return identity;
+}
+
+// Choose the server's storage backend: the default local SQLite file, or PostgreSQL (server-mode).
+// Returns the config `database` field (undefined ⇒ sqlite). When Postgres is chosen the user can either
+// spin up a local Docker container (we provision + start it here) or point at an existing server by URL.
+// Offers an optional connectivity check but, like the server-reachability check, tolerates failure so
+// setup can complete offline.
+async function configureStorage(current: FiniusConfig | null): Promise<FiniusConfig["database"]> {
+  const existingUrl = current?.database?.backend === "postgres" ? current.database.url : undefined;
+  const usePostgres = ask(
+    await confirm({
+      message: "Use PostgreSQL for storage? (default: a local SQLite file under ~/.finius)",
+      initialValue: Boolean(existingUrl)
+    })
+  );
+  if (!usePostgres) return undefined;
+
+  // Offer the Docker spin-up only when the daemon is actually reachable; otherwise go straight to the
+  // existing-URL prompt. Pre-select whichever matches the prior config so re-runs default to a no-op.
+  const dockerReady = isDockerAvailable();
+  const mode = dockerReady
+    ? ask(
+        await select({
+          message: "How should Finius get a PostgreSQL database?",
+          initialValue: existingUrl ? "url" : "docker",
+          options: [
+            { value: "docker", label: "Spin up a local Postgres in Docker", hint: "managed for you" },
+            { value: "url", label: "Connect to an existing Postgres", hint: "enter a connection URL" }
+          ]
+        })
+      )
+    : (log.info("Docker not detected — connect to an existing PostgreSQL server by URL."), "url");
+
+  const url = mode === "docker" ? await provisionDockerPostgres(current) : await promptPostgresUrl(existingUrl);
+  if (!url) return undefined;
+  return { backend: "postgres", url };
+}
+
+// Provision (or reuse) a local Docker Postgres container and return its connection URL. Falls back to
+// the URL prompt on any docker failure so setup never dead-ends. Returns null only if the user backs out.
+async function provisionDockerPostgres(current: FiniusConfig | null): Promise<string | null> {
+  const existingUrl = current?.database?.backend === "postgres" ? current.database.url : undefined;
+  const state = inspectContainer(DEFAULT_PG_CONTAINER);
+
+  // A container from a previous setup already exists. If we still hold its URL (so we know the
+  // password), reuse it — just make sure it's running. Otherwise its password is unrecoverable, so the
+  // only safe options are to recreate it (wipes the volume? no — the named volume persists, but the
+  // password is baked into that data dir, so we must drop both) or fall back to a URL.
+  if (state.exists) {
+    if (existingUrl) {
+      if (!state.running) {
+        const s = spinner();
+        s.start(`Starting existing container ${pc.cyan(DEFAULT_PG_CONTAINER)}`);
+        try {
+          startContainer(DEFAULT_PG_CONTAINER);
+          await waitForPostgres(DEFAULT_PG_CONTAINER, DEFAULT_PG_USER);
+          s.stop(pc.green(`Container ${DEFAULT_PG_CONTAINER} is running`));
+        } catch (error) {
+          s.stop(pc.yellow(`Couldn't start it (${(error as Error).message}) — keeping the saved URL anyway`));
+        }
+      } else {
+        log.info(`Reusing the running ${pc.cyan(DEFAULT_PG_CONTAINER)} container.`);
+      }
+      return existingUrl;
+    }
+    const recreate = ask(
+      await confirm({
+        message: `A ${DEFAULT_PG_CONTAINER} container exists but its password isn't in this config. Remove it and create a fresh one?`,
+        initialValue: false
+      })
+    );
+    if (!recreate) {
+      log.info("Leaving the existing container in place — enter its connection URL instead.");
+      return promptPostgresUrl(existingUrl);
+    }
+    removeContainer(DEFAULT_PG_CONTAINER);
+    removeVolume(DEFAULT_PG_VOLUME);
+  }
+
+  const port = await promptPort();
+  const password = generatePassword();
+  const opts = {
+    container: DEFAULT_PG_CONTAINER,
+    volume: DEFAULT_PG_VOLUME,
+    port,
+    database: DEFAULT_PG_DATABASE,
+    user: DEFAULT_PG_USER,
+    password
+  };
+
+  const s = spinner();
+  s.start(`Starting ${pc.cyan(DEFAULT_PG_IMAGE)} on port ${port}`);
+  try {
+    runContainer(opts);
+  } catch (error) {
+    const stderr = (error as { stderr?: Buffer }).stderr?.toString().trim();
+    const hint = stderr && /port is already allocated|address already in use/i.test(stderr)
+      ? `port ${port} is already in use — re-run setup and pick another`
+      : stderr || (error as Error).message;
+    s.stop(pc.yellow(`Could not start the container (${hint})`));
+    return promptPostgresUrl(existingUrl);
+  }
+  const ready = await waitForPostgres(DEFAULT_PG_CONTAINER, DEFAULT_PG_USER);
+  s.stop(ready ? pc.green(`PostgreSQL ready in container ${DEFAULT_PG_CONTAINER}`) : pc.yellow("Container started but Postgres didn't report ready in time — `finius serve` will retry"));
+
+  const url = postgresUrl(opts);
+  note(
+    [
+      `${pc.dim("Container")}  ${DEFAULT_PG_CONTAINER}  ${pc.dim(`(volume ${DEFAULT_PG_VOLUME}, restart unless-stopped)`)}`,
+      `${pc.dim("URL")}        ${url}`,
+      pc.dim("Stop/remove later with: docker rm -f " + DEFAULT_PG_CONTAINER)
+    ].join("\n"),
+    "Local PostgreSQL provisioned"
+  );
+  return url;
+}
+
+// Prompt for a host port to publish, defaulting to 5432. Validates it's a plausible TCP port.
+async function promptPort(): Promise<number> {
+  const entered = ask(
+    await text({
+      message: "Host port to expose Postgres on",
+      placeholder: String(DEFAULT_PG_PORT),
+      defaultValue: String(DEFAULT_PG_PORT),
+      initialValue: String(DEFAULT_PG_PORT),
+      validate: (value) => {
+        const n = Number((value ?? "").trim());
+        return Number.isInteger(n) && n > 0 && n < 65536 ? undefined : "Enter a port between 1 and 65535";
+      }
+    })
+  ).trim();
+  return Number(entered) || DEFAULT_PG_PORT;
+}
+
+// Prompt for a Postgres connection URL and run an optional, non-fatal connectivity check (lazy-imports
+// the `pg` peer dep). Returns the URL, or null if the user submitted nothing.
+async function promptPostgresUrl(existingUrl: string | undefined): Promise<string | null> {
+  const url = ask(
+    await text({
+      message: "PostgreSQL connection URL",
+      placeholder: "postgres://user:pass@localhost:5432/finius",
+      defaultValue: existingUrl,
+      initialValue: existingUrl,
+      validate: (value) => {
+        const s = (value ?? "").trim();
+        if (!s) return "Enter a connection URL";
+        try {
+          return /^postgres(ql)?:$/.test(new URL(s).protocol) ? undefined : "Must be a postgres:// URL";
+        } catch {
+          return "Enter a valid URL";
+        }
+      }
+    })
+  ).trim();
+  if (!url) return null;
+
+  // Optional connectivity check (lazy-imports the `pg` peer dep). Non-fatal: save regardless.
+  const s = spinner();
+  s.start("Testing PostgreSQL connection");
+  try {
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: url });
+    try {
+      await pool.query("SELECT 1");
+      s.stop(pc.green("PostgreSQL reachable"));
+    } finally {
+      await pool.end();
+    }
+  } catch (error) {
+    const msg = (error as Error).message;
+    const hint = /Cannot find package 'pg'|Cannot find module 'pg'/.test(msg) ? "the `pg` driver isn't installed — run `npm i -g pg` before `finius serve`" : msg;
+    s.stop(pc.yellow(`Could not connect (${hint}) — saving anyway`));
+  }
+  return url;
 }
 
 async function configureOAuth(serverUrl: string, current: FiniusConfig | null): Promise<NonNullable<FiniusConfig["auth"]>["oauth"] | undefined> {

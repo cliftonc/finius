@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, describe, expect, it } from "vitest";
-import { connect, runMigrations } from "../src/server/db/client.js";
+import { connectSqlite, runMigrationsSqlite } from "../src/server/db/client.js";
 
 // Durable schema guard. The adapter now builds its schema solely via the Drizzle migrator (schema.ts
 // → generated baseline migration), so there is no second migrate() path to diff against. Instead we
@@ -84,8 +84,8 @@ describe("schema guard: Drizzle migration matches the committed schema snapshot"
   it("produces the frozen normalized schema structure", () => {
     // Build a fresh DB through the same migrator the adapter uses.
     const path = join(dir, "fresh.sqlite");
-    const { db, sqlite } = connect(path);
-    runMigrations(db);
+    const { db, sqlite } = connectSqlite(path);
+    runMigrationsSqlite(db);
 
     const actual = describeSchema(sqlite);
     const expected = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8")) as ReturnType<typeof describeSchema>;

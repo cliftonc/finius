@@ -4,10 +4,11 @@
 
 import { type DrizzleDb } from "./client.js";
 import { type SQL, and, sql } from "drizzle-orm";
-import { metricPoints, sessions, sourceFiles } from "./schema.js";
+import { metricPoints, sessions, sourceFiles } from "./schema-active.js";
 import { OTEL_SOURCE, whereClause } from "./fragments.js";
 import { dialect } from "./dialect.js";
-import { getUserById, userDirectory } from "./users.js";
+import { rawAll } from "./raw.js";
+import { userDirectory, usersById } from "./users.js";
 import type { SummaryFilters, SessionSummary } from "../types.js";
 
 export function listSessions(db: DrizzleDb, filters: SummaryFilters): Promise<SessionSummary[]> {
@@ -47,62 +48,64 @@ export async function buildSessions(db: DrizzleDb, filters: SummaryFilters, tail
   }
   const where = whereClause(and(...clauses));
 
-  const rows = db.all(
+  const rows = (await rawAll(
+    db,
     sql`SELECT
-        s.id, s.session_id AS sessionId, s.user_id AS userId, s.user_email AS userEmail, s.user_row_id AS userRowId,
-        s.user_account_id AS userAccountId, s.first_seen_at AS firstSeenAt, s.last_seen_at AS lastSeenAt,
-        s.metric_source AS metricSource, s.has_otel AS hasOtel, s.has_jsonl AS hasJsonl,
-        COALESCE(SUM(CASE WHEN p.kind = 'cost' THEN p.value ELSE 0 END), 0) AS totalCost,
-        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'input' THEN p.value ELSE 0 END), 0) AS inputTokens,
-        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'output' THEN p.value ELSE 0 END), 0) AS outputTokens,
-        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'cache_creation' THEN p.value ELSE 0 END), 0) AS cacheCreationTokens,
-        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'cache_read' THEN p.value ELSE 0 END), 0) AS cacheReadTokens,
-        COALESCE(SUM(CASE WHEN p.kind = 'tokens' THEN p.value ELSE 0 END), 0) AS totalTokens,
+        s.id, s.session_id AS "sessionId", s.user_id AS "userId", s.user_email AS "userEmail", s.user_row_id AS "userRowId",
+        s.user_account_id AS "userAccountId", s.first_seen_at AS "firstSeenAt", s.last_seen_at AS "lastSeenAt",
+        s.metric_source AS "metricSource", s.has_otel AS "hasOtel", s.has_jsonl AS "hasJsonl",
+        COALESCE(SUM(CASE WHEN p.kind = 'cost' THEN p.value ELSE 0 END), 0) AS "totalCost",
+        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'input' THEN p.value ELSE 0 END), 0) AS "inputTokens",
+        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'output' THEN p.value ELSE 0 END), 0) AS "outputTokens",
+        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'cache_creation' THEN p.value ELSE 0 END), 0) AS "cacheCreationTokens",
+        COALESCE(SUM(CASE WHEN p.kind = 'tokens' AND p.token_type = 'cache_read' THEN p.value ELSE 0 END), 0) AS "cacheReadTokens",
+        COALESCE(SUM(CASE WHEN p.kind = 'tokens' THEN p.value ELSE 0 END), 0) AS "totalTokens",
         -- Per-signal token totals for the whole session (independent of the authoritative join and
         -- of the model/source filters) so the UI can show how far the two ingest paths disagree when
         -- a session carries both. OTel often misses requests the transcript captured (or vice versa).
         (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'tokens') AS otelTotalTokens,
+           WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'tokens') AS "otelTotalTokens",
         (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' AND mp.kind = 'tokens') AS jsonlTotalTokens,
+           WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' AND mp.kind = 'tokens') AS "jsonlTotalTokens",
         -- Per-signal cost too. OTel cost is Claude's reported figure; JSONL cost is the synthesized
         -- finius.cost.computed point (kind=cost, signal=jsonl). Independent of the authoritative join so
         -- the UI can show the delta when a session carries both.
         (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'cost') AS otelTotalCost,
+           WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' AND mp.kind = 'cost') AS "otelTotalCost",
         (SELECT COALESCE(SUM(mp.value), 0) FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' AND mp.kind = 'cost') AS jsonlTotalCost,
+           WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' AND mp.kind = 'cost') AS "jsonlTotalCost",
         -- The actual source for each signal on this session (e.g. 'copilot-chat' vs 'codex-cli-jsonl'),
         -- so the UI can tell which agent produced it. Independent of the authoritative join/filters.
         (SELECT mp.source FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' LIMIT 1) AS otelSource,
+           WHERE mp.session_row_id = s.id AND mp.signal = 'otlp_metrics' LIMIT 1) AS "otelSource",
         (SELECT mp.source FROM ${metricPoints} mp
-           WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' LIMIT 1) AS jsonlSource,
-        ${dialect.groupConcatDistinct(sql`p.model`)} AS models,
-        EXISTS(SELECT 1 FROM ${sourceFiles} sf WHERE sf.session_row_id = s.id) AS hasTranscript
+           WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' LIMIT 1) AS "jsonlSource",
+        ${dialect.groupConcatDistinct(sql`p.model`)} AS "models",
+        EXISTS(SELECT 1 FROM ${sourceFiles} sf WHERE sf.session_row_id = s.id) AS "hasTranscript"
       FROM ${sessions} s
       LEFT JOIN ${metricPoints} p ON ${joinCondition}
       ${where}
       GROUP BY s.id
       ${tail}`
-  ) as Array<
-      Omit<SessionSummary, "models" | "hasTranscript" | "source" | "hasOtel" | "hasJsonl" | "githubLogin" | "displayName"> & {
-        userRowId: number | null;
-        metricSource: "otel" | "jsonl";
-        models: string | null;
-        hasTranscript: number;
-        hasOtel: number;
-        hasJsonl: number;
-        otelSource: string | null;
-        jsonlSource: string | null;
-      }
-    >;
+  )) as Array<
+    Omit<SessionSummary, "models" | "hasTranscript" | "source" | "hasOtel" | "hasJsonl" | "githubLogin" | "displayName"> & {
+      userRowId: number | null;
+      metricSource: "otel" | "jsonl";
+      models: string | null;
+      hasTranscript: number;
+      hasOtel: number;
+      hasJsonl: number;
+      otelSource: string | null;
+      jsonlSource: string | null;
+    }
+  >;
 
-  // Resolve each session's friendly identity (GitHub login / display name) the same way People does,
-  // keyed by the session's canonical identity string, so the sessions list can prefer it over email.
-  const directory = await userDirectory(db);
+  // Resolve each session's friendly identity (GitHub login / display name) the same way People does:
+  // prefer the authoritative user_row_id link, falling back to the canonical identity string. Both maps
+  // are prefetched once (the users table is tiny) so this is not an N+1 over the session list.
+  const [directory, byId] = await Promise.all([userDirectory(db), usersById(db)]);
   return rows.map(({ otelSource, jsonlSource, ...row }) => {
-    const u = (row.userRowId ? getUserById(db, row.userRowId) : null) ?? directory.get(row.userEmail ?? row.userAccountId ?? row.userId ?? "unknown");
+    const u = (row.userRowId != null ? byId.get(row.userRowId) : undefined) ?? directory.get(row.userEmail ?? row.userAccountId ?? row.userId ?? "unknown");
     return {
       ...row,
       source: row.metricSource === "otel" ? otelSource ?? OTEL_SOURCE : jsonlSource ?? "claude-code-jsonl",

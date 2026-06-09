@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { intro, log, outro } from "@clack/prompts";
 import { type ClaudeSettings, TELEMETRY_HOOK_EVENTS } from "./claude-settings.js";
-import { CONFIG_PATH, loadConfig, normalizeUrl, resolveAuthToken } from "./config.js";
+import { CONFIG_PATH, FINIUS_HOME, loadConfig, normalizeUrl, resolveAuthToken, resolvePostgresUrl } from "./config.js";
 import { isFiniusOnPath } from "./install.js";
 import { banner, pc } from "./ui.js";
 
@@ -98,6 +98,32 @@ export async function runDoctor(): Promise<number> {
   section("CLI");
   if (isFiniusOnPath()) ok("`finius` is on PATH");
   else warn("`finius` not on PATH", "install globally with `npm i -g finius` so hooks can run it");
+
+  // --- Storage (server-local; only meaningful on the machine that runs `finius serve`) ---------------
+  section("Storage");
+  const postgresUrl = resolvePostgresUrl(config);
+  if (postgresUrl) {
+    ok(`backend = postgres (${originOf(postgresUrl) ?? "configured"})`);
+    try {
+      const { Pool } = await import("pg");
+      const pool = new Pool({ connectionString: postgresUrl });
+      try {
+        await pool.query("SELECT 1");
+        ok("postgres reachable (SELECT 1)");
+      } finally {
+        await pool.end();
+      }
+    } catch (error) {
+      const msg = (error as Error).message;
+      if (/Cannot find package 'pg'|Cannot find module 'pg'/.test(msg)) bad("`pg` driver not installed", "run `npm i -g pg` so `finius serve` can use Postgres");
+      else bad(`postgres not reachable (${msg})`, "check the connection URL and that the database is up");
+    }
+  } else {
+    const dbPath = process.env.FINIUS_DB_PATH ?? join(FINIUS_HOME, "data", "finius.sqlite");
+    ok(`backend = sqlite (${dbPath})`);
+    if (existsSync(dbPath)) ok("database file exists");
+    else warn("database file not created yet", "it's created on first `finius serve`");
+  }
 
   // --- Server -----------------------------------------------------------------
   section("Server");

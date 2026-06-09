@@ -6,7 +6,7 @@
 
 import { type DrizzleDb } from "./client.js";
 import { type Column, type SQL, and, countDistinct, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
-import { metricPoints, metricRollup } from "./schema.js";
+import { metricPoints, metricRollup } from "./schema-active.js";
 import { GRANULARITY_MS, POINT_IDENTITY, canUseRollup, pointWhere, rollupWhere, sumWhen } from "./fragments.js";
 import { dialect } from "./dialect.js";
 import { enrichUsers } from "./users.js";
