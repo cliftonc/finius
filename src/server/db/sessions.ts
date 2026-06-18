@@ -81,7 +81,8 @@ export async function buildSessions(db: DrizzleDb, filters: SummaryFilters, tail
         (SELECT mp.source FROM ${metricPoints} mp
            WHERE mp.session_row_id = s.id AND mp.signal = 'jsonl' LIMIT 1) AS "jsonlSource",
         ${dialect.groupConcatDistinct(sql`p.model`)} AS "models",
-        EXISTS(SELECT 1 FROM ${sourceFiles} sf WHERE sf.session_row_id = s.id) AS "hasTranscript"
+        -- CASE-wrap so this comes back as integer 1/0 on both dialects (bare EXISTS is boolean on Postgres).
+        CASE WHEN EXISTS(SELECT 1 FROM ${sourceFiles} sf WHERE sf.session_row_id = s.id) THEN 1 ELSE 0 END AS "hasTranscript"
       FROM ${sessions} s
       LEFT JOIN ${metricPoints} p ON ${joinCondition}
       ${where}
